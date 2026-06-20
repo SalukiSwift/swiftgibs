@@ -1,0 +1,7 @@
+# Build outputs
+/dist/
+# Upstream checkout / compiled objects (if vendored)
+*.o
+# OS cruft
+.DS_Store
+Thumbs.db
