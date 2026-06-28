@@ -67,7 +67,7 @@
 +    VARP(highlightself, 0, 1, 1);
 +    SVARP(friendcolor, "0");      // \f0 green
 +    SVARP(selfcolor, "8");        // \f8 cyan (rendertext.cpp line 232: bvec(96,240,255))
-+    SVARP(friendmarker, "\xe2\x98\x85 ");  // U+2605 BLACK STAR + space
++    SVARP(friendmarker, "* ");  // asterisk + space (rendertext byte-loop has no UTF-8 decode; U+2605 renders as 3 garbage glyphs)
 +
      static string cname[3];
      static int cidx = 0;
