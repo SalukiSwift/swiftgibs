@@ -19,7 +19,12 @@ SRC="$INSTALL" ALLMAPS=1 "$ROOT/tools/strip-assets.sh" "$ROOT/maps/pool.txt" "$S
 rm -rf "$OUT"; mkdir -p "$OUT/bin64"
 
 # 2) stock client + runtime DLLs only (exclude EOS/EAC/p1xbraten/pdb/uninstall)
-cp "$WINBIN/sauerbraten.exe" "$OUT/bin64/"
+# patched SwiftGibs engine (M2); fall back to stock if not built yet
+if [ -f "$ROOT/dist/engines/win64/sauerbraten.exe" ]; then
+  cp "$ROOT/dist/engines/win64/sauerbraten.exe" "$OUT/bin64/"
+else
+  echo "WARN: patched exe missing, using stock"; cp "$WINBIN/sauerbraten.exe" "$OUT/bin64/"
+fi
 find "$WINBIN" -maxdepth 1 -name '*.dll' ! -iname 'EOSSDK*' -exec cp {} "$OUT/bin64/" \;
 
 # 3) staged data + packages (make writable -- copies off /mnt/c come read-only)
