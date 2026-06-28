@@ -44,3 +44,10 @@ Stripped-down instagib Sauerbraten with Swift's competitive config. Unzip and ru
   (harmless).
 - On non-instagib official servers, a friend's powerup icon may sit slightly off next to their
   overhead name (never happens in instagib).
+
+## Reload countdown (rifle)
+A center-screen 3 → 2 → 1 counts down the rifle's 1.5s reload, then the crosshair pops back in.
+Pick a style or turn it off in **F3 → "reload countdown..."**: **Drift** (floats up & fades),
+**Slam** (bold amber punch), **Zoom** (rushes in, red), **Tick** (small & subtle), or **Off**.
+The crosshair hides during the count and pops in when you can fire again. Your choice persists.
+(Console: `/reloadcount 0..4`; preview with `/reloadcountdemo`.)
