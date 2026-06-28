@@ -37,11 +37,17 @@ fi
 # which would block the downscale below and the overlay copy later.
 chmod -R u+w "$STAGE"
 
-# 4) crush WORLD textures/skins/mapshots to <=WORLD_PX px (flat competitive look).
-#    EXEMPT the glyph atlases in packages/fonts + packages/hud: their .cfg addresses
-#    characters by pixel coords assuming the original 512px atlas, so downscaling them
-#    scrambles every glyph -> mangled fonts. Geometry files (.md*/.obj/.iqm) untouched.
-find "$STAGE/packages" -type d \( -name fonts -o -name hud \) -prune -o \
+# 4) crush only WORLD textures/skins to <=WORLD_PX px (flat competitive look).
+#    EXEMPT the UI/menu art so menus, icons, crosshairs and map thumbnails stay crisp:
+#      fonts/hud  - glyph atlases (.cfg addresses chars by 512px pixel coords)
+#      icons      - menu icons (checkbox/arrows/player-model/etc. — the blurry squares)
+#      crosshairs - crosshair previews in options
+#      particles  - effect sprites (look bad smushed)
+#      base       - map .ogz live here; its .jpg are the map-picker thumbnails
+#    Geometry files (.md*/.obj/.iqm) are untouched (not matched by the image find).
+find "$STAGE/packages" -type d \( \
+       -name fonts -o -name hud -o -name icons -o -name crosshairs -o -name particles -o -name base \
+     \) -prune -o \
      -type f \( -iname '*.jpg' -o -iname '*.png' \) -print0 \
   | xargs -0 -P6 -I{} mogrify -resize "${WORLD_PX}x${WORLD_PX}>" "{}"
 
