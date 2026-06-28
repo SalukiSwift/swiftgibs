@@ -28,6 +28,10 @@ while read -r m; do
   done
 done < "$POOL"
 
+# make the stage writable: copies off a Windows mount (/mnt/c) come read-only,
+# which would block the downscale below and the overlay copy later.
+chmod -R u+w "$STAGE"
+
 # 4) crush WORLD textures/skins/mapshots to <=WORLD_PX px (flat competitive look).
 #    EXEMPT the glyph atlases in packages/fonts + packages/hud: their .cfg addresses
 #    characters by pixel coords assuming the original 512px atlas, so downscaling them

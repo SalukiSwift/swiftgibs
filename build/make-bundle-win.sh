@@ -1,30 +1,39 @@
 #!/usr/bin/env bash
-# Assemble the Windows SwiftGibs bundle from a staged tree + overlay + stock binary.
-# Usage: make-bundle-win.sh <stage-dir>
+# Assemble the Windows SwiftGibs bundle: stock binary + data BOTH from Swift's
+# matching Sauerbraten install. The stock exe and its data/maps/shaders are
+# version-locked -- pairing the exe with a DIFFERENT release's data (e.g. the git
+# mirror) gives blank maps, broken icons, and shader errors. So we always strip
+# from the same install the exe comes from.
+# Usage: make-bundle-win.sh
 set -euo pipefail
 ROOT="$HOME/repos/swiftgibs"
-STAGE="${1:?stage dir required}"
-WINBIN="/mnt/c/Program Files (x86)/Sauerbraten/bin64"
+INSTALL="/mnt/c/Program Files (x86)/Sauerbraten"   # 2020 install: stock exe + its matching data
+WINBIN="$INSTALL/bin64"
 OUT="$ROOT/dist/swiftgibs-win64"
+STAGE="${STAGE:-/tmp/swiftgibs-stage}"
+
+# 1) strip a minimal, low-res tree from the SAME install the exe comes from
+SRC="$INSTALL" "$ROOT/tools/strip-assets.sh" "$ROOT/maps/pool.txt" "$STAGE"
 
 rm -rf "$OUT"; mkdir -p "$OUT/bin64"
 
-# stock client + runtime DLLs only (exclude EOS/EAC/p1xbraten/pdb/uninstall)
+# 2) stock client + runtime DLLs only (exclude EOS/EAC/p1xbraten/pdb/uninstall)
 cp "$WINBIN/sauerbraten.exe" "$OUT/bin64/"
 find "$WINBIN" -maxdepth 1 -name '*.dll' ! -iname 'EOSSDK*' -exec cp {} "$OUT/bin64/" \;
 
-# staged data + packages
+# 3) staged data + packages (make writable -- copies off /mnt/c come read-only)
 cp -a "$STAGE/data" "$OUT/data"
 cp -a "$STAGE/packages" "$OUT/packages"
+chmod -R u+w "$OUT"
 
-# overlay last so it wins (autoexec, menus, crosshair, q009, servers.cfg)
+# 4) overlay last so it wins (autoexec, menus, crosshair, servers.cfg)
 cp -a "$ROOT/overlay/." "$OUT/"
 rm -f "$OUT/autoexec.source.cfg"   # internal reference file, don't ship
 
-# portable launcher: '.' = home dir, so our root autoexec.cfg loads
+# 5) portable launcher: '.' = home dir, so our root autoexec.cfg loads
 printf '@echo off\r\nstart bin64\\sauerbraten.exe -q.\r\n' > "$OUT/swiftgibs.bat"
 
-# zip
+# 6) zip
 cd "$ROOT/dist"
 rm -f swiftgibs-win64.zip
 zip -rq swiftgibs-win64.zip swiftgibs-win64
