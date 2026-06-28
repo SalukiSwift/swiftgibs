@@ -41,7 +41,25 @@
      void killed(fpsent *d, fpsent *actor)
      {
          if(d->state==CS_EDITING)
-@@ -740,6 +774,12 @@
+@@ -472,13 +506,13 @@
+         const char *dname = "", *aname = "";
+         if(m_teammode && teamcolorfrags)
+         {
+-            dname = teamcolorname(d, "you");
+-            aname = teamcolorname(actor, "you");
++            dname = teamcolorname(d, NULL);
++            aname = teamcolorname(actor, NULL);
+         }
+         else
+         {
+-            dname = colorname(d, NULL, "", "", "you");
+-            aname = colorname(actor, NULL, "", "", "you");
++            dname = colorname(d, NULL, "", "", NULL);
++            aname = colorname(actor, NULL, "", "", NULL);
+         }
+         if(actor->type==ENT_AI)
+             conoutf(contype, "\f2%s got killed by %s!", dname, aname);
+@@ -740,12 +774,32 @@
          return false;
      }
  
@@ -54,6 +72,26 @@
      static string cname[3];
      static int cidx = 0;
  
+     const char *colorname(fpsent *d, const char *name, const char *prefix, const char *suffix, const char *alt)
+     {
+         if(!name) name = alt && d == player1 ? alt : d->name;
++        // SwiftGibs: fold friend/self highlight into prefix/suffix
++        static string hpre, hsuf;
++        if(highlightself && d == player1)
++        {
++            formatstring(hpre, "\fs\f%s%s", selfcolor, prefix);
++            formatstring(hsuf, "%s\fr", suffix);
++            prefix = hpre; suffix = hsuf;
++        }
++        else if(highlightfriends && isfriendname(d->name))
++        {
++            formatstring(hpre, "\fs\f%s%s%s", friendcolor, friendmarker, prefix);
++            formatstring(hsuf, "%s\fr", suffix);
++            prefix = hpre; suffix = hsuf;
++        }
+         bool dup = !name[0] || duplicatename(d, name, alt) || d->aitype != AI_NONE;
+         if(dup || prefix[0] || suffix[0])
+         {
 --- a/fpsgame/game.h
 +++ b/fpsgame/game.h
 @@ -754,6 +754,7 @@
