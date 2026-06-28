@@ -12,8 +12,9 @@ WINBIN="$INSTALL/bin64"
 OUT="$ROOT/dist/swiftgibs-win64"
 STAGE="${STAGE:-/tmp/swiftgibs-stage}"
 
-# 1) strip a minimal, low-res tree from the SAME install the exe comes from
-SRC="$INSTALL" "$ROOT/tools/strip-assets.sh" "$ROOT/maps/pool.txt" "$STAGE"
+# 1) strip a low-res tree from the SAME install the exe comes from.
+#    ALLMAPS=1: ship every stock map so any public server's map loads (Swift's choice).
+SRC="$INSTALL" ALLMAPS=1 "$ROOT/tools/strip-assets.sh" "$ROOT/maps/pool.txt" "$STAGE"
 
 rm -rf "$OUT"; mkdir -p "$OUT/bin64"
 

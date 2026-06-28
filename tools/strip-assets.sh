@@ -19,14 +19,19 @@ for d in "$SRC"/packages/*/; do
   cp -a "$d" "$STAGE/packages/$name"
 done
 
-# 3) base: only the pooled maps' files (.ogz/.cfg/.wpt/.jpg) — drops ~320 unused maps
-while read -r m; do
-  [ -z "$m" ] && continue
-  for ext in ogz cfg wpt jpg; do
-    f="$SRC/packages/base/$m.$ext"
-    [ -f "$f" ] && cp "$f" "$STAGE/packages/base/"
-  done
-done < "$POOL"
+# 3) base maps. ALLMAPS=1 ships every map (full public-server compat); otherwise
+#    only the curated pool (tiny, for local + own-server play).
+if [ "${ALLMAPS:-0}" = 1 ]; then
+  cp -a "$SRC/packages/base/." "$STAGE/packages/base/"
+else
+  while read -r m; do
+    [ -z "$m" ] && continue
+    for ext in ogz cfg wpt jpg; do
+      f="$SRC/packages/base/$m.$ext"
+      [ -f "$f" ] && cp "$f" "$STAGE/packages/base/"
+    done
+  done < "$POOL"
+fi
 
 # make the stage writable: copies off a Windows mount (/mnt/c) come read-only,
 # which would block the downscale below and the overlay copy later.
