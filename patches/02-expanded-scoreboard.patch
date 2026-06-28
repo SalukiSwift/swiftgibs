@@ -1,19 +1,29 @@
 --- a/fpsgame/scoreboard.cpp
 +++ b/fpsgame/scoreboard.cpp
-@@ -14,6 +14,9 @@
+@@ -14,6 +14,10 @@
      VARP(showconnecting, 0, 0, 1);
      VARP(hidefrags, 0, 1, 1);
      VARP(showdeaths, 0, 0, 1);
 +    VARP(showkdr, 0, 1, 1);   // SwiftGibs: kill/death ratio (all players)
 +    VARP(showacc, 0, 0, 1);   // SwiftGibs: accuracy % (local row; remote needs extinfo)
 +    VARP(showdmg, 0, 0, 1);   // SwiftGibs: total damage (local row; remote needs extinfo)
++    VARP(showcaptures, 0, 1, 1);   // SwiftGibs: flag captures, shown in CTF modes (all players)
  
      static hashset<teaminfo> teaminfos;
  
-@@ -258,6 +261,33 @@
+@@ -258,6 +262,42 @@
                  g.poplist();
              }
  
++            if(showcaptures && m_ctf)
++            {
++                g.pushlist();
++                g.strut(6);
++                g.text("caps", fgcolor);
++                loopscoregroup(o, g.textf("%d", 0xFFFFDD, NULL, o->flags));
++                g.poplist();
++            }
++
 +            if(showkdr)
 +            {
 +                g.pushlist();
