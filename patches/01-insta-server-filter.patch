@@ -1,0 +1,18 @@
+--- a/fpsgame/fps.cpp
++++ b/fpsgame/fps.cpp
+@@ -1202,8 +1202,15 @@
+         return (n>=MM_START && size_t(n-MM_START)<sizeof(mastermodeicons)/sizeof(mastermodeicons[0])) ? mastermodeicons[n-MM_START] : unknown;
+     }
+ 
++    VARP(filterinstaservers, 0, 1, 1);  // SwiftGibs: show only one-shot-rifle (M_INSTA) servers
++
+     bool serverinfoentry(g3d_gui *g, int i, const char *name, int port, const char *sdesc, const char *map, int ping, const vector<int> &attr, int np)
+     {
++        // SwiftGibs: hide reachable, protocol-compatible, classifiable non-insta servers.
++        // Unreachable / unknown-protocol servers (attr empty or mismatched) are left visible.
++        if(filterinstaservers && attr.length() >= 2 && attr[0] == PROTOCOL_VERSION &&
++           m_valid(attr[1]) && !(gamemodes[attr[1] - STARTGAMEMODE].flags & M_INSTA))
++            return false;
+         if(ping < 0 || attr.empty() || attr[0]!=PROTOCOL_VERSION)
+         {
+             switch(i)
