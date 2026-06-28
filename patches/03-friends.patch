@@ -1,0 +1,66 @@
+--- a/fpsgame/fps.cpp
++++ b/fpsgame/fps.cpp
+@@ -454,6 +454,40 @@
+ 
+     VARP(teamcolorfrags, 0, 1, 1);
+ 
++    // === SwiftGibs friend list (by displayed name, persistent) ===
++    vector<char *> friends;
++    bool isfriendname(const char *name)
++    {
++        if(!name || !name[0]) return false;
++        loopv(friends) if(!strcasecmp(friends[i], name)) return true;
++        return false;
++    }
++    void writefriends()
++    {
++        stream *f = openutf8file(path("friends.cfg", true), "w");
++        if(!f) return;
++        f->printf("// SwiftGibs friend list — these names are highlighted in-game\n\n");
++        loopv(friends) f->printf("addfriend %s\n", escapestring(friends[i]));
++        delete f;
++    }
++    ICOMMAND(addfriend, "s", (char *name),
++    {
++        if(!name[0] || isfriendname(name)) return;
++        friends.add(newstring(name));
++        writefriends();
++    });
++    ICOMMAND(delfriend, "s", (char *name),
++    {
++        loopv(friends) if(!strcasecmp(friends[i], name)) { delete[] friends[i]; friends.remove(i); writefriends(); break; }
++    });
++    ICOMMAND(isfriend, "s", (char *name), intret(isfriendname(name) ? 1 : 0));
++    ICOMMAND(clearfriends, "", (), { friends.deletearrays(); writefriends(); });
++    ICOMMAND(numfriends, "", (), intret(friends.length()));
++    ICOMMAND(getfriend, "i", (int *i), result(friends.inrange(*i) ? friends[*i] : ""));
++    // current OTHER players, for the "add from game" menu list
++    ICOMMAND(numplayers, "", (), intret(players.length()));
++    ICOMMAND(getplayername, "i", (int *i), result(players.inrange(*i) ? players[*i]->name : ""));
++
+     void killed(fpsent *d, fpsent *actor)
+     {
+         if(d->state==CS_EDITING)
+@@ -740,6 +774,12 @@
+         return false;
+     }
+ 
++    VARP(highlightfriends, 0, 1, 1);
++    VARP(highlightself, 0, 1, 1);
++    SVARP(friendcolor, "0");      // \f0 green
++    SVARP(selfcolor, "8");        // \f8 cyan (rendertext.cpp line 232: bvec(96,240,255))
++    SVARP(friendmarker, "\xe2\x98\x85 ");  // U+2605 BLACK STAR + space
++
+     static string cname[3];
+     static int cidx = 0;
+ 
+--- a/fpsgame/game.h
++++ b/fpsgame/game.h
+@@ -754,6 +754,7 @@
+     extern void ignore(int cn);
+     extern void unignore(int cn);
+     extern bool isignored(int cn);
++    extern bool isfriendname(const char *name);
+     extern bool addmsg(int type, const char *fmt = NULL, ...);
+     extern void switchname(const char *name);
+     extern void switchteam(const char *name);
