@@ -5,7 +5,7 @@ set -euo pipefail
 SRC="${SRC:-$HOME/repos/sauerbraten}"
 POOL="${1:?usage: strip-assets.sh <pool-file> <stage-dir>}"
 STAGE="${2:?stage dir required}"
-MAXPX=128
+WORLD_PX="${WORLD_PX:-2}"   # world textures crushed to this many px (flat look); fonts/hud exempt
 
 rm -rf "$STAGE"; mkdir -p "$STAGE/packages/base"
 
@@ -28,8 +28,12 @@ while read -r m; do
   done
 done < "$POOL"
 
-# 4) crush every texture/skin/mapshot to <=128px (geometry files untouched)
-find "$STAGE/packages" \( -iname '*.jpg' -o -iname '*.png' \) -print0 \
-  | xargs -0 -P4 -I{} mogrify -resize "${MAXPX}x${MAXPX}>" "{}"
+# 4) crush WORLD textures/skins/mapshots to <=WORLD_PX px (flat competitive look).
+#    EXEMPT the glyph atlases in packages/fonts + packages/hud: their .cfg addresses
+#    characters by pixel coords assuming the original 512px atlas, so downscaling them
+#    scrambles every glyph -> mangled fonts. Geometry files (.md*/.obj/.iqm) untouched.
+find "$STAGE/packages" -type d \( -name fonts -o -name hud \) -prune -o \
+     -type f \( -iname '*.jpg' -o -iname '*.png' \) -print0 \
+  | xargs -0 -P6 -I{} mogrify -resize "${WORLD_PX}x${WORLD_PX}>" "{}"
 
 echo "stage size: $(du -sh "$STAGE" | cut -f1)"
