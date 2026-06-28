@@ -1,6 +1,6 @@
 --- a/fpsgame/fps.cpp
 +++ b/fpsgame/fps.cpp
-@@ -1104,6 +1104,108 @@
+@@ -1104,6 +1104,142 @@
          pophudmatrix();
      }
  
@@ -12,6 +12,56 @@
 +    int reloadfreezems = -1;
 +    ICOMMAND(reloadcountfreeze, "ii", (int *style, int *ms), { reloadcount = *style; reloadfreezems = *ms; });
 +
++    // Returns elapsed ms in [0,1500) when any countdown source is active, else -1.
++    int reloadcountdownElapsed()
++    {
++        fpsent *d = hudplayer();
++        if(d->state == CS_SPECTATOR || d->state == CS_DEAD) return -1;
++
++        const int dur = 1500;
++
++        if(reloadfreezems >= 0) return reloadfreezems;
++
++        int e = lastmillis - d->lastaction;
++        if(d->lastattackgun == GUN_RIFLE && d->gunwait > 0 && e >= 0 && e < d->gunwait) return e;
++
++        int de = lastmillis - reloaddemostart;
++        if(de >= 0 && de < dur) return de;
++
++        return -1;
++    }
++
++    ICOMMAND(testreload, "", (), { player1->lastaction = lastmillis; player1->gunwait = guns[GUN_RIFLE].attackdelay; player1->lastattackgun = GUN_RIFLE; });
++
++    // Returns crosshair scale: 1.0 normally, >1.0 during the 160ms pop-in after countdown ends.
++    float reloadcrosshairscale()
++    {
++        if(reloadcount == 0) return 1.0f;
++
++        const int popStart = 1500;
++        const int popDur   = 160;
++
++        fpsent *d = hudplayer();
++        if(d->state == CS_SPECTATOR || d->state == CS_DEAD) return 1.0f;
++
++        int t = -1;
++        if(reloadfreezems < 0)
++        {
++            int e = lastmillis - d->lastaction;
++            if(d->lastattackgun == GUN_RIFLE && e >= popStart && e < popStart + popDur)
++                t = e;
++            else
++            {
++                int de = lastmillis - reloaddemostart;
++                if(de >= popStart && de < popStart + popDur) t = de;
++            }
++        }
++        if(t < 0) return 1.0f;
++
++        float p = (t - popStart) / (float)popDur;  // 0..1 over the pop window
++        return 1.0f + 0.7f * (1.0f - p) * (1.0f - p);  // 1.7 → 1.0 (ease-out quad)
++    }
++
 +    void drawreloadcountdown(int w, int h)
 +    {
 +        if(reloadcount == 0) return;
@@ -20,23 +70,7 @@
 +        if(d->state == CS_SPECTATOR || d->state == CS_DEAD) return;
 +
 +        const int dur = 1500;
-+        int elapsed = -1;
-+
-+        if(reloadfreezems >= 0)
-+        {
-+            elapsed = reloadfreezems;
-+        }
-+        else
-+        {
-+            int e = lastmillis - d->lastaction;
-+            bool inCooldown = (d->lastattackgun == GUN_RIFLE && d->gunwait > 0 && e >= 0 && e < d->gunwait);
-+            if(inCooldown) elapsed = e;
-+            else
-+            {
-+                int de = lastmillis - reloaddemostart;
-+                if(de >= 0 && de < dur) elapsed = de;
-+            }
-+        }
++        int elapsed = reloadcountdownElapsed();
 +
 +        if(elapsed < 0 || elapsed >= dur) return;
 +
@@ -109,7 +143,7 @@
      void gameplayhud(int w, int h)
      {
          pushhudmatrix();
-@@ -1134,6 +1236,8 @@
+@@ -1134,6 +1270,8 @@
              if(cmode) cmode->drawhud(d, w, h);
          }
  
@@ -118,17 +152,33 @@
          pophudmatrix();
  
          if(d->state!=CS_EDITING && d->state!=CS_SPECTATOR && d->state!=CS_DEAD)
-@@ -1192,6 +1296,13 @@
+@@ -1192,6 +1330,9 @@
              else if(d->health<=50) color = vec(1, 0.5f, 0);
          }
          if(d->gunwait) color.mul(0.5f);
-+        // Hide crosshair during rifle-reload countdown when the feature is enabled
-+        if(reloadcount)
-+        {
-+            int e = lastmillis - d->lastaction;
-+            if(d->lastattackgun == GUN_RIFLE && d->gunwait > 0 && e >= 0 && e < d->gunwait)
-+                return -1;
-+        }
++        // Hide crosshair during any active reload countdown (real cooldown, demo, or freeze)
++        if(reloadcount && reloadcountdownElapsed() >= 0)
++            return -1;
          return crosshair;
      }
  
+--- a/shared/igame.h
++++ b/shared/igame.h
+@@ -82,6 +82,7 @@
+     extern void g3d_gamemenus();
+     extern const char *defaultcrosshair(int index);
+     extern int selectcrosshair(vec &color);
++    extern float reloadcrosshairscale();
+     extern void lighteffects(dynent *d, vec &color, vec &dir);
+     extern void setupcamera();
+     extern bool allowthirdperson(bool msg = false);
+--- a/engine/rendergl.cpp
++++ b/engine/rendergl.cpp
+@@ -2149,6 +2149,7 @@
+             crosshair = crosshairs[index];
+         }
+         chsize = crosshairsize*w/900.0f;
++        chsize *= game::reloadcrosshairscale();
+     }
+     if(crosshair->type&Texture::ALPHA) glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+     else glBlendFunc(GL_ONE, GL_ONE);
