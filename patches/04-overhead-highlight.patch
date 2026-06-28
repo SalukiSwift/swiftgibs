@@ -1,0 +1,30 @@
+--- a/fpsgame/render.cpp
++++ b/fpsgame/render.cpp
+@@ -239,7 +239,15 @@
+             if(d->armour>0 && d->armourtype>=A_GREEN && !m_noitems) icons++;
+         }
+         if(icons) concatstring(d->info, " ");
+-        particle_text(p, d->info, PART_TEXT, 1, team ? (team==1 ? 0x6496FF : 0xFF4B19) : 0x1EC850, 2.0f, 0, icons);
++        int namecolor = team ? (team==1 ? 0x6496FF : 0xFF4B19) : 0x1EC850;
++        if(highlightfriends && isfriendname(d->name))
++        {
++            namecolor = 0x40FF40;   // bright green, distinct from the FFA green
++            static string fname;
++            formatstring(fname, "%s%s", friendmarker, d->info);
++            particle_textcopy(p, fname, PART_TEXT, 1, namecolor, 2.0f, 0);
++        }
++        else particle_text(p, d->info, PART_TEXT, 1, namecolor, 2.0f, 0, icons);
+         if(icons)
+         {
+             float tw, th;
+--- a/fpsgame/game.h
++++ b/fpsgame/game.h
+@@ -755,6 +755,8 @@
+     extern void unignore(int cn);
+     extern bool isignored(int cn);
+     extern bool isfriendname(const char *name);
++    extern int highlightfriends;
++    extern char *friendmarker;
+     extern bool addmsg(int type, const char *fmt = NULL, ...);
+     extern void switchname(const char *name);
+     extern void switchteam(const char *name);
