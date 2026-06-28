@@ -22,3 +22,25 @@ Stripped-down instagib Sauerbraten with Swift's competitive config. Unzip and ru
   accuracy/damage columns in the F3 menu or with `/showacc 1` / `/showdmg 1`
   (accurate for your own row; other players need server extinfo).
 - ARM/Raspberry Pi build is **experimental** (cross-compiled, not yet tested on hardware).
+
+## M3 features (friends + scoreboard options)
+
+- **Friends:** open the **friends** menu from the main menu, the in-game **Esc** menu, or
+  **F3 → "friends..."**. Add a friend by typing their name (press Enter), or pick from the
+  players currently in your game. A friend's name shows **green with a `*` marker** in the
+  scoreboard, kill log, chat, join/leave messages, and above their head. Your own name shows
+  **cyan**, and your frags read "**Swift** fragged …" instead of "you". Friends save to
+  `friends.cfg` and persist across launches. Toggle highlighting with `/highlightfriends` and
+  `/highlightself`; retune colors or the marker with `/friendcolor`, `/selfcolor`,
+  `/friendmarker` (e.g. set a different single character as marker).
+
+- **Scoreboard columns:** **F3 → "scoreboard columns..."** lets you toggle the frags / deaths /
+  KDR / accuracy / damage / captures columns on and off, plus the friend/self highlight toggles.
+
+**Known notes:**
+- The marker is `*` rather than a unicode star because the engine's bitmap font renders only
+  single-byte glyphs (no Unicode). It is changeable via `/friendmarker`.
+- The "in game now" list in the friends menu may include your own name during solo/local play
+  (harmless).
+- On non-instagib official servers, a friend's powerup icon may sit slightly off next to their
+  overhead name (never happens in instagib).
