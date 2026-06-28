@@ -1,0 +1,134 @@
+--- a/fpsgame/fps.cpp
++++ b/fpsgame/fps.cpp
+@@ -1104,6 +1104,108 @@
+         pophudmatrix();
+     }
+ 
++    VARP(reloadcount, 0, 1, 4);   // 0=off, 1=Drift, 2=Slam, 3=Zoom, 4=Tick (persistent)
++
++    int reloaddemostart = -100000;
++    ICOMMAND(reloadcountdemo, "", (), { reloaddemostart = lastmillis; });
++
++    int reloadfreezems = -1;
++    ICOMMAND(reloadcountfreeze, "ii", (int *style, int *ms), { reloadcount = *style; reloadfreezems = *ms; });
++
++    void drawreloadcountdown(int w, int h)
++    {
++        if(reloadcount == 0) return;
++
++        fpsent *d = hudplayer();
++        if(d->state == CS_SPECTATOR || d->state == CS_DEAD) return;
++
++        const int dur = 1500;
++        int elapsed = -1;
++
++        if(reloadfreezems >= 0)
++        {
++            elapsed = reloadfreezems;
++        }
++        else
++        {
++            int e = lastmillis - d->lastaction;
++            bool inCooldown = (d->lastattackgun == GUN_RIFLE && d->gunwait > 0 && e >= 0 && e < d->gunwait);
++            if(inCooldown) elapsed = e;
++            else
++            {
++                int de = lastmillis - reloaddemostart;
++                if(de >= 0 && de < dur) elapsed = de;
++            }
++        }
++
++        if(elapsed < 0 || elapsed >= dur) return;
++
++        const int beat = dur / 3;  // 500ms per number
++        int idx = min(elapsed / beat, 2);
++        int number = 3 - idx;
++        float t = (elapsed - idx * beat) / (float)beat;  // 0..1 within this beat
++
++        defformatstring(numstr, "%d", number);
++        int tw, th;
++        text_bounds(numstr, tw, th);
++        if(th <= 0) return;
++
++        // Center of the 1800-unit virtual space
++        float cx = w * 900.0f / h;
++        float cy = 900.0f;
++
++        float alpha = 1.0f;
++        float styleScale = 1.0f;
++        float dx = 0.0f, dy = 0.0f;
++        int r = 255, g = 255, b = 255;
++        float TARGET_H = 300.0f;
++
++        switch(reloadcount)
++        {
++            case 1: // Drift: fade in fast then shrink+rise+fade
++                alpha = t < 0.12f ? t / 0.12f : 1.0f - (t - 0.12f) / 0.88f;
++                styleScale = 1.0f - 0.45f * t;
++                dy = -260.0f * t;
++                r = 255; g = 255; b = 255;
++                break;
++            case 2: // Slam: scale-overshoot bounce in, hold, fade
++                if(t < 0.18f)      styleScale = 1.6f - (0.9f) * (t / 0.18f);
++                else if(t < 0.30f) styleScale = 0.7f + (0.3f) * ((t - 0.18f) / 0.12f);
++                else               styleScale = 1.0f;
++                alpha = t < 0.65f ? 1.0f : 1.0f - (t - 0.65f) / 0.35f;
++                r = 255; g = 200; b = 40;
++                break;
++            case 3: // Zoom: rush from small to large while fading
++                styleScale = 0.5f + 1.6f * t;
++                alpha = 1.0f - t * t;
++                r = 255; g = 80; b = 60;
++                break;
++            case 4: // Tick: small, soft fade in/out in place
++                TARGET_H = 190.0f;
++                styleScale = 1.0f;
++                alpha = (t < 0.25f ? t / 0.25f : (t > 0.6f ? 1.0f - (t - 0.6f) / 0.4f : 1.0f)) * 0.7f;
++                r = 220; g = 235; b = 255;
++                break;
++            default: return;
++        }
++
++        alpha = max(0.0f, min(1.0f, alpha));
++        if(alpha < 0.01f) return;
++
++        float baseS = TARGET_H / (float)th;
++        float s = baseS * styleScale;
++
++        pushhudmatrix();
++        hudmatrix.translate(cx + dx, cy + dy, 0);
++        hudmatrix.scale(s, s, 1);
++        flushhudmatrix();
++
++        int a = int(alpha * 255.0f + 0.5f);
++        draw_text(numstr, -tw/2, -th/2, r, g, b, a);
++
++        pophudmatrix();
++    }
++
+     void gameplayhud(int w, int h)
+     {
+         pushhudmatrix();
+@@ -1134,6 +1236,8 @@
+             if(cmode) cmode->drawhud(d, w, h);
+         }
+ 
++        drawreloadcountdown(w, h);
++
+         pophudmatrix();
+ 
+         if(d->state!=CS_EDITING && d->state!=CS_SPECTATOR && d->state!=CS_DEAD)
+@@ -1192,6 +1296,13 @@
+             else if(d->health<=50) color = vec(1, 0.5f, 0);
+         }
+         if(d->gunwait) color.mul(0.5f);
++        // Hide crosshair during rifle-reload countdown when the feature is enabled
++        if(reloadcount)
++        {
++            int e = lastmillis - d->lastaction;
++            if(d->lastattackgun == GUN_RIFLE && d->gunwait > 0 && e >= 0 && e < d->gunwait)
++                return -1;
++        }
+         return crosshair;
+     }
+ 
