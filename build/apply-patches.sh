@@ -2,7 +2,7 @@
 # Make a patched, buildable copy of the vendored 2020 source.
 # Usage: apply-patches.sh <dest-dir>
 set -euo pipefail
-ROOT="$HOME/repos/swiftgibs"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"   # repo root, location-independent
 DEST="${1:?dest dir required}"
 rm -rf "$DEST"; cp -r "$ROOT/vendor/sauer2020" "$DEST"; chmod -R u+w "$DEST"
 # her 2020 enet fails on modern glibc (socklen_t); the mirror's enet builds clean

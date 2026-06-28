@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-ROOT="$HOME/repos/swiftgibs"; B=/tmp/sg-engine-win
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"; B=/tmp/sg-engine-win
 "$ROOT/build/apply-patches.sh" "$B"
 # The Makefile requires "CROSS" in PLATFORM to activate x86_64-w64-mingw32-g++.
 # MINGW64CROSS contains "MINGW", "64", and "CROSS".
