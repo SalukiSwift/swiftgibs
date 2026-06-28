@@ -5,3 +5,5 @@
 # OS cruft
 .DS_Store
 Thumbs.db
+.superpowers/
+vendor/sauer2020/**/*.o
