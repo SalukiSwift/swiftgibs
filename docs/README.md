@@ -46,8 +46,9 @@ Stripped-down instagib Sauerbraten with Swift's competitive config. Unzip and ru
   overhead name (never happens in instagib).
 
 ## Reload countdown (rifle)
-A center-screen 3 → 2 → 1 counts down the rifle's 1.5s reload, then the crosshair pops back in.
-Pick a style or turn it off in **F3 → "reload countdown..."**: **Drift** (floats up & fades),
-**Slam** (bold amber punch), **Zoom** (rushes in, red), **Tick** (small & subtle), or **Off**.
-The crosshair hides during the count and pops in when you can fire again. Your choice persists.
-(Console: `/reloadcount 0..4`; preview with `/reloadcountdemo`.)
+A rhythmic countdown fills the rifle's 1.5s reload, then the crosshair snaps back to full when you can fire.
+The crosshair stays visible but **faded** during the count (brightening as you near ready) so you can keep aiming.
+Pick a style or turn it off in **F3 → "reload countdown..."** — seven styles plus Off:
+- **Number styles:** Drift (fade + shrink in place), Slam (bold amber punch), Zoom (rushes in, red), Tick (small & subtle).
+- **Graphical styles:** Rings (3 cyan rings collapse inward, one per beat), Wedges (3 amber reticle prongs count down), Pulse (a bright ring pings outward each beat).
+Your choice persists. (Console: `/reloadcount 0..7`; preview with `/reloadcountdemo`.)
