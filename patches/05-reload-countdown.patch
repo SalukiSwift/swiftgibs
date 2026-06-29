@@ -46,7 +46,7 @@
 +        if(reloadcount == 0) return 1.0f;
 +        int elapsed = reloadcountdownElapsed();
 +        if(elapsed < 0) return 1.0f;  // pop phase or no countdown
-+        return 0.30f + 0.35f * (elapsed / 1500.0f);
++        return 0.40f + 0.30f * (elapsed / 1500.0f);
 +    }
 +
 +    // Returns crosshair scale: 1.0 normally, >1.0 during the 160ms pop-in after countdown ends.
@@ -139,11 +139,11 @@
 +                }
 +                case 6: // Wedges: filled triangles pointing inward, spaced 120 deg, amber
 +                {
-+                    const float rbase = 110.0f, rapex = 55.0f, halfArc = 0.26f;
++                    const float rbase = 115.0f, rapex = 50.0f, halfArc = 0.30f;
 +                    const float wangles[3] = {
-+                        (float)M_PI / 2.0f,
-+                        (float)M_PI / 2.0f + 2.0f * (float)M_PI / 3.0f,
-+                        (float)M_PI / 2.0f + 4.0f * (float)M_PI / 3.0f
++                        -(float)M_PI / 2.0f,                              // top
++                        (float)M_PI / 6.0f,                               // lower-right
++                        5.0f * (float)M_PI / 6.0f                         // lower-left
 +                    };
 +                    int numWedges = 3 - idx;
 +
@@ -175,14 +175,14 @@
 +                    hudshader->set();
 +                    return;
 +                }
-+                case 7: // Pulse: one expanding thin ring per beat, additive blend
++                case 7: // Pulse: one expanding ring per beat, additive blend
 +                {
 +                    const int N = 48;
-+                    const float R  = 25.0f + 125.0f * t; // lerp(25, 150, t)
-+                    const float thk = 6.0f;
++                    const float R  = 40.0f + 135.0f * t; // lerp(40, 175, t)
++                    const float thk = 10.0f;
 +                    const float Ro = R + thk * 0.5f;
 +                    const float Ri = R - thk * 0.5f;
-+                    float a = 1.0f - t;
++                    float a = 0.9f * (1.0f - t);
 +
 +                    hudnotextureshader->set();
 +                    glBlendFunc(GL_SRC_ALPHA, GL_ONE);   // additive glow
