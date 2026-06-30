@@ -44,7 +44,7 @@ Stripped-down instagib Sauerbraten with Swift's competitive config. Unzip and ru
 
 ## Friend team visuals (green / purple)
 - Friends on **your team** render as a **green** player model and a **green triangle** on the minimap.
-- Friends on the **enemy team** render in **bright purple** (still clearly an enemy, just marked as your friend).
+- Friends on the **enemy team** render in **bright red-leaning purple** (still clearly an enemy, just marked as your friend).
 - The old `*` next to friend names is gone — the green name/color is the marker now.
 - Team modes only (FFA still uses the green name highlight from M3). Toggle with `/friendmodels`,
   `/friendblip` (and the master `/highlightfriends`). Colors are baked into the skins/blip textures;
