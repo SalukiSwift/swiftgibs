@@ -1,0 +1,88 @@
+--- a/fpsgame/client.cpp
++++ b/fpsgame/client.cpp
+@@ -5,6 +5,7 @@
+     VARP(minradarscale, 0, 384, 10000);
+     VARP(maxradarscale, 1, 1024, 10000);
+     VARP(radarteammates, 0, 1, 1);
++    VARP(friendblip, 0, 1, 1);   // SwiftGibs: friend teammates as a green triangle on the radar
+     FVARP(minimapalpha, 0, 1, 1);
+ 
+     float calcradarscale()
+@@ -64,39 +65,64 @@
+     {
+         if(!radarteammates) return;
+         float scale = calcradarscale();
+-        int alive = 0, dead = 0;
+-        loopv(players) 
++        bool fr = highlightfriends && friendblip;   // SwiftGibs: friends -> green triangle
++        int alive = 0, dead = 0, falive = 0, fdead = 0;
++        loopv(players)   // non-friend alive teammates (stock blue/red blip)
+         {
+             fpsent *o = players[i];
+-            if(o != d && o->state == CS_ALIVE && isteam(o->team, d->team))
++            if(o != d && o->state == CS_ALIVE && isteam(o->team, d->team) && !(fr && isfriendname(o->name)))
+             {
+-                if(!alive++) 
++                if(!alive++)
+                 {
+                     settexture(isteam(d->team, player1->team) ? "packages/hud/blip_blue_alive.png" : "packages/hud/blip_red_alive.png");
+-                    gle::defvertex(2);
+-                    gle::deftexcoord0();
+-                    gle::begin(GL_QUADS);
++                    gle::defvertex(2); gle::deftexcoord0(); gle::begin(GL_QUADS);
+                 }
+                 drawteammate(d, x, y, s, o, scale);
+             }
+         }
+         if(alive) gle::end();
+-        loopv(players) 
++        if(fr) loopv(players)   // friend alive teammates (green triangle)
+         {
+             fpsent *o = players[i];
+-            if(o != d && o->state == CS_DEAD && isteam(o->team, d->team))
++            if(o != d && o->state == CS_ALIVE && isteam(o->team, d->team) && isfriendname(o->name))
+             {
+-                if(!dead++) 
++                if(!falive++)
++                {
++                    settexture("packages/hud/blip_green_alive.png");
++                    gle::defvertex(2); gle::deftexcoord0(); gle::begin(GL_QUADS);
++                }
++                drawteammate(d, x, y, s, o, scale);
++            }
++        }
++        if(falive) gle::end();
++        loopv(players)   // non-friend dead teammates
++        {
++            fpsent *o = players[i];
++            if(o != d && o->state == CS_DEAD && isteam(o->team, d->team) && !(fr && isfriendname(o->name)))
++            {
++                if(!dead++)
+                 {
+                     settexture(isteam(d->team, player1->team) ? "packages/hud/blip_blue_dead.png" : "packages/hud/blip_red_dead.png");
+-                    gle::defvertex(2);
+-                    gle::deftexcoord0();
+-                    gle::begin(GL_QUADS);
++                    gle::defvertex(2); gle::deftexcoord0(); gle::begin(GL_QUADS);
+                 }
+                 drawteammate(d, x, y, s, o, scale);
+             }
+         }
+         if(dead) gle::end();
++        if(fr) loopv(players)   // friend dead teammates (green triangle)
++        {
++            fpsent *o = players[i];
++            if(o != d && o->state == CS_DEAD && isteam(o->team, d->team) && isfriendname(o->name))
++            {
++                if(!fdead++)
++                {
++                    settexture("packages/hud/blip_green_dead.png");
++                    gle::defvertex(2); gle::deftexcoord0(); gle::begin(GL_QUADS);
++                }
++                drawteammate(d, x, y, s, o, scale);
++            }
++        }
++        if(fdead) gle::end();
+     }
+         
+     #include "capture.h"
