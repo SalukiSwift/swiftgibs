@@ -27,23 +27,28 @@ Stripped-down instagib Sauerbraten with Swift's competitive config. Unzip and ru
 
 - **Friends:** open the **friends** menu from the main menu, the in-game **Esc** menu, or
   **F3 → "friends..."**. Add a friend by typing their name (press Enter), or pick from the
-  players currently in your game. A friend's name shows **green with a `*` marker** in the
-  scoreboard, kill log, chat, join/leave messages, and above their head. Your own name shows
-  **cyan**, and your frags read "**Swift** fragged …" instead of "you". Friends save to
-  `friends.cfg` and persist across launches. Toggle highlighting with `/highlightfriends` and
-  `/highlightself`; retune colors or the marker with `/friendcolor`, `/selfcolor`,
-  `/friendmarker` (e.g. set a different single character as marker).
+  players currently in your game. A friend's name shows **green** in the scoreboard, kill log,
+  chat, join/leave messages, and above their head. Your own name shows **cyan**, and your frags
+  read "**Swift** fragged …" instead of "you". Friends save to `friends.cfg` and persist across
+  launches. Toggle highlighting with `/highlightfriends` and `/highlightself`; retune colors
+  with `/friendcolor`, `/selfcolor`.
 
 - **Scoreboard columns:** **F3 → "scoreboard columns..."** lets you toggle the frags / deaths /
   KDR / accuracy / damage / captures columns on and off, plus the friend/self highlight toggles.
 
 **Known notes:**
-- The marker is `*` rather than a unicode star because the engine's bitmap font renders only
-  single-byte glyphs (no Unicode). It is changeable via `/friendmarker`.
 - The "in game now" list in the friends menu may include your own name during solo/local play
   (harmless).
 - On non-instagib official servers, a friend's powerup icon may sit slightly off next to their
   overhead name (never happens in instagib).
+
+## Friend team visuals (green / purple)
+- Friends on **your team** render as a **green** player model and a **green triangle** on the minimap.
+- Friends on the **enemy team** render in **bright purple** (still clearly an enemy, just marked as your friend).
+- The old `*` next to friend names is gone — the green name/color is the marker now.
+- Team modes only (FFA still uses the green name highlight from M3). Toggle with `/friendmodels`,
+  `/friendblip` (and the master `/highlightfriends`). Colors are baked into the skins/blip textures;
+  regenerate with `tools/make-friend-skins.sh` (tune `GREEN_MOD`/`PURPLE_MOD`).
 
 ## Reload countdown (rifle)
 A rhythmic countdown fills the rifle's 1.5s reload, then the crosshair snaps back to full when you can fire.
