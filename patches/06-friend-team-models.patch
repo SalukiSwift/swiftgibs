@@ -1,0 +1,60 @@
+--- a/fpsgame/render.cpp
++++ b/fpsgame/render.cpp
+@@ -13,6 +13,7 @@
+     VARP(ragdollfade, 0, 1000, 300000);
+     VARFP(playermodel, 0, 0, 4, changedplayermodel());
+     VARP(forceplayermodels, 0, 0, 1);
++    VARP(friendmodels, 0, 1, 1);   // SwiftGibs: recolor friend models (green teammate / purple enemy)
+     VARP(hidedead, 0, 0, 2);
+ 
+     vector<fpsent *> ragdolls;
+@@ -51,12 +52,12 @@
+ 
+     static const playermodelinfo playermodels[5] =
+     {
+-        { "mrfixit", "mrfixit/blue", "mrfixit/red", "mrfixit/hudguns", NULL, "mrfixit/horns", { "mrfixit/armor/blue", "mrfixit/armor/green", "mrfixit/armor/yellow" }, "mrfixit", "mrfixit_blue", "mrfixit_red", true },
+-        { "snoutx10k", "snoutx10k/blue", "snoutx10k/red", "snoutx10k/hudguns", NULL, "snoutx10k/wings", { "snoutx10k/armor/blue", "snoutx10k/armor/green", "snoutx10k/armor/yellow" }, "snoutx10k", "snoutx10k_blue", "snoutx10k_red", true },
++        { "mrfixit", "mrfixit/blue", "mrfixit/red", "mrfixit/hudguns", NULL, "mrfixit/horns", { "mrfixit/armor/blue", "mrfixit/armor/green", "mrfixit/armor/yellow" }, "mrfixit", "mrfixit_blue", "mrfixit_red", true, "mrfixit/green", "mrfixit/purple" },
++        { "snoutx10k", "snoutx10k/blue", "snoutx10k/red", "snoutx10k/hudguns", NULL, "snoutx10k/wings", { "snoutx10k/armor/blue", "snoutx10k/armor/green", "snoutx10k/armor/yellow" }, "snoutx10k", "snoutx10k_blue", "snoutx10k_red", true, "snoutx10k/green", "snoutx10k/purple" },
+         //{ "ogro/green", "ogro/blue", "ogro/red", "mrfixit/hudguns", "ogro/vwep", NULL, { NULL, NULL, NULL }, "ogro", "ogro_blue", "ogro_red", false },
+-        { "ogro2", "ogro2/blue", "ogro2/red", "mrfixit/hudguns", NULL, "ogro2/quad", { "ogro2/armor/blue", "ogro2/armor/green", "ogro2/armor/yellow" }, "ogro", "ogro_blue", "ogro_red", true },
+-        { "inky", "inky/blue", "inky/red", "inky/hudguns", NULL, "inky/quad", { "inky/armor/blue", "inky/armor/green", "inky/armor/yellow" }, "inky", "inky_blue", "inky_red", true },
+-        { "captaincannon", "captaincannon/blue", "captaincannon/red", "captaincannon/hudguns", NULL, "captaincannon/quad", { "captaincannon/armor/blue", "captaincannon/armor/green", "captaincannon/armor/yellow" }, "captaincannon", "captaincannon_blue", "captaincannon_red", true }
++        { "ogro2", "ogro2/blue", "ogro2/red", "mrfixit/hudguns", NULL, "ogro2/quad", { "ogro2/armor/blue", "ogro2/armor/green", "ogro2/armor/yellow" }, "ogro", "ogro_blue", "ogro_red", true, "ogro2/green", "ogro2/purple" },
++        { "inky", "inky/blue", "inky/red", "inky/hudguns", NULL, "inky/quad", { "inky/armor/blue", "inky/armor/green", "inky/armor/yellow" }, "inky", "inky_blue", "inky_red", true, "inky/green", "inky/purple" },
++        { "captaincannon", "captaincannon/blue", "captaincannon/red", "captaincannon/hudguns", NULL, "captaincannon/quad", { "captaincannon/armor/blue", "captaincannon/armor/green", "captaincannon/armor/yellow" }, "captaincannon", "captaincannon_blue", "captaincannon_red", true, "captaincannon/green", "captaincannon/purple" }
+     };
+ 
+     int chooserandomplayermodel(int seed)
+@@ -116,6 +117,8 @@
+             {
+                 preloadmodel(mdl->blueteam);
+                 preloadmodel(mdl->redteam);
++                if(mdl->greenteam) preloadmodel(mdl->greenteam);
++                if(mdl->purpleteam) preloadmodel(mdl->purpleteam);
+             }
+             else preloadmodel(mdl->ffa);
+             if(mdl->vwep) preloadmodel(mdl->vwep);
+@@ -179,6 +182,12 @@
+             case 1: mdlname = mdl.blueteam; break;
+             case 2: mdlname = mdl.redteam; break;
+         }
++        // SwiftGibs: friend teammates render green, friend enemies render purple
++        if(highlightfriends && friendmodels && isfriendname(d->name))
++        {
++            if(team == 1)      mdlname = mdl.greenteam;
++            else if(team == 2) mdlname = mdl.purpleteam;
++        }
+         renderclient(d, mdlname, a[0].tag ? a : NULL, hold, attack, delay, lastaction, intermission && d->state!=CS_DEAD ? 0 : d->lastpain, fade, ragdoll && mdl.ragdoll);
+ #if 0
+         if(d->state!=CS_DEAD && d->quadmillis) 
+--- a/fpsgame/game.h
++++ b/fpsgame/game.h
+@@ -835,6 +835,7 @@
+                    *vwep, *quad, *armour[3],
+                    *ffaicon, *blueicon, *redicon;
+         bool ragdoll;
++        const char *greenteam, *purpleteam;   // SwiftGibs: friend-teammate / friend-enemy skins
+     };
+ 
+     extern int playermodel, teamskins, testteam;
