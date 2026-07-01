@@ -88,3 +88,18 @@ are reconstructed from the server's *"X suggests &lt;mode&gt; on map &lt;map&gt;
 that's accurate; a server that rewords those messages just shows fewer/no counts — it never breaks. Maps
 without a mapshot show a placeholder cube; on a very busy server only the top few candidates fit
 (the rest are notice-lined).
+
+## Player render styles (flat colours / hitbox)
+Players render as clean **flat team colours** for maximum visibility, in one of two switchable styles
+(press **`P`**, or **F3 → "player render style…"**):
+
+- **Flat colour model (default)** — the normal character, skinned in a solid team colour.
+- **Hitbox octagon** — an engine-drawn octagonal prism matching the **exact hit shape** (Sauerbraten's hit
+  volume is a cylinder: radius 4.1, feet-to-just-above-eyes), plus a **facing prong** showing which way each
+  player is looking (aim direction, up/down included). So you always know precisely what you can hit.
+
+Both use the same palette — **teammate blue, friend cyan, enemy red, friend-on-enemy orange** — which also
+retints the minimap friend blip to **cyan**. (Colours are cvars: `hbblue/hbcyan/hbred/hborange`.)
+
+This is **purely visual and client-side** — hit detection is unchanged (it always uses that cylinder), so it
+stays fully compatible with official servers. `playerstyle` (0 flat / 1 hitbox) persists between launches.
