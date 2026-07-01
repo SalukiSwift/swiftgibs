@@ -1,0 +1,51 @@
+--- a/fpsgame/fps.cpp
++++ b/fpsgame/fps.cpp
+@@ -236,8 +236,10 @@
+         }
+     }
+ 
++    void updatereloadmetronome();
+     void updateworld()        // main game update loop
+     {
++        updatereloadmetronome();
+         if(!maptime) { maptime = lastmillis; maprealtime = totalmillis; return; }
+         if(!curtime) { gets2c(); if(player1->clientnum>=0) c2sinfo(); return; }
+ 
+@@ -1333,6 +1335,37 @@
+         }
+     }
+ 
++    // === SwiftGibs reload metronome (audio tick/ding over the rifle reload) ===
++    VARP(reloadmetronome, 0, 0, 2);    // 0=off, 1=flat, 2=rising
++    FVARP(reloadmetrovol, 0, 1, 1);
++    void updatereloadmetronome()
++    {
++        static int mact = -1, mticks = 0; static bool mding = false;
++        const int DUR = 1500, BEAT = 500;
++        if(reloadmetronome == 0) { mact = -1; return; }
++        int start = -1;
++        fpsent *d = player1;
++        if(d->state == CS_ALIVE && d->lastattackgun == GUN_RIFLE)
++        { int e = lastmillis - d->lastaction; if(e >= 0 && e < DUR + 200) start = d->lastaction; }
++        if(start < 0) { int e = lastmillis - reloaddemostart; if(e >= 0 && e < DUR + 200) start = reloaddemostart; }
++        if(start < 0) { mact = -1; return; }
++        if(start != mact) { mact = start; mticks = 0; mding = false; }
++        int e = lastmillis - start, vol = int(reloadmetrovol * 100.0f + 0.5f);
++        while(mticks < 3 && e >= mticks * BEAT)
++        {
++            const char *snd = reloadmetronome == 2
++                ? (mticks == 0 ? "swiftgibs/tick_lo" : mticks == 1 ? "swiftgibs/tick_mid" : "swiftgibs/tick_hi")
++                : "swiftgibs/tick_mid";
++            playsoundname(snd, NULL, vol);
++            mticks++;
++        }
++        if(!mding && e >= DUR)
++        {
++            playsoundname("swiftgibs/ding", NULL, vol);
++            mding = true;
++        }
++    }
++
+     void gameplayhud(int w, int h)
+     {
+         pushhudmatrix();
