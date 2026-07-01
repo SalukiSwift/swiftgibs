@@ -1,0 +1,90 @@
+--- a/fpsgame/render.cpp
++++ b/fpsgame/render.cpp
+@@ -1,4 +1,5 @@
+ #include "game.h"
++#include "texture.h"   // SwiftGibs: notextureshader for flat hitbox geometry
+ 
+ struct spawninfo { const extentity *e; float weight; };
+ extern float gatherspawninfos(dynent *d, int tag, vector<spawninfo> &spawninfos);
+@@ -131,8 +132,69 @@
+     VAR(testarmour, 0, 0, 1);
+     VAR(testteam, 0, 0, 3);
+ 
++    // SwiftGibs: flat player render styles -----------------------------------------------
++    VARP(playerstyle, 0, 0, 1); // 0 = flat colour model (default), 1 = hitbox octagon
++    VARP(hbblue,   0, 0x4D73FF, 0xFFFFFF); // teammate
++    VARP(hbcyan,   0, 0x1AE6FF, 0xFFFFFF); // friend teammate
++    VARP(hbred,    0, 0xFF4033, 0xFFFFFF); // enemy
++    VARP(hborange, 0, 0xFF801F, 0xFFFFFF); // friend on enemy team
++
++    static inline void hbcol(int hex, float &r, float &g, float &b)
++    { r = ((hex>>16)&0xFF)/255.0f; g = ((hex>>8)&0xFF)/255.0f; b = (hex&0xFF)/255.0f; }
++
++    // draw the exact hit cylinder as a flat octagonal prism + a yaw/pitch facing prong
++    void drawhitboxshape(fpsent *d, int hex)
++    {
++        float r = d->radius, z0 = d->o.z - d->eyeheight, z1 = d->o.z + d->aboveeye, cx = d->o.x, cy = d->o.y;
++        const int S = 8;
++        float px[S], py[S];
++        loopi(S) { float a = i*2.0f*(float)M_PI/S; px[i] = cx + r*cosf(a); py[i] = cy + r*sinf(a); }
++        float cr, cg, cb; hbcol(hex, cr, cg, cb);
++        notextureshader->set();
++        loopi(S) // 8 side faces, shaded by facing so the prism reads as a solid
++        {
++            int j = (i+1)%S;
++            float nx = (px[i]+px[j])*0.5f - cx, ny = (py[i]+py[j])*0.5f - cy, nl = sqrtf(nx*nx+ny*ny);
++            float sh = nl>0 ? 0.60f + 0.40f*clamp(((nx/nl)*0.4f + (ny/nl)*0.6f)*0.5f + 0.5f, 0.0f, 1.0f) : 1.0f;
++            gle::colorf(cr*sh, cg*sh, cb*sh, 1.0f);
++            gle::defvertex(3);
++            gle::begin(GL_TRIANGLE_STRIP, 4);
++            gle::attrib(vec(px[i], py[i], z0)); gle::attrib(vec(px[i], py[i], z1));
++            gle::attrib(vec(px[j], py[j], z0)); gle::attrib(vec(px[j], py[j], z1));
++            gle::end();
++        }
++        loopk(2) // caps: top brighter, bottom darker
++        {
++            float z = k ? z1 : z0, sh = k ? 1.0f : 0.45f;
++            gle::colorf(cr*sh, cg*sh, cb*sh, 1.0f);
++            gle::defvertex(3);
++            gle::begin(GL_TRIANGLE_FAN, S+2);
++            gle::attrib(vec(cx, cy, z));
++            loopi(S+1) gle::attrib(vec(px[i%S], py[i%S], z));
++            gle::end();
++        }
++        vec dir; vecfromyawpitch(d->yaw, d->pitch, 1, 0, dir); // gaze prong = facing (yaw+pitch)
++        vec eye(cx, cy, d->o.z), tip = vec(eye).add(vec(dir).mul(r*1.9f));
++        vec side = vec(dir.y, -dir.x, 0);
++        if(side.magnitude() > 1e-4f) { side.normalize(); side.mul(r*0.5f); } else side = vec(r*0.5f, 0, 0);
++        gle::colorf(cr, cg, cb, 1.0f);
++        gle::defvertex(3);
++        gle::begin(GL_TRIANGLES, 3);
++        gle::attrib(tip); gle::attrib(vec(eye).add(side)); gle::attrib(vec(eye).sub(side));
++        gle::end();
++    }
++    // -------------------------------------------------------------------------------------
++
+     void renderplayer(fpsent *d, const playermodelinfo &mdl, int team, float fade, bool mainpass)
+     {
++        int hbteam = testteam ? testteam-1 : team;
++        bool hbfriend = highlightfriends && isfriendname(d->name);
++        if(playerstyle == 1) // hitbox octagon: draw the exact hit shape, skip the model
++        {
++            int hex = hbteam==1 ? (hbfriend?hbcyan:hbblue) : hbteam==2 ? (hbfriend?hborange:hbred) : (hbfriend?hbcyan:hbred);
++            drawhitboxshape(d, hex);
++            return;
++        }
+         int lastaction = d->lastaction, hold = mdl.vwep || d->gunselect==GUN_PISTOL ? 0 : (ANIM_HOLD1+d->gunselect)|ANIM_LOOP, attack = ANIM_ATTACK1+d->gunselect, delay = mdl.vwep ? 300 : guns[d->gunselect].attackdelay+50;
+         if(intermission && d->state!=CS_DEAD)
+         {
+@@ -188,6 +250,11 @@
+             if(team == 1)      mdlname = mdl.greenteam;
+             else if(team == 2) mdlname = mdl.purpleteam;
+         }
++        // SwiftGibs: flat solid team-colour skin (style 0) -- overrides the stock/friend choice above
++        string flatname;
++        const char *fc = hbteam==1 ? (hbfriend?"flatcyan":"flatblue") : hbteam==2 ? (hbfriend?"flatorange":"flatred") : (hbfriend?"flatcyan":"flatred");
++        formatstring(flatname, "%s/%s", mdl.ffa, fc);
++        mdlname = flatname;
+         renderclient(d, mdlname, a[0].tag ? a : NULL, hold, attack, delay, lastaction, intermission && d->state!=CS_DEAD ? 0 : d->lastpain, fade, ragdoll && mdl.ragdoll);
+ #if 0
+         if(d->state!=CS_DEAD && d->quadmillis) 
