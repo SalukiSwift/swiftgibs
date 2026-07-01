@@ -6,11 +6,11 @@
  
  namespace game
  {
-@@ -1104,6 +1105,261 @@
+@@ -1104,6 +1105,234 @@
          pophudmatrix();
      }
  
-+    VARP(reloadcount, 0, 1, 7);   // 0=off, 1=Drift, 2=Slam, 3=Zoom, 4=Tick, 5=Rings, 6=Wedges, 7=Pulse
++    VARP(reloadcount, 0, 1, 7);   // 0=off; 1 Rings 2 Pulse 3 Collapse 4 Sweep 5 Pips 6 CrosshairPulse 7 Digits
 +
 +    int reloaddemostart = -100000;
 +    ICOMMAND(reloadcountdemo, "", (), { reloaddemostart = lastmillis; });
@@ -18,257 +18,230 @@
 +    int reloadfreezems = -1;
 +    ICOMMAND(reloadcountfreeze, "ii", (int *style, int *ms), { reloadcount = *style; reloadfreezems = *ms; });
 +
-+    // Returns elapsed ms in [0,1500) when any countdown source is active, else -1.
++    // === SwiftGibs reload-countdown v3 shared layer ===
++    static const int RC_DUR = 1500, RC_POP = 180;
++
++    // Returns elapsed ms in [0,RC_DUR) when any countdown source is active, else -1.
 +    int reloadcountdownElapsed()
 +    {
 +        fpsent *d = hudplayer();
 +        if(d->state == CS_SPECTATOR || d->state == CS_DEAD) return -1;
-+
-+        const int dur = 1500;
-+
 +        if(reloadfreezems >= 0) return reloadfreezems;
-+
 +        int e = lastmillis - d->lastaction;
 +        if(d->lastattackgun == GUN_RIFLE && d->gunwait > 0 && e >= 0 && e < d->gunwait) return e;
-+
 +        int de = lastmillis - reloaddemostart;
-+        if(de >= 0 && de < dur) return de;
-+
++        if(de >= 0 && de < RC_DUR) return de;
 +        return -1;
 +    }
 +
 +    ICOMMAND(testreload, "", (), { player1->lastaction = lastmillis; player1->gunwait = guns[GUN_RIFLE].attackdelay; player1->lastattackgun = GUN_RIFLE; });
 +
-+    // Returns crosshair opacity: 1.0 normally; ramps 0.30→0.65 during the countdown so it
-+    // stays visible but faded (player can aim; brightens toward "ready").
++    // per-beat colour journey: idx 0=count3 cyan, 1=count2 amber, 2=count1 hot
++    static void reloadbeatcolor(int idx, float &r, float &g, float &b)
++    {
++        static const float C[3][3] = {{0.25f,0.85f,1.00f},{1.00f,0.65f,0.15f},{1.00f,0.28f,0.22f}};
++        int i = clamp(idx, 0, 2); r = C[i][0]; g = C[i][1]; b = C[i][2];
++    }
++    static inline float beatpunch(float t) { return t < 0.18f ? t / 0.18f : 1.0f; }
++    static inline float easeoutquad(float p) { p = clamp(p, 0.0f, 1.0f); return 1.0f - (1.0f - p) * (1.0f - p); }
++
++    // Draw a filled annulus (ring) in the hud space centred at (cx,cy).
++    static void reloadring(float cx, float cy, float R, float thk, float r, float g, float b, float a)
++    {
++        if(a < 0.01f || R <= 0.0f) return;
++        const int N = 56; float Ro = R + thk*0.5f, Ri = max(0.0f, R - thk*0.5f);
++        gle::colorf(r, g, b, a);
++        gle::defvertex(2);
++        gle::begin(GL_TRIANGLE_STRIP, (N + 1) * 2);
++        for(int i = 0; i <= N; i++) { float ang = i*2.0f*(float)M_PI/N, cc = cosf(ang), ss = sinf(ang); gle::attribf(cx+Ro*cc, cy+Ro*ss); gle::attribf(cx+Ri*cc, cy+Ri*ss); }
++        gle::end();
++    }
++    static void reloaddisc(float cx, float cy, float R, float r, float g, float b, float a)
++    {
++        if(a < 0.01f || R <= 0.0f) return;
++        const int N = 40;
++        gle::colorf(r, g, b, a);
++        gle::defvertex(2);
++        gle::begin(GL_TRIANGLE_FAN, N + 2);
++        gle::attribf(cx, cy);
++        for(int i = 0; i <= N; i++) { float ang = i*2.0f*(float)M_PI/N; gle::attribf(cx + R*cosf(ang), cy + R*sinf(ang)); }
++        gle::end();
++    }
++
++    // Pop-phase timer: elapsed in [0,RC_POP) during the READY pop window, else -1 (honors freeze).
++    int reloadpopElapsed()
++    {
++        if(reloadcount == 0) return -1;
++        fpsent *d = hudplayer();
++        if(d->state == CS_SPECTATOR || d->state == CS_DEAD) return -1;
++        if(reloadfreezems >= 0)
++            return (reloadfreezems >= RC_DUR && reloadfreezems < RC_DUR + RC_POP) ? reloadfreezems - RC_DUR : -1;
++        int e = lastmillis - d->lastaction;
++        if(d->lastattackgun == GUN_RIFLE && e >= RC_DUR && e < RC_DUR + RC_POP) return e - RC_DUR;
++        int de = lastmillis - reloaddemostart;
++        if(de >= RC_DUR && de < RC_DUR + RC_POP) return de - RC_DUR;
++        return -1;
++    }
++
++    // Crosshair opacity: full normally; faded-but-aimable during the count (brightens toward ready).
 +    float reloadcrosshairfade()
 +    {
 +        if(reloadcount == 0) return 1.0f;
 +        int elapsed = reloadcountdownElapsed();
-+        if(elapsed < 0) return 1.0f;  // pop phase or no countdown
-+        return 0.40f + 0.30f * (elapsed / 1500.0f);
++        if(elapsed < 0 || elapsed >= RC_DUR) return 1.0f;
++        if(reloadcount == 6) { float bt = (elapsed % (RC_DUR/3)) / (float)(RC_DUR/3); return 0.50f + 0.50f * (1.0f - bt) * (1.0f - bt); }
++        return 0.45f + 0.30f * (elapsed / (float)RC_DUR);
 +    }
 +
-+    // Returns crosshair scale: 1.0 normally, >1.0 during the 160ms pop-in after countdown ends.
++    // Crosshair scale: punchy pop at ready; per-beat pulse for the Crosshair-Pulse style.
 +    float reloadcrosshairscale()
 +    {
 +        if(reloadcount == 0) return 1.0f;
-+
-+        const int popStart = 1500;
-+        const int popDur   = 160;
-+
-+        fpsent *d = hudplayer();
-+        if(d->state == CS_SPECTATOR || d->state == CS_DEAD) return 1.0f;
-+
-+        int t = -1;
-+        if(reloadfreezems < 0)
++        if(reloadcount == 6)
 +        {
-+            int e = lastmillis - d->lastaction;
-+            if(d->lastattackgun == GUN_RIFLE && e >= popStart && e < popStart + popDur)
-+                t = e;
-+            else
-+            {
-+                int de = lastmillis - reloaddemostart;
-+                if(de >= popStart && de < popStart + popDur) t = de;
-+            }
++            int ce = reloadcountdownElapsed();
++            if(ce >= 0) { float bt = (ce % (RC_DUR/3)) / (float)(RC_DUR/3); return 1.0f + 0.85f * (1.0f - easeoutquad(bt)); }
 +        }
++        int t = reloadpopElapsed();
 +        if(t < 0) return 1.0f;
-+
-+        float p = (t - popStart) / (float)popDur;  // 0..1 over the pop window
-+        return 1.0f + 0.7f * (1.0f - p) * (1.0f - p);  // 1.7 → 1.0 (ease-out quad)
++        float p = t / (float)RC_POP;
++        return 1.0f + 0.9f * (1.0f - easeoutquad(p));
 +    }
 +
 +    void drawreloadcountdown(int w, int h)
 +    {
 +        if(reloadcount == 0) return;
-+
 +        fpsent *d = hudplayer();
 +        if(d->state == CS_SPECTATOR || d->state == CS_DEAD) return;
 +
-+        const int dur = 1500;
-+        int elapsed = reloadcountdownElapsed();
-+
-+        if(elapsed < 0 || elapsed >= dur) return;
-+
-+        const int beat = dur / 3;  // 500ms per number
-+        int idx = min(elapsed / beat, 2);
-+        int number = 3 - idx;
-+        float t = (elapsed - idx * beat) / (float)beat;  // 0..1 within this beat
-+
-+        // Center of the 1800-unit virtual space (shared by text and graphical styles)
 +        float cx = w * 900.0f / h;
 +        float cy = 900.0f;
 +
-+        // --- Graphical styles 5/6/7 (shapes, no text) ---
-+        if(reloadcount >= 5)
++        // Universal READY flash: bright green ring ping + a quick centre bloom (any style).
 +        {
-+            switch(reloadcount)
++            int pe = reloadpopElapsed();
++            if(pe >= 0)
 +            {
-+                case 5: // Rings: 3 concentric annuli, lose outermost each beat
-+                {
-+                    const int N = 48;
-+                    const float radii[3] = {60.0f, 100.0f, 140.0f};
-+                    const float thk = 12.0f;
-+                    int numRings = 3 - idx; // rings to draw incl. the leaving one
-+
-+                    hudnotextureshader->set();
-+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-+
-+                    for(int ri = 0; ri < numRings; ri++)
-+                    {
-+                        float Ro = radii[ri] + thk * 0.5f;
-+                        float Ri = radii[ri] - thk * 0.5f;
-+                        float a = (ri == numRings - 1) ? 0.8f * (1.0f - t) : 0.8f;
-+                        if(a < 0.01f) continue;
-+
-+                        gle::colorf(0.3f, 0.9f, 1.0f, a);
-+                        gle::defvertex(2);
-+                        gle::begin(GL_TRIANGLE_STRIP, (N + 1) * 2);
-+                        for(int i = 0; i <= N; i++)
-+                        {
-+                            float ang = i * 2.0f * (float)M_PI / N;
-+                            float cc = cosf(ang), ss = sinf(ang);
-+                            gle::attribf(cx + Ro * cc, cy + Ro * ss);
-+                            gle::attribf(cx + Ri * cc, cy + Ri * ss);
-+                        }
-+                        gle::end();
-+                    }
-+
-+                    hudshader->set();
-+                    return;
-+                }
-+                case 6: // Wedges: filled triangles pointing inward, spaced 120 deg, amber
-+                {
-+                    const float rbase = 115.0f, rapex = 50.0f, halfArc = 0.30f;
-+                    const float wangles[3] = {
-+                        -(float)M_PI / 2.0f,                              // top
-+                        (float)M_PI / 6.0f,                               // lower-right
-+                        5.0f * (float)M_PI / 6.0f                         // lower-left
-+                    };
-+                    int numWedges = 3 - idx;
-+
-+                    hudnotextureshader->set();
-+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-+
-+                    for(int wi = 0; wi < numWedges; wi++)
-+                    {
-+                        float a = (wi == numWedges - 1) ? 0.85f * (1.0f - t) : 0.85f;
-+                        if(a < 0.01f) continue;
-+
-+                        float ang = wangles[wi];
-+                        float bx1 = cx + rbase * cosf(ang - halfArc);
-+                        float by1 = cy + rbase * sinf(ang - halfArc);
-+                        float bx2 = cx + rbase * cosf(ang + halfArc);
-+                        float by2 = cy + rbase * sinf(ang + halfArc);
-+                        float ax  = cx + rapex * cosf(ang);
-+                        float ay  = cy + rapex * sinf(ang);
-+
-+                        gle::colorf(1.0f, 0.55f, 0.1f, a);
-+                        gle::defvertex(2);
-+                        gle::begin(GL_TRIANGLES);
-+                        gle::attribf(bx1, by1);
-+                        gle::attribf(bx2, by2);
-+                        gle::attribf(ax,  ay);
-+                        gle::end();
-+                    }
-+
-+                    hudshader->set();
-+                    return;
-+                }
-+                case 7: // Pulse: one expanding ring per beat, additive blend
-+                {
-+                    const int N = 48;
-+                    const float R  = 40.0f + 135.0f * t; // lerp(40, 175, t)
-+                    const float thk = 10.0f;
-+                    const float Ro = R + thk * 0.5f;
-+                    const float Ri = R - thk * 0.5f;
-+                    float a = 0.9f * (1.0f - t);
-+
-+                    hudnotextureshader->set();
-+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE);   // additive glow
-+
-+                    gle::colorf(0.6f, 0.95f, 1.0f, a);
-+                    gle::defvertex(2);
-+                    gle::begin(GL_TRIANGLE_STRIP, (N + 1) * 2);
-+                    for(int i = 0; i <= N; i++)
-+                    {
-+                        float ang = i * 2.0f * (float)M_PI / N;
-+                        float cc = cosf(ang), ss = sinf(ang);
-+                        gle::attribf(cx + Ro * cc, cy + Ro * ss);
-+                        gle::attribf(cx + Ri * cc, cy + Ri * ss);
-+                    }
-+                    gle::end();
-+
-+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); // restore
-+                    hudshader->set();
-+                    return;
-+                }
++                float p = pe / (float)RC_POP;
++                hudnotextureshader->set();
++                glBlendFunc(GL_SRC_ALPHA, GL_ONE);
++                reloadring(cx, cy, 60.0f + 300.0f * easeoutquad(p), 26.0f, 0.40f, 1.0f, 0.50f, 1.0f - p);
++                reloaddisc(cx, cy, 55.0f * (1.0f - p), 0.55f, 1.0f, 0.60f, 0.7f * (1.0f - p*p));
++                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++                hudshader->set();
++                return;
 +            }
-+            hudshader->set();
-+            return;
 +        }
 +
-+        // --- Text number styles (1-4) ---
-+        defformatstring(numstr, "%d", number);
-+        int tw, th;
-+        text_bounds(numstr, tw, th);
-+        if(th <= 0) return;
++        int elapsed = reloadcountdownElapsed();
++        if(elapsed < 0 || elapsed >= RC_DUR) return;
 +
-+        float alpha = 1.0f;
-+        float styleScale = 1.0f;
-+        float dx = 0.0f, dy = 0.0f;
-+        int r = 255, g = 255, b = 255;
-+        float TARGET_H = 180.0f; // smaller numbers, easier to aim through
++        const int beat = RC_DUR / 3;
++        int idx = min(elapsed / beat, 2);
++        int number = 3 - idx;
++        float t = (elapsed - idx * beat) / (float)beat;
++
++        float cr, cg, cb; reloadbeatcolor(idx, cr, cg, cb);
 +
 +        switch(reloadcount)
 +        {
-+            case 1: // Drift: fade in fast then shrink+fade in place (no upward motion)
-+                alpha = t < 0.12f ? t / 0.12f : 1.0f - (t - 0.12f) / 0.88f;
-+                styleScale = 1.0f - 0.45f * t;
-+                r = 255; g = 255; b = 255;
-+                break;
-+            case 2: // Slam: scale-overshoot bounce in, hold, fade
-+                if(t < 0.18f)      styleScale = 1.6f - (0.9f) * (t / 0.18f);
-+                else if(t < 0.30f) styleScale = 0.7f + (0.3f) * ((t - 0.18f) / 0.12f);
-+                else               styleScale = 1.0f;
-+                alpha = t < 0.65f ? 1.0f : 1.0f - (t - 0.65f) / 0.35f;
-+                r = 255; g = 200; b = 40;
-+                break;
-+            case 3: // Zoom: rush from small to large while fading (trimmed scale)
-+                styleScale = 0.5f + 1.0f * t;
-+                alpha = 1.0f - t * t;
-+                r = 255; g = 80; b = 60;
-+                break;
-+            case 4: // Tick: small, soft fade in/out in place
-+                TARGET_H = 130.0f;
-+                styleScale = 1.0f;
-+                alpha = (t < 0.25f ? t / 0.25f : (t > 0.6f ? 1.0f - (t - 0.6f) / 0.4f : 1.0f)) * 0.7f;
-+                r = 220; g = 235; b = 255;
-+                break;
++            case 1: // Rings -- N solid rings (=remaining count), current-beat colour, per-beat scale punch
++            {
++                int numRings = 3 - idx;
++                float pop = 1.0f + 0.30f * (1.0f - beatpunch(t));
++                hudnotextureshader->set();
++                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++                for(int ri = 0; ri < numRings; ri++)
++                    reloadring(cx, cy, (46.0f + 40.0f * ri) * pop, 20.0f, cr, cg, cb, 0.90f - 0.16f * ri);
++                hudshader->set();
++                return;
++            }
++            case 2: // Pulse -- one expanding ping per beat, additive, colour journey, brighter last beat
++            {
++                float pr = easeoutquad(t);
++                float a = (0.75f + (idx == 2 ? 0.25f : 0.0f)) * (1.0f - pr);
++                hudnotextureshader->set();
++                glBlendFunc(GL_SRC_ALPHA, GL_ONE);
++                reloadring(cx, cy, 40.0f + 175.0f * pr, 16.0f, cr, cg, cb, a);
++                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++                hudshader->set();
++                return;
++            }
++            case 3: // Collapse -- ring contracts to the crosshair, arriving at fire-time
++            {
++                float R = 190.0f * (1.0f - easeoutquad(t)) + 8.0f;
++                float a = 0.90f * (0.35f + 0.65f * t);
++                hudnotextureshader->set();
++                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++                reloadring(cx, cy, R, 18.0f, cr, cg, cb, a);
++                hudshader->set();
++                return;
++            }
++            case 4: // Sweep -- arc fills clockwise, full circle at fire-time, tick each beat
++            {
++                const int N = 72; const float Ro = 128.0f, Ri = 106.0f;
++                float frac = elapsed / (float)RC_DUR;
++                int segs = max(1, (int)(N * frac + 0.5f));
++                float tick = 1.0f - min(1.0f, (elapsed % beat) / 110.0f);
++                float a = 0.80f + 0.20f * tick;
++                hudnotextureshader->set();
++                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++                gle::colorf(cr, cg, cb, a);
++                gle::defvertex(2);
++                gle::begin(GL_TRIANGLE_STRIP, (segs + 1) * 2);
++                for(int i = 0; i <= segs; i++) { float ang = -(float)M_PI/2.0f + (i/(float)N)*2.0f*(float)M_PI, cc = cosf(ang), ss = sinf(ang); gle::attribf(cx+Ro*cc, cy+Ro*ss); gle::attribf(cx+Ri*cc, cy+Ri*ss); }
++                gle::end();
++                hudshader->set();
++                return;
++            }
++            case 5: // Pips -- 3 charges ring the crosshair; deplete one per beat (ghost when spent)
++            {
++                const float ringR = 82.0f, pipR = 21.0f;
++                hudnotextureshader->set();
++                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++                reloadring(cx, cy, ringR, 3.0f, cr, cg, cb, 0.22f);   // faint connecting ring
++                for(int k = 0; k < 3; k++)
++                {
++                    float ang = -(float)M_PI/2.0f + k * (2.0f*(float)M_PI/3.0f);
++                    float px = cx + ringR*cosf(ang), py = cy + ringR*sinf(ang);
++                    bool lit = (k < number);
++                    bool spending = (k == number - 1);
++                    if(!lit) { reloadring(px, py, pipR*0.85f, 4.0f, cr, cg, cb, 0.20f); continue; }  // ghost
++                    float a = spending ? (1.0f - easeoutquad(t)) : 0.92f;
++                    float sc = spending ? (1.0f + 0.6f * beatpunch(t) * (1.0f - t)) : 1.0f;
++                    reloaddisc(px, py, pipR * sc, cr, cg, cb, a);
++                }
++                hudshader->set();
++                return;
++            }
++            case 6: // Crosshair Pulse -- effect is in the crosshair hooks; nothing drawn here
++                return;
++            case 7: // Digits (below the crosshair)
++            {
++                defformatstring(numstr, "%d", number);
++                int tw, th; text_bounds(numstr, tw, th);
++                if(th <= 0) return;
++                float scl = 0.9f + 0.30f * beatpunch(t);
++                float alpha = (t < 0.12f ? t / 0.12f : 1.0f) * 0.90f;
++                if(alpha < 0.01f) return;
++                const float TARGET_H = 130.0f;
++                float s = (TARGET_H / (float)th) * scl;
++                pushhudmatrix();
++                hudmatrix.translate(cx, cy + 165.0f, 0);
++                hudmatrix.scale(s, s, 1);
++                flushhudmatrix();
++                draw_text(numstr, -tw/2, -th/2, int(cr*255.0f), int(cg*255.0f), int(cb*255.0f), int(alpha*255.0f));
++                pophudmatrix();
++                return;
++            }
 +            default: return;
 +        }
-+
-+        alpha = max(0.0f, min(1.0f, alpha));
-+        if(alpha < 0.01f) return;
-+
-+        float baseS = TARGET_H / (float)th;
-+        float s = baseS * styleScale;
-+
-+        pushhudmatrix();
-+        hudmatrix.translate(cx + dx, cy + dy, 0);
-+        hudmatrix.scale(s, s, 1);
-+        flushhudmatrix();
-+
-+        int a = int(alpha * 255.0f + 0.5f);
-+        draw_text(numstr, -tw/2, -th/2, r, g, b, a);
-+
-+        pophudmatrix();
 +    }
 +
      void gameplayhud(int w, int h)
      {
          pushhudmatrix();
-@@ -1134,6 +1390,8 @@
+@@ -1134,6 +1363,8 @@
              if(cmode) cmode->drawhud(d, w, h);
          }
  
