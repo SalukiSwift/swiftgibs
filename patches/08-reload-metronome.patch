@@ -16,8 +16,8 @@
      }
  
 +    // === SwiftGibs reload metronome (audio tick/ding over the rifle reload) ===
-+    VARP(reloadmetronome, 0, 0, 2);    // 0=off, 1=flat, 2=rising
-+    FVARP(reloadmetrovol, 0, 1, 1);
++    VARP(reloadmetronome, 0, 0, 2);      // 0=off, 1=flat, 2=rising
++    VARP(reloadmetrovol, 0, 200, 255);   // playsound volume (0..255; 255=full)
 +    void updatereloadmetronome()
 +    {
 +        static int mact = -1, mticks = 0; static bool mding = false;
@@ -30,7 +30,7 @@
 +        if(start < 0) { int e = lastmillis - reloaddemostart; if(e >= 0 && e < DUR + 200) start = reloaddemostart; }
 +        if(start < 0) { mact = -1; return; }
 +        if(start != mact) { mact = start; mticks = 0; mding = false; }
-+        int e = lastmillis - start, vol = int(reloadmetrovol * 100.0f + 0.5f);
++        int e = lastmillis - start, vol = reloadmetrovol;
 +        while(mticks < 3 && e >= mticks * BEAT)
 +        {
 +            const char *snd = reloadmetronome == 2
