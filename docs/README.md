@@ -72,3 +72,19 @@ with the visuals off. Two flavours: **Flat** (same tick each beat) or **Rising**
 up to the ding). Pick it in **F3 → "reload sound (metronome)..."** (or `/reloadmetronome 0..2` — 0 off,
 1 flat, 2 rising); volume via `/reloadmetrovol 0..1`. Default **off**. The sounds live in
 `packages/sounds/swiftgibs/` — swap in your own `.ogg` if you like.
+
+## Map-vote panel (intermission)
+At the end of a match a **pop-up panel** shows the maps people are voting for — each with a **mapshot
+preview**, its game mode, a **live vote count**, and a **vote** button. **Click a mapshot or its button to
+cast (or change) your vote** — no more squinting at the tiny top-left log. The current leader is marked
+**`>`** and your own pick is tagged **(your vote)**; the list is sorted most-voted first.
+
+It **auto-opens at intermission** (toggle that with the **"auto-open at intermission"** checkbox in the
+panel, or `/mapvotepopup 0`), and you can open it any time with the **`V`** key. The console still prints
+the usual suggest messages.
+
+This is **client-side only** (so SwiftGibs stays compatible with normal Sauerbraten servers): the counts
+are reconstructed from the server's *"X suggests &lt;mode&gt; on map &lt;map&gt;"* messages. On stock servers
+that's accurate; a server that rewords those messages just shows fewer/no counts — it never breaks. Maps
+without a mapshot show a placeholder cube; on a very busy server only the top few candidates fit
+(the rest are notice-lined).
