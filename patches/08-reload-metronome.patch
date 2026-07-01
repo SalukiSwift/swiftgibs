@@ -36,12 +36,12 @@
 +            const char *snd = reloadmetronome == 2
 +                ? (mticks == 0 ? "swiftgibs/tick_lo" : mticks == 1 ? "swiftgibs/tick_mid" : "swiftgibs/tick_hi")
 +                : "swiftgibs/tick_mid";
-+            playsoundname(snd, NULL, vol);
++            if(vol > 0) playsoundname(snd, NULL, vol);   // vol 0 = muted (engine treats raw 0 as "default")
 +            mticks++;
 +        }
 +        if(!mding && e >= DUR)
 +        {
-+            playsoundname("swiftgibs/ding", NULL, vol);
++            if(vol > 0) playsoundname("swiftgibs/ding", NULL, vol);
 +            mding = true;
 +        }
 +    }
