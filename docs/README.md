@@ -51,9 +51,16 @@ Stripped-down instagib Sauerbraten with Swift's competitive config. Unzip and ru
   regenerate with `tools/make-friend-skins.sh` (tune `GREEN_MOD`/`PURPLE_MOD`).
 
 ## Reload countdown (rifle)
-A rhythmic countdown fills the rifle's 1.5s reload, then the crosshair snaps back to full when you can fire.
-The crosshair stays visible but **faded** during the count (brightening as you near ready) so you can keep aiming.
+A **beat-locked** countdown fills the rifle's 1.5s reload, then a bright **green READY flash** + crosshair
+pop fires the instant you can shoot again — so it's unmistakable when you're ready. The crosshair stays
+**faded but aimable** during the count (brightening toward ready). Colours count you down:
+**cyan → amber → red**, then **green** GO.
 Pick a style or turn it off in **F3 → "reload countdown..."** — seven styles plus Off:
-- **Number styles:** Drift (fade + shrink in place), Slam (bold amber punch), Zoom (rushes in, red), Tick (small & subtle).
-- **Graphical styles:** Rings (3 cyan rings collapse inward, one per beat), Wedges (3 amber reticle prongs count down), Pulse (a bright ring pings outward each beat).
+- **Rings** — 3 cyan rings, one drops per beat, a punch on each beat.
+- **Pulse** — an expanding ring ping per beat (additive glow), brightest on the last beat.
+- **Collapse** — a ring contracts into the crosshair, arriving exactly at fire-time ("charging up").
+- **Sweep** — a clock-arc fills around the crosshair, completing the full circle right at ready.
+- **Pips** — 3 charges ringing the crosshair, depleting one per beat.
+- **Crosshair Pulse** — the crosshair itself breathes on each beat (minimalist, no extra HUD).
+- **Digits** — a small 3-2-1 number **below** the crosshair (never covers your aim).
 Your choice persists. (Console: `/reloadcount 0..7`; preview with `/reloadcountdemo`.)
