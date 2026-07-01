@@ -100,7 +100,7 @@
 +        if(reloadcount == 6)
 +        {
 +            int ce = reloadcountdownElapsed();
-+            if(ce >= 0) { float bt = (ce % (RC_DUR/3)) / (float)(RC_DUR/3); return 1.0f + 0.85f * (1.0f - easeoutquad(bt)); }
++            if(ce >= 0 && ce < RC_DUR) { float bt = (ce % (RC_DUR/3)) / (float)(RC_DUR/3); return 1.0f + 0.85f * (1.0f - easeoutquad(bt)); }
 +        }
 +        int t = reloadpopElapsed();
 +        if(t < 0) return 1.0f;
