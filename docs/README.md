@@ -64,3 +64,11 @@ Pick a style or turn it off in **F3 → "reload countdown..."** — seven styles
 - **Crosshair Pulse** — the crosshair itself breathes on each beat (minimalist, no extra HUD).
 - **Digits** — a small 3-2-1 number **below** the crosshair (never covers your aim).
 Your choice persists. (Console: `/reloadcount 0..7`; preview with `/reloadcountdemo`.)
+
+### Reload metronome (sound)
+An optional **audio metronome** over the reload — **tick · tick · tick · ding!**, where the ticks land
+on the beats (with the pulses/blips) and the **ding is the instant you can fire**. Reload by ear, even
+with the visuals off. Two flavours: **Flat** (same tick each beat) or **Rising** (ticks climb in pitch
+up to the ding). Pick it in **F3 → "reload sound (metronome)..."** (or `/reloadmetronome 0..2` — 0 off,
+1 flat, 2 rising); volume via `/reloadmetrovol 0..1`. Default **off**. The sounds live in
+`packages/sounds/swiftgibs/` — swap in your own `.ogg` if you like.
