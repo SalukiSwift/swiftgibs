@@ -45,7 +45,7 @@
 -                if(!dead++) 
 +                if(!falive++)
 +                {
-+                    settexture("packages/hud/blip_green_alive.png");
++                    settexture("packages/hud/blip_cyan_alive.png");
 +                    gle::defvertex(2); gle::deftexcoord0(); gle::begin(GL_QUADS);
 +                }
 +                drawteammate(d, x, y, s, o, scale);
@@ -76,7 +76,7 @@
 +            {
 +                if(!fdead++)
 +                {
-+                    settexture("packages/hud/blip_green_dead.png");
++                    settexture("packages/hud/blip_cyan_dead.png");
 +                    gle::defvertex(2); gle::deftexcoord0(); gle::begin(GL_QUADS);
 +                }
 +                drawteammate(d, x, y, s, o, scale);
