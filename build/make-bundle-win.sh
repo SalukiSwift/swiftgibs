@@ -13,8 +13,10 @@ OUT="$ROOT/dist/swiftgibs-win64"
 STAGE="${STAGE:-/tmp/swiftgibs-stage}"
 
 # 1) strip a low-res tree from the SAME install the exe comes from.
-#    ALLMAPS=1: ship every stock map so any public server's map loads (Swift's choice).
-SRC="$INSTALL" ALLMAPS=1 "$ROOT/tools/strip-assets.sh" "$ROOT/maps/pool.txt" "$STAGE"
+#    ALLMAPS=0: ship only the curated pool in maps/pool.txt (Swift's servers: RUGBY Reloaded's
+#    instaCTF rotation + venice + her local bot-match maps) -- much smaller download. Maps a server
+#    runs that aren't in the pool won't load; set ALLMAPS=1 to ship all 331 for full compat.
+SRC="$INSTALL" ALLMAPS="${ALLMAPS:-0}" "$ROOT/tools/strip-assets.sh" "$ROOT/maps/pool.txt" "$STAGE"
 
 rm -rf "$OUT"; mkdir -p "$OUT/bin64"
 
