@@ -51,4 +51,13 @@ find "$STAGE/packages" -type d \( \
      -type f \( -iname '*.jpg' -o -iname '*.png' \) -print0 \
   | xargs -0 -P6 -I{} mogrify -resize "${WORLD_PX}x${WORLD_PX}>" "{}"
 
+# 5) drop dead weight that's shipped but never used (zero visual/gameplay change, ~70MB):
+#    - map background MUSIC (.ogg outside sounds/): SwiftGibs runs musicvol 0, so it never plays.
+#      (sound EFFECTS live under packages/sounds/ and are kept.)
+#    - high-res .dds textures: the stock cfgs load them via the "<dds>foo.png" prefix, which falls
+#      back to foo.png when the .dds is absent -- so removing them just forces the crushed 2px .png
+#      (smaller AND more consistent with the flat look; every .dds has a .png/.jpg counterpart).
+find "$STAGE/packages" -iname '*.ogg' -not -path '*/sounds/*' -delete
+find "$STAGE/packages" -iname '*.dds' -delete
+
 echo "stage size: $(du -sh "$STAGE" | cut -f1)"
