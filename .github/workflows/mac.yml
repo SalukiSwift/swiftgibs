@@ -1,0 +1,74 @@
+name: mac-build
+on:
+  workflow_dispatch:
+  push:
+    branches: [macos-build, master]
+    paths: ['patches/**', 'vendor/**', 'build/**', '.github/workflows/mac.yml']
+
+jobs:
+  build:
+    runs-on: macos-14        # Apple Silicon, Xcode preinstalled
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch SDL2 frameworks (universal; arm64 slice is what we build against)
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/fw
+          SDL=2.30.9; IMG=2.8.2; MIX=2.8.0
+          curl -fsSL -o /tmp/sdl.dmg https://github.com/libsdl-org/SDL/releases/download/release-$SDL/SDL2-$SDL.dmg
+          curl -fsSL -o /tmp/img.dmg https://github.com/libsdl-org/SDL_image/releases/download/release-$IMG/SDL2_image-$IMG.dmg
+          curl -fsSL -o /tmp/mix.dmg https://github.com/libsdl-org/SDL_mixer/releases/download/release-$MIX/SDL2_mixer-$MIX.dmg
+          for d in sdl img mix; do
+            mnt=$(hdiutil attach -nobrowse -readonly /tmp/$d.dmg | tail -1 | sed 's/.*\/Volumes/\/Volumes/')
+            echo "mounted $d at: $mnt"
+            cp -R "$mnt"/*.framework /tmp/fw/
+            hdiutil detach "$mnt"
+          done
+          # also into /Library/Frameworks so the Makefile -F path can resolve at link time
+          sudo cp -R /tmp/fw/*.framework /Library/Frameworks/
+          ls -d /tmp/fw/*.framework
+
+      - name: Apply patches (keep vendored enet on macOS)
+        run: SWAP_ENET=0 build/apply-patches.sh /tmp/src
+
+      - name: Retarget the Darwin build to native arm64
+        run: |
+          set -euo pipefail
+          # the Makefile's Darwin path hardcodes -arch x86_64 / min 10.9; make it native arm64
+          sed -i '' -e 's/-arch x86_64/-arch arm64/g' -e 's/OSXMIN= 10.9/OSXMIN= 11.0/' /tmp/src/Makefile
+          grep -n 'arch arm64\|OSXMIN=' /tmp/src/Makefile
+
+      - name: Build client
+        run: |
+          set -euo pipefail
+          # the Makefile links -F../sauerbraten.app/Contents/Frameworks (relative to the source dir)
+          mkdir -p /tmp/sauerbraten.app/Contents/Frameworks
+          cp -R /tmp/fw/*.framework /tmp/sauerbraten.app/Contents/Frameworks/
+          # PLATFORM auto-detects to DARWIN via `uname -s` uppercased; do NOT override it
+          make -C /tmp/src -j3 client
+          file /tmp/src/sauer_client
+          lipo -info /tmp/src/sauer_client
+
+      - name: Assemble + sign SwiftGibs.app
+        run: build/make-app-skeleton.sh /tmp/src/sauer_client /tmp/fw /tmp/SwiftGibs.app
+
+      - name: Verify
+        run: |
+          set -euo pipefail
+          codesign --verify --deep --strict --verbose=2 /tmp/SwiftGibs.app
+          echo "--- linkage ---"
+          otool -L /tmp/SwiftGibs.app/Contents/MacOS/sauerbraten | grep -Ei 'sdl2|rpath|executable_path' || true
+          echo "--- rpaths ---"
+          otool -l /tmp/SwiftGibs.app/Contents/MacOS/sauerbraten | grep -A2 LC_RPATH || true
+          echo "--- headless load (no display: expected to stop at video/GL init, not dyld/segfault) ---"
+          ( /tmp/SwiftGibs.app/Contents/MacOS/sauerbraten -q/tmp/sgtest -t0 2>&1 || true ) | tail -25
+
+      - name: Package artifact
+        run: ditto -c -k --keepParent /tmp/SwiftGibs.app /tmp/SwiftGibs-app-code.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SwiftGibs-app-code
+          path: /tmp/SwiftGibs-app-code.zip
+          if-no-files-found: error
