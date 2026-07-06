@@ -1,0 +1,90 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: write        # create releases + upload assets
+
+jobs:
+  mac-binary:
+    runs-on: macos-14
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch universal SDL2 frameworks
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/fw
+          SDL=2.30.9; IMG=2.8.2; MIX=2.8.0
+          curl -fsSL -o /tmp/sdl.dmg https://github.com/libsdl-org/SDL/releases/download/release-$SDL/SDL2-$SDL.dmg
+          curl -fsSL -o /tmp/img.dmg https://github.com/libsdl-org/SDL_image/releases/download/release-$IMG/SDL2_image-$IMG.dmg
+          curl -fsSL -o /tmp/mix.dmg https://github.com/libsdl-org/SDL_mixer/releases/download/release-$MIX/SDL2_mixer-$MIX.dmg
+          for d in sdl img mix; do
+            mnt=$(hdiutil attach -nobrowse -readonly /tmp/$d.dmg | tail -1 | sed 's/.*\/Volumes/\/Volumes/')
+            cp -R "$mnt"/*.framework /tmp/fw/; hdiutil detach "$mnt"
+          done
+          sudo cp -R /tmp/fw/*.framework /Library/Frameworks/
+      - name: Apply patches + build native arm64
+        run: |
+          set -euo pipefail
+          SWAP_ENET=0 build/apply-patches.sh /tmp/src
+          sed -i '' -e 's/-arch x86_64/-arch arm64/g' -e 's/OSXMIN= 10.9/OSXMIN= 11.0/' /tmp/src/Makefile
+          mkdir -p /tmp/sauerbraten.app/Contents/Frameworks
+          cp -R /tmp/fw/*.framework /tmp/sauerbraten.app/Contents/Frameworks/
+          make -C /tmp/src -j3 client
+          lipo -info /tmp/src/sauer_client
+      - name: Assemble + sign SwiftGibs.app
+        run: build/make-app-skeleton.sh /tmp/src/sauer_client /tmp/fw /tmp/SwiftGibs.app
+      - name: Package artifact
+        run: ditto -c -k --keepParent /tmp/SwiftGibs.app /tmp/SwiftGibs-app-code.zip
+      - uses: actions/upload-artifact@v4
+        with: { name: mac-app, path: /tmp/SwiftGibs-app-code.zip, if-no-files-found: error }
+
+  native-binaries:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64 libsdl2-dev libsdl2-image-dev libsdl2-mixer-dev zip
+      - name: Linux client
+        run: build/make-engine-linux.sh
+      - name: Windows exe (mingw)
+        run: build/make-engine-win.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-bins
+          path: |
+            dist/engines/linux-x86_64/sauer_client
+            dist/engines/win64/sauerbraten.exe
+          if-no-files-found: error
+
+  release:
+    needs: [mac-binary, native-binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y imagemagick zip bzip2
+      - uses: actions/download-artifact@v4
+        with: { path: /tmp/arts }
+      - name: Install rcodesign
+        run: |
+          V=0.29.0
+          curl -fsSL -o /tmp/rc.tgz "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F$V/apple-codesign-$V-x86_64-unknown-linux-musl.tar.gz"
+          tar -C /tmp -xzf /tmp/rc.tgz && sudo cp /tmp/apple-codesign-*/rcodesign /usr/local/bin/
+      - name: Assemble the three bundles from official data
+        run: |
+          set -euo pipefail
+          mkdir -p dist/engines/linux-x86_64 dist/engines/win64
+          cp /tmp/arts/native-bins/sauer_client dist/engines/linux-x86_64/
+          cp /tmp/arts/native-bins/sauerbraten.exe dist/engines/win64/
+          chmod +x dist/engines/linux-x86_64/sauer_client
+          DATA=$(build/fetch-official-data.sh)
+          INSTALL="$DATA" build/make-bundle-win.sh
+          INSTALL="$DATA" build/make-bundle-linux.sh
+          APP_ZIP=/tmp/arts/mac-app/SwiftGibs-app-code.zip INSTALL="$DATA" RCODESIGN=rcodesign build/make-bundle-mac.sh
+      - name: Publish GitHub Release
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "SwiftGibs ${{ github.ref_name }}" --generate-notes \
+            dist/swiftgibs-win64.zip dist/SwiftGibs-linux-x86_64.tar.gz dist/SwiftGibs-mac.zip
