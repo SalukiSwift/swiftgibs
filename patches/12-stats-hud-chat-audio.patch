@@ -1,6 +1,6 @@
 --- a/engine/console.cpp
 +++ b/engine/console.cpp
-@@ -496,6 +496,14 @@
+@@ -496,6 +496,22 @@
                  if(histpos + 1 < history.length()) history[++histpos]->restore();
                  break;
  
@@ -9,6 +9,14 @@
 +                break;
 +
 +            case SDLK_PAGEDOWN:
++                setconskip(conskip, fullconsole ? fullconfilter : confilter, -3);
++                break;
++
++            case -4: // mouse wheel up: scroll chat history back while composing
++                setconskip(conskip, fullconsole ? fullconfilter : confilter, 3);
++                break;
++
++            case -5: // mouse wheel down
 +                setconskip(conskip, fullconsole ? fullconfilter : confilter, -3);
 +                break;
 +
