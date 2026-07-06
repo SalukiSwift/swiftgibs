@@ -6,7 +6,7 @@
                  actor->frags = frags;
 +                extern int killstreak, beststreak;
 +                extern void killstreakmilestone(int tier);
-+                if(actor == player1 && victim != player1)
++                if(actor == player1 && victim != player1 && (!victim || !m_teammode || !isteam(actor->team, victim->team)))
 +                {
 +                    killstreak++;
 +                    if(killstreak > beststreak) beststreak = killstreak;
