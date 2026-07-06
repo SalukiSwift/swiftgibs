@@ -1,0 +1,32 @@
+SwiftGibs — a modified build of Cube 2: Sauerbraten
+
+Copyright (C) 2001-2020 Wouter van Oortmerssen, Lee Salzman, Mike Dysart,
+                        Robert Pointon, and Quinton Reeves (Cube 2: Sauerbraten)
+SwiftGibs modifications Copyright (C) 2026 the SwiftGibs contributors
+
+This software is based on Cube 2: Sauerbraten and is distributed under the same
+zlib license. SwiftGibs is an altered version of the original software and is
+plainly marked as such below and throughout this repository (see patches/ and
+overlay/ for the modifications).
+
+This software is provided 'as-is', without any express or implied warranty. In
+no event will the authors be held liable for any damages arising from the use of
+this software.
+
+Permission is granted to anyone to use this software for any purpose, including
+commercial applications, and to alter it and redistribute it freely, subject to
+the following restrictions:
+
+  1. The origin of this software must not be misrepresented; you must not claim
+     that you wrote the original software. If you use this software in a product,
+     an acknowledgment in the product documentation would be appreciated but is
+     not required.
+
+  2. Altered source versions must be plainly marked as such, and must not be
+     misrepresented as being the original software.
+
+  3. This notice may not be removed or altered from any source distribution.
+
+Game content (maps, textures, models, sounds) bundled in releases is the work of
+the Sauerbraten authors and contributors and ships under its original licenses;
+those license files are included inside each release bundle.
