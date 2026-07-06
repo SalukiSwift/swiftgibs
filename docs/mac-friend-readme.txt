@@ -17,7 +17,7 @@ SwiftGibs for Mac — quick start
    System Settings -> Privacy & Security -> scroll down ->
    click "Open Anyway" next to SwiftGibs, then launch it again.
 
-4. Play. It's the same instagib SwiftGibs Swift runs, and it joins the same
+4. Play. It's the same instagib SwiftGibs, and it joins the same
    servers. The server browser is filtered to instagib games; friends list,
    scoreboard columns, the reload countdown + metronome, the map-vote panel,
    and the flat team-colour player models are all included.
