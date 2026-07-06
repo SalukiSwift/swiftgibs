@@ -6,7 +6,7 @@
 # from the same install the exe comes from.
 # Usage: make-bundle-win.sh
 set -euo pipefail
-ROOT="$HOME/repos/swiftgibs"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"   # repo root, location-independent (works in CI)
 INSTALL="${INSTALL:-/mnt/c/Program Files (x86)/Sauerbraten}"   # 2020 install (override for CI/official data)
 WINBIN="$INSTALL/bin64"
 OUT="$ROOT/dist/swiftgibs-win64"
