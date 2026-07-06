@@ -6,11 +6,11 @@
  
  namespace game
  {
-@@ -1104,6 +1105,259 @@
+@@ -1104,6 +1105,277 @@
          pophudmatrix();
      }
  
-+    VARP(reloadcount, 0, 6, 7);   // countdown style, 0=off; 1 Rings 2 Pulse 3 Collapse 4 Sweep 5 Pips 6 CrosshairPulse 7 Digits
++    VARP(reloadcount, 0, 6, 8);   // countdown style, 0=off; 1 Rings 2 Pulse 3 Collapse 4 Sweep 5 Pips 6 CrosshairPulse 7 Digits 8 Edge-beats
 +    VARP(reloadflash, 0, 4, 7);   // fire-ready flash, INDEPENDENT of reloadcount: 0 off; 1 Pip 2 Dot 3 ThinRing; 4 RingPing 5 Bloom 6 Burst 7 EdgePulse
 +
 +    int reloaddemostart = -100000;
@@ -259,6 +259,24 @@
 +                pophudmatrix();
 +                return;
 +            }
++            case 8: // Edge-beats -- screen-edge bars flash in the beat colour on each 3-2-1 beat
++            {
++                float pulse = 1.0f - beatpunch(t);   // sharp at beat onset, fades over ~90ms
++                float th = 34.0f * pulse + 3.0f;
++                float w2 = cx*2.0f, h2 = cy*2.0f;
++                hudnotextureshader->set();
++                glBlendFunc(GL_SRC_ALPHA, GL_ONE);
++                gle::colorf(cr, cg, cb, 0.80f * pulse);
++                gle::defvertex(2); gle::begin(GL_QUADS);
++                gle::attribf(0,0); gle::attribf(w2,0); gle::attribf(w2,th); gle::attribf(0,th);
++                gle::attribf(0,h2-th); gle::attribf(w2,h2-th); gle::attribf(w2,h2); gle::attribf(0,h2);
++                gle::attribf(0,0); gle::attribf(th,0); gle::attribf(th,h2); gle::attribf(0,h2);
++                gle::attribf(w2-th,0); gle::attribf(w2,0); gle::attribf(w2,h2); gle::attribf(w2-th,h2);
++                gle::end();
++                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++                hudshader->set();
++                return;
++            }
 +            default: return;
 +        }
 +    }
@@ -266,7 +284,7 @@
      void gameplayhud(int w, int h)
      {
          pushhudmatrix();
-@@ -1134,6 +1388,8 @@
+@@ -1134,6 +1406,8 @@
              if(cmode) cmode->drawhud(d, w, h);
          }
  
@@ -275,7 +293,7 @@
          pophudmatrix();
  
          if(d->state!=CS_EDITING && d->state!=CS_SPECTATOR && d->state!=CS_DEAD)
-@@ -1167,6 +1423,8 @@
+@@ -1167,6 +1441,8 @@
          }
      }
  
@@ -284,7 +302,7 @@
      int selectcrosshair(vec &color)
      {
          fpsent *d = hudplayer();
-@@ -1175,18 +1433,24 @@
+@@ -1175,18 +1451,24 @@
          if(d->state!=CS_ALIVE) return 0;
  
          int crosshair = 0;
