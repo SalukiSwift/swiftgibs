@@ -17,7 +17,58 @@
                  {
 --- a/fpsgame/client.cpp
 +++ b/fpsgame/client.cpp
-@@ -1570,6 +1570,14 @@
+@@ -918,9 +918,21 @@
+         if(editmode) toggleedit();
+     }
+ 
++    // === SwiftGibs session chat log (Task 9) ===
++    vector<char *> chatlog;
++    void logchat(const char *who, const char *msg, bool team)
++    {
++        defformatstring(line, "%s%s: %s", team ? "\f8[team] " : "", who, msg);
++        chatlog.add(newstring(line));
++        while(chatlog.length() > 200) { delete[] chatlog[0]; chatlog.remove(0); }
++    }
++    ICOMMAND(numchatlines, "", (), intret(chatlog.length()));
++    ICOMMAND(getchatline, "i", (int *i), { if(chatlog.inrange(*i)) result(chatlog[*i]); });
++
+     void gamedisconnect(bool cleanup)
+     {
+         if(remote) stopfollowing();
++        chatlog.deletearrays();
+         ignores.setsize(0);
+         connected = remote = false;
+         player1->clientnum = -1;
+@@ -948,10 +960,10 @@
+     VARP(teamcolorchat, 0, 1, 1);
+     const char *chatcolorname(fpsent *d) { return teamcolorchat ? teamcolorname(d, NULL) : colorname(d); }
+ 
+-    void toserver(char *text) { conoutf(CON_CHAT, "%s:\f0 %s", chatcolorname(player1), text); addmsg(N_TEXT, "rcs", player1, text); }
++    void toserver(char *text) { conoutf(CON_CHAT, "%s:\f0 %s", chatcolorname(player1), text); logchat(player1->name, text, false); addmsg(N_TEXT, "rcs", player1, text); }
+     COMMANDN(say, toserver, "C");
+ 
+-    void sayteam(char *text) { conoutf(CON_TEAMCHAT, "\fs\f8[team]\fr %s: \f8%s", chatcolorname(player1), text); addmsg(N_SAYTEAM, "rcs", player1, text); }
++    void sayteam(char *text) { conoutf(CON_TEAMCHAT, "\fs\f8[team]\fr %s: \f8%s", chatcolorname(player1), text); logchat(player1->name, text, true); addmsg(N_SAYTEAM, "rcs", player1, text); }
+     COMMAND(sayteam, "C");
+ 
+     ICOMMAND(servcmd, "C", (char *cmd), addmsg(N_SERVCMD, "rs", cmd));
+@@ -1356,6 +1368,7 @@
+                 if(d->state!=CS_DEAD && d->state!=CS_SPECTATOR)
+                     particle_textcopy(d->abovehead(), text, PART_TEXT, 2000, 0x32FF64, 4.0f, -8);
+                 conoutf(CON_CHAT, "%s:\f0 %s", chatcolorname(d), text);
++                logchat(d->name, text, false);
+                 break;
+             }
+ 
+@@ -1369,6 +1382,7 @@
+                 if(t->state!=CS_DEAD && t->state!=CS_SPECTATOR)
+                     particle_textcopy(t->abovehead(), text, PART_TEXT, 2000, 0x6496FF, 4.0f, -8);
+                 conoutf(CON_TEAMCHAT, "\fs\f8[team]\fr %s: \f8%s", chatcolorname(t), text);
++                logchat(t->name, text, true);
+                 break;
+             }
+ 
+@@ -1570,6 +1584,14 @@
                         *actor = getclient(acn);
                  if(!actor) break;
                  actor->frags = frags;
