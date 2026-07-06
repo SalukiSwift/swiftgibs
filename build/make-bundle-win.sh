@@ -38,6 +38,10 @@ chmod -R u+w "$OUT"
 cp -a "$ROOT/overlay/." "$OUT/"
 rm -f "$OUT/autoexec.source.cfg"   # internal reference file, don't ship
 
+# 4b) attach the SwiftGibs + Friends tabs to the staged stock options menu; ship no user config
+"$ROOT/build/integrate-menus.sh" "$OUT"
+rm -f "$OUT/config.cfg" "$OUT/init.cfg"   # fresh VARP defaults + native-resolution auto-detect
+
 # 5) portable launcher: '.' = home dir, so our root autoexec.cfg loads
 printf '@echo off\r\nstart bin64\\sauerbraten.exe -q.\r\n' > "$OUT/swiftgibs.bat"
 

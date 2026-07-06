@@ -112,3 +112,20 @@ Distribution is a zipped `.app` (`READ-ME-FIRST.txt` bundled alongside). Because
 notarized), the first launch needs a one-time **right-click → Open** to clear Gatekeeper; a paid Apple
 Developer certificate would remove that step but isn't worth it for a friends build. Universal (arm64 +
 x86_64) is a possible follow-up; the current build is native arm64.
+
+## Settings menus (Esc → options tabs)
+SwiftGibs settings live natively in **Esc → options** as two tabs: **SwiftGibs** (server filter,
+scoreboard columns, highlighting, reload countdown/flash/sound, teammate crosshair) and **Friends**
+(add/remove, live "in game now" list, friend count). They're attached to the stock options gui by a
+tiny build-time splice (`build/integrate-menus.sh`) that calls tab bodies defined in
+`overlay/menus_settings.cfg` — no fragile reproduction of the stock menu. **F3** is a lean **Quick
+Play** launcher (bot matches + a jump into settings).
+
+**Reload feedback** is two independent settings: `reloadcount` (the 3-2-1 countdown animation, incl.
+the new **Edge-beats** style) and `reloadflash` (the fire-ready flash, 8 styles from subtle *Pip* to
+bold *Edge-pulse*). **Teammate crosshair** keeps your normal crosshair shape but tints it blue over a
+teammate instead of the aim-obscuring circle-slash icon.
+
+Newcomer-friendly defaults ship built-in (not pinned, so your changes persist): visibility features
+on, countdown = Crosshair-Pulse, flash = Ring-ping, metronome off, and **native-resolution fullscreen
+auto-detected** on first launch. The old (non-working) intermission map-vote panel was removed.
