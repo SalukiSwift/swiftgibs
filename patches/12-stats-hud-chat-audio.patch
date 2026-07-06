@@ -17,3 +17,40 @@
          }
          d->gunselect = gun;
      }
+@@ -354,7 +355,8 @@
+         if(at==player1 && d!=at)
+         {
+             extern int hitsound;
+-            if(hitsound && lasthit != lastmillis) playsound(S_HIT);
++            extern const char *hitsndname();
++            if(hitsound && lasthit != lastmillis) { const char *hn = hitsndname(); if(hn) playsoundname(hn); else playsound(S_HIT); }
+             lasthit = lastmillis;
+         }
+ 
+--- a/fpsgame/fps.cpp
++++ b/fpsgame/fps.cpp
+@@ -396,6 +396,15 @@
+ 
+     VARP(hitsound, 0, 0, 1);
+ 
++    // === SwiftGibs selectable hit sound (0 = stock S_HIT ding) ===
++    VARP(hitsoundsel, 0, 0, 6);
++    const char *hitsndname()   // NULL => use stock S_HIT
++    {
++        static const char *n[7] = { NULL, "swiftgibs/hit_tf2","swiftgibs/hit_quake","swiftgibs/hit_unreal","swiftgibs/hit_cod","swiftgibs/hit_custom1","swiftgibs/hit_custom2" };
++        return (hitsoundsel>=1 && hitsoundsel<=6) ? n[hitsoundsel] : NULL;
++    }
++    ICOMMAND(playhitsoundpreview, "", (), { const char *hn = hitsndname(); if(hn) playsoundname(hn); else playsound(S_HIT); });
++
+     void damaged(int damage, fpsent *d, fpsent *actor, bool local)
+     {
+         if((d->state!=CS_ALIVE && d->state != CS_LAGGED && d->state != CS_SPAWNING) || intermission) return;
+@@ -406,7 +415,7 @@
+         fpsent *h = hudplayer();
+         if(h!=player1 && actor==h && d!=actor)
+         {
+-            if(hitsound && lasthit != lastmillis) playsound(S_HIT);
++            if(hitsound && lasthit != lastmillis) { const char *hn = hitsndname(); if(hn) playsoundname(hn); else playsound(S_HIT); }
+             lasthit = lastmillis;
+         }
+         if(d==h)
