@@ -1,0 +1,19 @@
+--- a/fpsgame/weapon.cpp
++++ b/fpsgame/weapon.cpp
+@@ -16,6 +16,7 @@
+ 
+     VARP(maxdebris, 10, 25, 1000);
+     VARP(maxbarreldebris, 5, 10, 1000);
++    VARP(gunreloadsound, 0, 1, 1);
+ 
+     ICOMMAND(getweapon, "", (), intret(player1->gunselect));
+ 
+@@ -24,7 +25,7 @@
+         if(gun!=d->gunselect)
+         {
+             addmsg(N_GUNSELECT, "rci", d, gun);
+-            playsound(S_WEAPLOAD, d == player1 ? NULL : &d->o);
++            if(gunreloadsound) playsound(S_WEAPLOAD, d == player1 ? NULL : &d->o);
+         }
+         d->gunselect = gun;
+     }
