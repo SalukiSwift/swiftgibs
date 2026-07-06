@@ -98,3 +98,17 @@ skinned in one solid colour so you can read teams and friends at a glance:
 The minimap friend blip is **cyan** to match. Models are rendered bright but not blown out
 (`fullbrightmodels 90` — high enough to see clearly in dark maps, low enough to keep the colour vivid). This
 is **purely visual and client-side**, so it stays fully compatible with official servers.
+
+## macOS build
+SwiftGibs also ships as a native **Apple Silicon** `.app` (`dist/SwiftGibs-mac.zip`). The patched engine
+(patches 01–10) is compiled and code-signed on a GitHub Actions **macos-14** runner
+(`.github/workflows/mac.yml` + `build/make-app-skeleton.sh`), producing a signed, framework-embedded
+`SwiftGibs.app`. `build/make-bundle-mac.sh` then assembles the shippable bundle locally: it drops the
+stripped install data + overlay into `Contents/Resources/` and **re-signs the complete bundle with
+`rcodesign`** (a Linux-capable Apple signer — ad-hoc, verified Apple-accepted). Same features and server
+compatibility as the Windows build.
+
+Distribution is a zipped `.app` (`READ-ME-FIRST.txt` bundled alongside). Because it's ad-hoc signed (not
+notarized), the first launch needs a one-time **right-click → Open** to clear Gatekeeper; a paid Apple
+Developer certificate would remove that step but isn't worth it for a friends build. Universal (arm64 +
+x86_64) is a possible follow-up; the current build is native arm64.
