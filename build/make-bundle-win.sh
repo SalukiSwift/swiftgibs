@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Assemble the Windows SwiftGibs bundle: stock binary + data BOTH from Swift's
+# Assemble the Windows SwiftGibs bundle: stock binary + data BOTH from a
 # matching Sauerbraten install. The stock exe and its data/maps/shaders are
 # version-locked -- pairing the exe with a DIFFERENT release's data (e.g. the git
 # mirror) gives blank maps, broken icons, and shader errors. So we always strip
@@ -13,7 +13,7 @@ OUT="$ROOT/dist/swiftgibs-win64"
 STAGE="${STAGE:-/tmp/swiftgibs-stage}"
 
 # 1) strip a low-res tree from the SAME install the exe comes from.
-#    ALLMAPS=1 (default): ship every stock map so any public server's map loads (Swift's choice).
+#    ALLMAPS=1 (default): ship every stock map so any public server's map loads.
 #    Set ALLMAPS=0 to ship only the curated pool in maps/pool.txt (RUGBY rotation + venice + local
 #    bot-match maps) for a ~halved download, at the cost of maps outside the pool not loading.
 SRC="$INSTALL" ALLMAPS="${ALLMAPS:-1}" "$ROOT/tools/strip-assets.sh" "$ROOT/maps/pool.txt" "$STAGE"

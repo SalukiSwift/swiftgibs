@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Assemble the shippable macOS SwiftGibs: CI-built code app + Swift's stripped install data.
+# Assemble the shippable macOS SwiftGibs: CI-built code app + stripped install data.
 # The code-only SwiftGibs.app (binary + embedded SDL2 frameworks + plist + icon, signed) comes
-# from the mac-build GitHub Actions artifact; game data comes from her matching 2020 install.
+# from the mac-build GitHub Actions artifact; game data comes from a matching 2020 install.
 # Usage: APP_ZIP=/path/to/SwiftGibs-app-code.zip build/make-bundle-mac.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
