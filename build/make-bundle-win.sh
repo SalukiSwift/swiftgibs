@@ -7,7 +7,7 @@
 # Usage: make-bundle-win.sh
 set -euo pipefail
 ROOT="$HOME/repos/swiftgibs"
-INSTALL="/mnt/c/Program Files (x86)/Sauerbraten"   # 2020 install: stock exe + its matching data
+INSTALL="${INSTALL:-/mnt/c/Program Files (x86)/Sauerbraten}"   # 2020 install (override for CI/official data)
 WINBIN="$INSTALL/bin64"
 OUT="$ROOT/dist/swiftgibs-win64"
 STAGE="${STAGE:-/tmp/swiftgibs-stage}"
@@ -27,7 +27,7 @@ if [ -f "$ROOT/dist/engines/win64/sauerbraten.exe" ]; then
 else
   echo "WARN: patched exe missing, using stock"; cp "$WINBIN/sauerbraten.exe" "$OUT/bin64/"
 fi
-find "$WINBIN" -maxdepth 1 -name '*.dll' ! -iname 'EOSSDK*' -exec cp {} "$OUT/bin64/" \;
+cp "$ROOT"/vendor/windows-dlls/*.dll "$OUT/bin64/"   # vendored redistributable runtime DLLs (no local install needed)
 
 # 3) staged data + packages (make writable -- copies off /mnt/c come read-only)
 cp -a "$STAGE/data" "$OUT/data"

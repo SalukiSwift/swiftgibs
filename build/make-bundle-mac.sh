@@ -5,7 +5,7 @@
 # Usage: APP_ZIP=/path/to/SwiftGibs-app-code.zip build/make-bundle-mac.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-INSTALL="/mnt/c/Program Files (x86)/Sauerbraten"
+INSTALL="${INSTALL:-/mnt/c/Program Files (x86)/Sauerbraten}"   # override for CI/official data
 APP_ZIP="${APP_ZIP:?set APP_ZIP to the downloaded CI artifact zip}"
 STAGE="${STAGE:-/tmp/swiftgibs-mac-stage}"
 OUT="$ROOT/dist/SwiftGibs.app"
