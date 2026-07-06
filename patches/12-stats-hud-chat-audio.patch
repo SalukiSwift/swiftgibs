@@ -1,3 +1,20 @@
+--- a/engine/console.cpp
++++ b/engine/console.cpp
+@@ -496,6 +496,14 @@
+                 if(histpos + 1 < history.length()) history[++histpos]->restore();
+                 break;
+ 
++            case SDLK_PAGEUP:
++                setconskip(conskip, fullconsole ? fullconfilter : confilter, 3);
++                break;
++
++            case SDLK_PAGEDOWN:
++                setconskip(conskip, fullconsole ? fullconfilter : confilter, -3);
++                break;
++
+             case SDLK_TAB:
+                 if(commandflags&CF_COMPLETE)
+                 {
 --- a/fpsgame/client.cpp
 +++ b/fpsgame/client.cpp
 @@ -1570,6 +1570,14 @@
