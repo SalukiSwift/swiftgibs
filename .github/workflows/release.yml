@@ -75,8 +75,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist/engines/linux-x86_64 dist/engines/win64
-          cp /tmp/arts/native-bins/sauer_client dist/engines/linux-x86_64/
-          cp /tmp/arts/native-bins/sauerbraten.exe dist/engines/win64/
+          cp /tmp/arts/native-bins/linux-x86_64/sauer_client dist/engines/linux-x86_64/
+          cp /tmp/arts/native-bins/win64/sauerbraten.exe dist/engines/win64/
           chmod +x dist/engines/linux-x86_64/sauer_client
           DATA=$(build/fetch-official-data.sh)
           INSTALL="$DATA" build/make-bundle-win.sh

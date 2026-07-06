@@ -7,7 +7,10 @@ INSTALL="${INSTALL:-$("$ROOT/build/fetch-official-data.sh")}"
 STAGE="${STAGE:-/tmp/swiftgibs-linux-stage}"
 OUT="$ROOT/dist/SwiftGibs-linux-x86_64"
 
-"$ROOT/build/make-engine-linux.sh" >/dev/null
+# Use a prebuilt client if present (CI supplies it from the native-binaries job); else build it.
+if [ ! -f "$ROOT/dist/engines/linux-x86_64/sauer_client" ]; then
+  "$ROOT/build/make-engine-linux.sh" >/dev/null
+fi
 rm -rf "$OUT"; mkdir -p "$OUT/bin"
 cp "$ROOT/dist/engines/linux-x86_64/sauer_client" "$OUT/bin/swiftgibs"
 
