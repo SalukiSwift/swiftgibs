@@ -42,7 +42,7 @@
              lasthit = lastmillis;
          }
          if(d==h)
-@@ -425,6 +434,17 @@
+@@ -425,6 +434,27 @@
          else playsound(S_PAIN1+rnd(5), &d->o);
      }
  
@@ -57,10 +57,20 @@
 +    ICOMMAND(getbeststreak, "", (), intret(beststreak));
 +    ICOMMAND(_ksset, "i", (int *n), { extern int killstreak; killstreak = *n; });
 +
++    // === SwiftGibs career stats file writer (Task 6) ===
++    ICOMMAND(writestatsfile, "iiiiii", (int *m,int *f,int *d,int *dmg,int *sh,int *bs),
++    {
++        stream *o = openutf8file(path("stats.cfg", true), "w");
++        if(!o) return;
++        o->printf("// SwiftGibs career stats (auto-written)\n");
++        o->printf("alias st_matches %d\nalias st_frags %d\nalias st_deaths %d\nalias st_damage %d\nalias st_shots %d\nalias st_beststreak %d\n", *m,*f,*d,*dmg,*sh,*bs);
++        delete o;
++    });
++
      VARP(deathscore, 0, 1, 1);
  
      void deathstate(fpsent *d, bool restore)
-@@ -438,6 +458,7 @@
+@@ -438,6 +468,7 @@
          }
          if(d==player1)
          {
@@ -68,7 +78,7 @@
              if(deathscore) showscores(true);
              disablezoom();
              if(!restore) loopi(NUMGUNS) savedammo[i] = player1->ammo[i];
-@@ -659,6 +680,7 @@
+@@ -659,6 +690,7 @@
              d->lifesequence = -1;
              d->respawned = d->suicided = -2;
          }
@@ -76,7 +86,7 @@
  
          setclientmode();
  
-@@ -1409,6 +1431,32 @@
+@@ -1409,6 +1441,32 @@
          }
      }
  
@@ -109,7 +119,7 @@
      void gameplayhud(int w, int h)
      {
          pushhudmatrix();
-@@ -1441,6 +1489,8 @@
+@@ -1441,6 +1499,8 @@
  
          drawreloadcountdown(w, h);
  
