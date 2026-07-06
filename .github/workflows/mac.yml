@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     runs-on: macos-14        # Apple Silicon, Xcode preinstalled
+    timeout-minutes: 25      # hard backstop: never let a hung step burn hours of runner time
     steps:
       - uses: actions/checkout@v4
 
@@ -61,8 +62,20 @@ jobs:
           otool -L /tmp/SwiftGibs.app/Contents/MacOS/sauerbraten | grep -Ei 'sdl2|rpath|executable_path' || true
           echo "--- rpaths ---"
           otool -l /tmp/SwiftGibs.app/Contents/MacOS/sauerbraten | grep -A2 LC_RPATH || true
-          echo "--- headless load (no display: expected to stop at video/GL init, not dyld/segfault) ---"
-          ( /tmp/SwiftGibs.app/Contents/MacOS/sauerbraten -q/tmp/sgtest -t0 2>&1 || true ) | tail -25
+          echo "--- bounded load probe: alive after 15s = passed dyld/init (would block at window/GL headless) ---"
+          set +e
+          /tmp/SwiftGibs.app/Contents/MacOS/sauerbraten -q/tmp/sgtest -t0 > /tmp/load.log 2>&1 &
+          BPID=$!
+          sleep 15
+          if kill -0 $BPID 2>/dev/null; then
+            echo "LOAD OK: process alive after 15s (dynamic link + init succeeded)"
+            kill $BPID 2>/dev/null; wait $BPID 2>/dev/null
+          else
+            wait $BPID; echo "process exited early rc=$? -- inspect log for dyld/symbol errors"
+          fi
+          set -e
+          echo "--- first 30 lines of load log ---"
+          head -30 /tmp/load.log 2>/dev/null || true
 
       - name: Package artifact
         run: ditto -c -k --keepParent /tmp/SwiftGibs.app /tmp/SwiftGibs-app-code.zip
