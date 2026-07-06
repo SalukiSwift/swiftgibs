@@ -1,0 +1,16 @@
+--- a/engine/main.cpp
++++ b/engine/main.cpp
+@@ -247,6 +247,13 @@
+               lx = 0.5f*(w - lw), ly = 0.5f*(h*0.5f - lh);
+         settexture((maxtexsize ? min(maxtexsize, hwtexsize) : hwtexsize) >= 1024 && (screenw > 1280 || screenh > 800) ? "data/logo_1024.png" : "data/logo.png", 3);
+         bgquad(lx, ly, lw, lh);
++        // SwiftGibs logo, bottom-left, kept clear of the centred Cube 2 logo
++        if(textureload("data/swiftgibs-logo.png", 3) != notexture)
++        {
++            settexture("data/swiftgibs-logo.png", 3);
++            float sgw = 0.26f*w, sgh = sgw*287.0f/640.0f;
++            bgquad(0.035f*w, h - sgh - 0.04f*h, sgw, sgh);
++        }
+         if(caption)
+         {
+             int tw = text_width(caption);
