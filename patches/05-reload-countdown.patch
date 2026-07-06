@@ -10,8 +10,8 @@
          pophudmatrix();
      }
  
-+    VARP(reloadcount, 0, 3, 8);   // countdown style, 0=off; 1 Rings 2 Pulse 3 Collapse 4 Sweep 5 Pips 6 CrosshairPulse 7 Digits 8 Edge-beats
-+    VARP(reloadflash, 0, 3, 7);   // fire-ready flash, INDEPENDENT of reloadcount: 0 off; 1 Pip 2 Dot 3 ThinRing; 4 RingPing 5 Bloom 6 Burst 7 EdgePulse
++    VARP(reloadcount, 0, 0, 8);   // countdown style, 0=off; 1 Rings 2 Pulse 3 Collapse 4 Sweep 5 Pips 6 CrosshairPulse 7 Digits 8 Edge-beats
++    VARP(reloadflash, 0, 0, 7);   // fire-ready flash, INDEPENDENT of reloadcount: 0 off; 1 Pip 2 Dot 3 ThinRing; 4 RingPing 5 Bloom 6 Burst 7 EdgePulse
 +
 +    int reloaddemostart = -100000;
 +    ICOMMAND(reloadcountdemo, "", (), { reloaddemostart = lastmillis; });
