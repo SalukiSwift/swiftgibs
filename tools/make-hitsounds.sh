@@ -6,6 +6,9 @@
 # Output: overlay/packages/sounds/swiftgibs/hit_{tf2,quake,unreal,cod,custom1,custom2}.ogg
 # All six are short (<250ms), punchy, mono, 44.1kHz vorbis - matching the existing
 # swiftgibs sound assets.
+#
+# Also emits streak.ogg: a short (~230ms) rising three-note flourish for the
+# killstreak milestone ding (Task 5), same mono/44.1kHz/vorbis style.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/overlay/packages/sounds/swiftgibs"
@@ -43,4 +46,9 @@ $FF -f lavfi -i "sine=f=1046:d=0.06" -f lavfi -i "sine=f=1568:d=0.06" \
   -filter_complex "[0][1]amix=inputs=2:duration=longest,afade=t=out:st=0.02:d=0.05,alimiter=level_in=2" \
   -c:a libvorbis -q:a 4 -ar 44100 -ac 1 "$OUT/hit_custom2.ogg"
 
-echo "wrote hit_tf2.ogg hit_quake.ogg hit_unreal.ogg hit_cod.ogg hit_custom1.ogg hit_custom2.ogg to $OUT"
+# --- streak: killstreak milestone (rising three-note major-arpeggio flourish) ---
+$FF -f lavfi -i "sine=f=523:d=0.07" -f lavfi -i "sine=f=659:d=0.07" -f lavfi -i "sine=f=784:d=0.09" \
+  -filter_complex "[0][1][2]concat=n=3:v=0:a=1,afade=t=out:st=0.20:d=0.03,alimiter=level_in=2" \
+  -c:a libvorbis -q:a 4 -ar 44100 -ac 1 "$OUT/streak.ogg"
+
+echo "wrote hit_tf2.ogg hit_quake.ogg hit_unreal.ogg hit_cod.ogg hit_custom1.ogg hit_custom2.ogg streak.ogg to $OUT"

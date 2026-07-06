@@ -42,13 +42,17 @@
              lasthit = lastmillis;
          }
          if(d==h)
-@@ -425,6 +434,13 @@
+@@ -425,6 +434,17 @@
          else playsound(S_PAIN1+rnd(5), &d->o);
      }
  
 +    // === SwiftGibs killstreak tracking (per-life; resets on death/match start) ===
 +    int killstreak = 0, beststreak = 0;
-+    void killstreakmilestone(int tier) {}   // stub; Task 5 fills in the sound
++    VARP(killstreaksound, 0, 0, 1);
++    void killstreakmilestone(int tier)
++    {
++        if(killstreaksound) playsoundname("swiftgibs/streak");
++    }
 +    ICOMMAND(getkillstreak, "", (), intret(killstreak));
 +    ICOMMAND(getbeststreak, "", (), intret(beststreak));
 +    ICOMMAND(_ksset, "i", (int *n), { extern int killstreak; killstreak = *n; });
@@ -56,7 +60,7 @@
      VARP(deathscore, 0, 1, 1);
  
      void deathstate(fpsent *d, bool restore)
-@@ -438,6 +454,7 @@
+@@ -438,6 +458,7 @@
          }
          if(d==player1)
          {
@@ -64,7 +68,7 @@
              if(deathscore) showscores(true);
              disablezoom();
              if(!restore) loopi(NUMGUNS) savedammo[i] = player1->ammo[i];
-@@ -659,6 +676,7 @@
+@@ -659,6 +680,7 @@
              d->lifesequence = -1;
              d->respawned = d->suicided = -2;
          }
@@ -72,7 +76,7 @@
  
          setclientmode();
  
-@@ -1409,6 +1427,32 @@
+@@ -1409,6 +1431,32 @@
          }
      }
  
@@ -105,7 +109,7 @@
      void gameplayhud(int w, int h)
      {
          pushhudmatrix();
-@@ -1441,6 +1485,8 @@
+@@ -1441,6 +1489,8 @@
  
          drawreloadcountdown(w, h);
  
