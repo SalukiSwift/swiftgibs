@@ -13,9 +13,11 @@ SwiftGibs takes the classic open-source arena shooter and strips it to its faste
 - **Flat low-detail world.** World textures crushed to a flat competitive look; fonts, HUD, and map thumbnails stay crisp. Runs on potatoes.
 - **Expanded scoreboard.** Frags in every mode (including CTF), deaths, KDR, captures, optional accuracy and damage. All toggleable.
 - **Friends system.** Name-based friends list; friends are highlighted in-game and on the minimap. Manage them from a dedicated Friends settings tab.
-- **Reload feedback, your way.** A 3-2-1 rifle-reload countdown (9 styles including Collapse and Edge-beats) and an independent fire-ready flash (8 styles from a subtle Thin-ring to a bold Edge-pulse), plus an optional tick-tick-tick-ding metronome. Mix and match.
+- **Reload feedback, your way.** An optional 3-2-1 rifle-reload countdown (9 styles including Collapse and Edge-beats), an independent fire-ready flash (8 styles from a subtle Thin-ring to a bold Edge-pulse), and a tick-tick-tick-ding metronome. All off by default. Mix and match.
+- **Hit and streak feedback.** Selectable hit-marker sounds with an adjustable volume and a preview button, a per-life killstreak counter with optional milestone dings, and a career stats page tracking your frags, deaths, accuracy, damage, and best streak.
+- **Readable chat.** Scroll back through chat with the mouse wheel while you type, or open a dedicated Chat History page.
 - **Non-obscuring teammate crosshair.** Over a teammate, your crosshair tints blue instead of the aim-blocking circle-slash icon (friendly fire is usually on).
-- **Native settings.** All SwiftGibs options live in the regular Esc > options menu as SwiftGibs and Friends tabs. F3 is a quick-play launcher for instant bot matches.
+- **Native settings.** All SwiftGibs options live in the regular Esc > options menu as SwiftGibs, Cues, and Friends tabs. F3 is a quick-play launcher for instant bot matches.
 - **Just works.** Auto-detects your monitor's native resolution and launches fullscreen on first run. No config needed.
 - **Server-compatible.** No protocol changes; every feature is client-side. Play on any official or public Sauerbraten server.
 
@@ -44,18 +46,20 @@ Your settings and saved friends live in your user config directory and persist b
 
 - Move and shoot like any Sauerbraten client. It's instagib: you spawn with the rifle, one hit kills.
 - **F3** opens Quick Play: launch an instant bot match (FFA, Team, or CTF), add bots, or jump into settings.
-- **Esc > options** has the SwiftGibs tab (server filter, scoreboard, highlighting, reload countdown/flash/sound, teammate crosshair) and the Friends tab (add/remove, see who's in-game).
+- **Esc > options** has the SwiftGibs tab (server filter, scoreboard columns, friend highlighting, career stats, chat history), the Cues tab (reload countdown/flash/metronome, hit-marker sounds and volume, killstreak feedback, teammate crosshair), and the Friends tab (add/remove, see who's in-game).
 - The server browser is filtered to instagib-family servers by default (toggle it in the SwiftGibs tab).
 
-### Reload feedback
+### Feedback cues
 
-Two independent settings under the SwiftGibs tab:
+Independent settings under the Cues tab (all off by default except where noted):
 
-| Setting | What it is | Styles |
+| Setting | What it is | Options |
 |---|---|---|
-| Countdown | the 3-2-1 during the rifle's reload | Off, Rings, Pulse, **Collapse** (default), Sweep, Pips, Crosshair-Pulse, Digits, Edge-beats |
-| Ready flash | the flash the instant you can fire again | Off, Pip, Dot, **Thin-ring** (default), Ring-ping, Bloom, Burst, Edge-pulse |
-| Metronome | audio tick-tick-tick-ding over the reload | Off (default), Flat, Rising, plus volume |
+| Countdown | the 3-2-1 during the rifle's reload | **Off** (default), Rings, Pulse, Collapse, Sweep, Pips, Crosshair-Pulse, Digits, Edge-beats |
+| Ready flash | the flash the instant you can fire again | **Off** (default), Pip, Dot, Thin-ring, Ring-ping, Bloom, Burst, Edge-pulse |
+| Metronome | audio tick-tick-tick-ding over the reload | **Off** (default), Flat, Rising, plus volume |
+| Hit sound | the marker sound when you land a hit | **Stock** (default) or an alternate, plus an adjustable volume and preview |
+| Killstreak | per-life streak counter, with optional milestone dings | Counter **on** by default; milestone sound off |
 
 ## Design philosophy: clarity, not cheating
 

@@ -29,4 +29,4 @@ Notes
 - To add friends so they're highlighted: F3 in-game opens the SwiftGibs menu,
   or use the friends menu; names are matched case-insensitively.
 
-Have fun. -- built with Claude
+Have fun.
