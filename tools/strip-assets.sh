@@ -7,6 +7,10 @@ POOL="${1:?usage: strip-assets.sh <pool-file> <stage-dir>}"
 STAGE="${2:?stage dir required}"
 WORLD_PX="${WORLD_PX:-2}"   # world textures crushed to this many px (flat look); fonts/hud exempt
 
+# A killed prior run can leave read-only package dirs in the stage (some install
+# packages ship mode 555, e.g. the "staffy" skybox), which makes `rm -rf` fail on the
+# next run. Make the leftover writable first so the clean always succeeds.
+chmod -R u+w "$STAGE" 2>/dev/null || true
 rm -rf "$STAGE"; mkdir -p "$STAGE/packages/base"
 
 # 1) data/ wholesale (shaders, fonts, menus, default cfgs ~2.8MB)

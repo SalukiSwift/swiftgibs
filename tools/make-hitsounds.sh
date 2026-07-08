@@ -3,7 +3,7 @@
 # Mirrors the reload-metronome sound style (short sine/partials + afade + alimiter,
 # libvorbis output) so the new sounds sit alongside tick_lo/tick_mid/tick_hi/ding.
 #
-# Output: overlay/packages/sounds/swiftgibs/hit_{unreal,custom1,custom2}.ogg
+# Output: overlay/packages/sounds/swiftgibs/hit_{custom1,custom2}.ogg
 #
 # NOTE: hit_tf2 / hit_quake / hit_cod are NO LONGER synthesized here. They are the
 # REAL game hit sounds (TF2 default doot extracted from the game's VPK, Quake 3, and
@@ -20,14 +20,8 @@ mkdir -p "$OUT"
 
 FF="ffmpeg -y -loglevel error"
 
-# (hit_tf2 and hit_quake are real game rips now -- committed directly, not synthesized.)
-
-# --- hit_unreal: metallic tink (two dissonant close-frequency partials ringing out) ---
-$FF -f lavfi -i "sine=f=2400:d=0.08" -f lavfi -i "sine=f=3100:d=0.08" \
-  -filter_complex "[0][1]amix=inputs=2:duration=longest,afade=t=out:st=0.02:d=0.06,alimiter=level_in=2" \
-  -c:a libvorbis -q:a 4 -ar 44100 -ac 1 "$OUT/hit_unreal.ogg"
-
-# (hit_cod is a real game rip now -- committed directly, not synthesized.)
+# (hit_tf2, hit_quake and hit_cod are real game rips now -- committed directly, not
+#  synthesized. The Unreal slot was removed entirely -- no source audio and April cut it.)
 
 # --- hit_custom1: satisfying rising synth ping (perfect-fifth two-tone) ---
 $FF -f lavfi -i "sine=f=660:d=0.05" -f lavfi -i "sine=f=990:d=0.08" \
@@ -44,4 +38,4 @@ $FF -f lavfi -i "sine=f=523:d=0.07" -f lavfi -i "sine=f=659:d=0.07" -f lavfi -i 
   -filter_complex "[0][1][2]concat=n=3:v=0:a=1,afade=t=out:st=0.20:d=0.03,alimiter=level_in=2" \
   -c:a libvorbis -q:a 4 -ar 44100 -ac 1 "$OUT/streak.ogg"
 
-echo "wrote hit_unreal.ogg hit_custom1.ogg hit_custom2.ogg streak.ogg to $OUT (tf2/quake/cod are real rips, not regenerated)"
+echo "wrote hit_custom1.ogg hit_custom2.ogg streak.ogg to $OUT (tf2/quake/cod are real rips, not regenerated; unreal removed)"
