@@ -29,6 +29,8 @@ Grab the latest build for your platform from the **[Releases](../../releases)** 
 ### Windows
 1. Download `swiftgibs-win64.zip` and unzip it.
 2. Open the `swiftgibs-win64` folder and double-click `swiftgibs.bat`.
+3. Optional: double-click `make-shortcut.bat` once to get a **SwiftGibs** shortcut on your
+   Desktop with the proper icon - launch from there from then on.
 
 ### macOS (Apple Silicon)
 1. Download `SwiftGibs-mac.zip` and unzip it to get `SwiftGibs.app`.
