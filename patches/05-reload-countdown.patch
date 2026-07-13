@@ -25,13 +25,13 @@
 +    // Returns elapsed ms in [0,RC_DUR) when any countdown source is active, else -1.
 +    int reloadcountdownElapsed()
 +    {
++        if(reloadfreezems >= 0) return reloadfreezems;
++        int de = lastmillis - reloaddemostart;                 // demo previews render anywhere,
++        if(de >= 0 && de < RC_DUR) return de;                  // menus included - check before state
 +        fpsent *d = hudplayer();
 +        if(d->state == CS_SPECTATOR || d->state == CS_DEAD) return -1;
-+        if(reloadfreezems >= 0) return reloadfreezems;
 +        int e = lastmillis - d->lastaction;
 +        if(d->lastattackgun == GUN_RIFLE && d->gunwait > 0 && e >= 0 && e < d->gunwait) return e;
-+        int de = lastmillis - reloaddemostart;
-+        if(de >= 0 && de < RC_DUR) return de;
 +        return -1;
 +    }
 +
@@ -73,14 +73,14 @@
 +    int reloadpopElapsed()
 +    {
 +        if(reloadcount == 0 && reloadflash == 0) return -1;   // pop window also drives the decoupled ready-flash
-+        fpsent *d = hudplayer();
-+        if(d->state == CS_SPECTATOR || d->state == CS_DEAD) return -1;
 +        if(reloadfreezems >= 0)
 +            return (reloadfreezems >= RC_DUR && reloadfreezems < RC_DUR + RC_POP) ? reloadfreezems - RC_DUR : -1;
++        int de = lastmillis - reloaddemostart;                 // demo previews render anywhere,
++        if(de >= RC_DUR && de < RC_DUR + RC_POP) return de - RC_DUR;   // menus included
++        fpsent *d = hudplayer();
++        if(d->state == CS_SPECTATOR || d->state == CS_DEAD) return -1;
 +        int e = lastmillis - d->lastaction;
 +        if(d->lastattackgun == GUN_RIFLE && e >= RC_DUR && e < RC_DUR + RC_POP) return e - RC_DUR;
-+        int de = lastmillis - reloaddemostart;
-+        if(de >= RC_DUR && de < RC_DUR + RC_POP) return de - RC_DUR;
 +        return -1;
 +    }
 +
