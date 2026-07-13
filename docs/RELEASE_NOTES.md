@@ -1,16 +1,13 @@
-# SwiftGibs v1.1.1
+# SwiftGibs v1.1.2
 
-A fix release for v1.1. Windows and Linux builds are unchanged apart from the name fix below; **macOS users should definitely update** — the v1.1 mac app could not launch from Finder.
+One fix, for all platforms: **your settings are yours now.**
 
-## Fixed
+Previous versions re-applied the SwiftGibs competitive config (sensitivity, gamma, FOV, crosshair, and friends) on every launch, silently overwriting any changes you had made. As of v1.1.2 those defaults are applied **once, on first run** — after that, everything you change in the options persists like it should.
 
-- **macOS: the app now launches.** The v1.1 `SwiftGibs.app` failed with "cannot find data files" when opened from Finder; the engine now locates the bundle's own data and stores your settings in `~/Library/Application Support/SwiftGibs`. The mac bundle also ships the SwiftGibs / Cues / Friends settings tabs it was missing. *(Contributed by Becky Conning — thanks!)*
-- **Your player name now sticks.** v1.1 shipped a config line that reset the player name to "Swift" on every launch. Set your name once; it persists.
+Upgrading note: your first launch of v1.1.2 applies the SwiftGibs defaults one last time (there was no way to tell your settings from the old pinned ones). Set things how you like them — from now on they stick.
 
 ## Download
 
 - **Windows:** `swiftgibs-win64.zip`
-- **macOS (Apple Silicon):** `SwiftGibs-mac.zip` — first launch: right-click → **Open** → **Open** (one-time Gatekeeper step)
+- **macOS (Apple Silicon):** `SwiftGibs-mac.zip` — first launch: right-click → **Open** → **Open**
 - **Linux (x86-64):** `SwiftGibs-linux-x86_64.tar.gz`
-
-Settings and friends carry over. If v1.1 renamed you to "Swift", just set your name again — it'll stay put now.
