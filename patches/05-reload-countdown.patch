@@ -379,12 +379,12 @@
      hudquad(x, y, chsize, chsize);
  }
  
-@@ -2358,6 +2359,8 @@
- 
-     glEnable(GL_BLEND);
- 
-+    game::reloadhudoverlay(w, h);   // cue demos on top of any open menu
-+
+@@ -2361,6 +2362,8 @@
      hudmatrix.ortho(0, w, h, 0, -1, 1);
      resethudmatrix();
  
++    game::reloadhudoverlay(w, h);   // cue demos over any open menu (must come after the ortho reset)
++
+     pushhudmatrix();
+     hudmatrix.scale(conscale, conscale, 1);
+     flushhudmatrix();
