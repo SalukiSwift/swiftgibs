@@ -93,7 +93,7 @@
                  if(actor!=player1 && (!cmode || !cmode->hidefrags() || !hidefrags))
 --- a/fpsgame/fps.cpp
 +++ b/fpsgame/fps.cpp
-@@ -396,6 +396,16 @@
+@@ -396,6 +396,17 @@
  
      VARP(hitsound, 0, 0, 1);
  
@@ -106,11 +106,12 @@
 +        return n[(hitsoundsel>=0 && hitsoundsel<=5) ? hitsoundsel : 0];
 +    }
 +    ICOMMAND(playhitsoundpreview, "", (), { if(hitsoundvol>0) playsoundname(hitsndname(), NULL, hitsoundvol); });
++    ICOMMAND(playstreaksound, "", (), playsoundname("swiftgibs/streak"));
 +
      void damaged(int damage, fpsent *d, fpsent *actor, bool local)
      {
          if((d->state!=CS_ALIVE && d->state != CS_LAGGED && d->state != CS_SPAWNING) || intermission) return;
-@@ -406,7 +416,7 @@
+@@ -406,7 +417,7 @@
          fpsent *h = hudplayer();
          if(h!=player1 && actor==h && d!=actor)
          {
@@ -119,7 +120,7 @@
              lasthit = lastmillis;
          }
          if(d==h)
-@@ -425,6 +435,27 @@
+@@ -425,6 +436,27 @@
          else playsound(S_PAIN1+rnd(5), &d->o);
      }
  
@@ -147,7 +148,7 @@
      VARP(deathscore, 0, 1, 1);
  
      void deathstate(fpsent *d, bool restore)
-@@ -438,6 +469,7 @@
+@@ -438,6 +470,7 @@
          }
          if(d==player1)
          {
@@ -155,7 +156,7 @@
              if(deathscore) showscores(true);
              disablezoom();
              if(!restore) loopi(NUMGUNS) savedammo[i] = player1->ammo[i];
-@@ -659,6 +691,7 @@
+@@ -659,6 +692,7 @@
              d->lifesequence = -1;
              d->respawned = d->suicided = -2;
          }
@@ -163,7 +164,7 @@
  
          setclientmode();
  
-@@ -1409,6 +1442,32 @@
+@@ -1409,6 +1443,32 @@
          }
      }
  
@@ -196,7 +197,7 @@
      void gameplayhud(int w, int h)
      {
          pushhudmatrix();
-@@ -1441,6 +1500,8 @@
+@@ -1441,6 +1501,8 @@
  
          drawreloadcountdown(w, h);
  

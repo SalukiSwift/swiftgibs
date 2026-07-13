@@ -19,7 +19,6 @@ assert i >= 0, "integrate-menus: options anchor (showfileeditor autoexec.cfg) no
 close = b.find(b'] "game"', i)                     # the options gui closing bracket after the anchor
 assert close >= 0, "integrate-menus: options closing `] \"game\"` not found after anchor"
 ins = (b'    guitab "SwiftGibs"' + nl + b'    sgSwiftgibsTab' + nl +
-       b'    guitab "Cues"' + nl + b'    sgCuesTab' + nl +
        b'    guitab "Friends"' + nl + b'    sgFriendsTab' + nl)
 open(p, "wb").write(b[:close] + ins + b[close:])
 print("integrate-menus: attached SwiftGibs + Friends tabs to", p)
