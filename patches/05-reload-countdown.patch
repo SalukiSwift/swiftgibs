@@ -6,7 +6,7 @@
  
  namespace game
  {
-@@ -1104,6 +1105,277 @@
+@@ -1104,6 +1105,295 @@
          pophudmatrix();
      }
  
@@ -21,6 +21,8 @@
 +
 +    // === SwiftGibs reload-countdown v3 shared layer ===
 +    static const int RC_DUR = 1500, RC_POP = 180;
++    static bool reloadoverlaypass = false;   // set while drawing the post-gui overlay
++    static bool reloaddemoing() { int de = lastmillis - reloaddemostart; return de >= 0 && de < RC_DUR + RC_POP; }
 +
 +    // Returns elapsed ms in [0,RC_DUR) when any countdown source is active, else -1.
 +    int reloadcountdownElapsed()
@@ -112,6 +114,7 @@
 +    void drawreloadcountdown(int w, int h)
 +    {
 +        if(reloadcount == 0 && reloadflash == 0) return;   // draw if EITHER the countdown or the ready-flash is on
++        if(reloaddemoing() && !reloadoverlaypass) return;   // demos draw AFTER the gui pass (menus would cover them)
 +        fpsent *d = hudplayer();
 +        if(d->state == CS_SPECTATOR || d->state == CS_DEAD) return;
 +
@@ -281,10 +284,25 @@
 +        }
 +    }
 +
++    // Post-gui overlay: cue demos must draw AFTER g3d_render2d or menu windows cover them
++    // (that is exactly where a player is when auditioning styles). Real reloads keep the
++    // normal gameplayhud draw above.
++    void reloadhudoverlay(int w, int h)
++    {
++        if(!reloaddemoing()) return;
++        reloadoverlaypass = true;
++        pushhudmatrix();
++        hudmatrix.scale(h/1800.0f, h/1800.0f, 1);
++        flushhudmatrix();
++        drawreloadcountdown(w, h);
++        pophudmatrix();
++        reloadoverlaypass = false;
++    }
++
      void gameplayhud(int w, int h)
      {
          pushhudmatrix();
-@@ -1134,6 +1406,8 @@
+@@ -1134,6 +1424,8 @@
              if(cmode) cmode->drawhud(d, w, h);
          }
  
@@ -293,7 +311,7 @@
          pophudmatrix();
  
          if(d->state!=CS_EDITING && d->state!=CS_SPECTATOR && d->state!=CS_DEAD)
-@@ -1167,6 +1441,8 @@
+@@ -1167,6 +1459,8 @@
          }
      }
  
@@ -302,7 +320,7 @@
      int selectcrosshair(vec &color)
      {
          fpsent *d = hudplayer();
-@@ -1175,18 +1451,24 @@
+@@ -1175,18 +1469,24 @@
          if(d->state!=CS_ALIVE) return 0;
  
          int crosshair = 0;
@@ -332,12 +350,13 @@
              else if(d->health<=50) color = vec(1, 0.5f, 0);
 --- a/shared/igame.h
 +++ b/shared/igame.h
-@@ -82,6 +82,8 @@
+@@ -82,6 +82,9 @@
      extern void g3d_gamemenus();
      extern const char *defaultcrosshair(int index);
      extern int selectcrosshair(vec &color);
 +    extern float reloadcrosshairscale();
 +    extern float reloadcrosshairfade();
++    extern void reloadhudoverlay(int w, int h);
      extern void lighteffects(dynent *d, vec &color, vec &dir);
      extern void setupcamera();
      extern bool allowthirdperson(bool msg = false);
@@ -359,4 +378,13 @@
 +    gle::color(color, game::reloadcrosshairfade());
      hudquad(x, y, chsize, chsize);
  }
+ 
+@@ -2358,6 +2359,8 @@
+ 
+     glEnable(GL_BLEND);
+ 
++    game::reloadhudoverlay(w, h);   // cue demos on top of any open menu
++
+     hudmatrix.ortho(0, w, h, 0, -1, 1);
+     resethudmatrix();
  
