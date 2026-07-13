@@ -1,13 +1,18 @@
-# SwiftGibs v1.1.2
+# SwiftGibs v1.1.3
 
-One fix, for all platforms: **your settings are yours now.**
+A menus and feedback update: settings now show you what they do.
 
-Previous versions re-applied the SwiftGibs competitive config (sensitivity, gamma, FOV, crosshair, and friends) on every launch, silently overwriting any changes you had made. As of v1.1.2 those defaults are applied **once, on first run** — after that, everything you change in the options persists like it should.
+## New
 
-Upgrading note: your first launch of v1.1.2 applies the SwiftGibs defaults one last time (there was no way to tell your settings from the old pinned ones). Set things how you like them — from now on they stick.
+- **Live previews everywhere.** Pick a reload countdown, ready flash, or metronome style and it plays out immediately - right over the menu, including the main menu, so you can tune your cues before ever joining a game. Hit sounds and volumes audition as you click or drag, the killstreak ding plays when you enable it, and a pulsing crosshair appears for crosshair-linked styles.
+- **Timing Cues tab.** The reload countdown, ready flash, and metronome now live in their own top-level options tab, with radio selectors for every style.
+
+## Fixed
+
+- **No more mystery numbered tabs.** Menu content that outgrew a tab used to spill into a bare-numbered extra tab (and the Friends tab could do this on busy servers, one row per player). Tabs are now fixed-size, with long lists on dedicated pages - the Friends tab shows who's in game with a full manage-friends page behind it.
 
 ## Download
 
 - **Windows:** `swiftgibs-win64.zip`
-- **macOS (Apple Silicon):** `SwiftGibs-mac.zip` — first launch: right-click → **Open** → **Open**
+- **macOS (Apple Silicon):** `SwiftGibs-mac.zip` - first launch: right-click, **Open**, **Open**
 - **Linux (x86-64):** `SwiftGibs-linux-x86_64.tar.gz`

@@ -17,7 +17,8 @@ SwiftGibs takes the classic open-source arena shooter and strips it to its faste
 - **Hit and streak feedback.** Selectable hit-marker sounds with an adjustable volume and a preview button, a per-life killstreak counter with optional milestone dings, and a career stats page tracking your frags, deaths, accuracy, damage, and best streak.
 - **Readable chat.** Scroll back through chat with the mouse wheel while you type, or open a dedicated Chat History page.
 - **Non-obscuring teammate crosshair.** Over a teammate, your crosshair tints blue instead of the aim-blocking circle-slash icon (friendly fire is usually on).
-- **Native settings.** All SwiftGibs options live in the regular Esc > options menu as SwiftGibs, Cues, and Friends tabs. F3 is a quick-play launcher for instant bot matches.
+- **Native settings.** All SwiftGibs options live in the regular Esc > options menu as SwiftGibs, Timing Cues, and Friends tabs. F3 is a quick-play launcher for instant bot matches.
+- **Live previews.** Selecting any cue demonstrates it on the spot: countdown and ready-flash styles play out right over the menu (main menu included, with a pulsing crosshair where a style needs one), and hit sounds, volumes, and the killstreak ding audition as you click.
 - **Just works.** Auto-detects your monitor's native resolution and launches fullscreen on first run. No config needed.
 - **Server-compatible.** No protocol changes; every feature is client-side. Play on any official or public Sauerbraten server.
 
@@ -46,12 +47,12 @@ Your settings and saved friends live in your user config directory and persist b
 
 - Move and shoot like any Sauerbraten client. It's instagib: you spawn with the rifle, one hit kills.
 - **F3** opens Quick Play: launch an instant bot match (FFA, Team, or CTF), add bots, or jump into settings.
-- **Esc > options** has the SwiftGibs tab (server filter, scoreboard columns, friend highlighting, career stats, chat history), the Cues tab (reload countdown/flash/metronome, hit-marker sounds and volume, killstreak feedback, teammate crosshair), and the Friends tab (add/remove, see who's in-game).
+- **Esc > options** has the SwiftGibs tab (server filter, scoreboard columns, friend highlighting, career stats, chat history, hit sounds, killstreak feedback, teammate crosshair), the Timing Cues tab (reload countdown, ready flash, and metronome with volume - every choice previews itself over the menu), and the Friends tab (quick-add, who's in game, and a full manage-friends page).
 - The server browser is filtered to instagib-family servers by default (toggle it in the SwiftGibs tab).
 
 ### Feedback cues
 
-Independent settings under the Cues tab (all off by default except where noted):
+Independent settings under the Timing Cues tab (all off by default except where noted); picking any option plays a live demo:
 
 | Setting | What it is | Options |
 |---|---|---|
@@ -88,7 +89,7 @@ build/make-bundle-mac.sh            # macOS .app (APP_DIR=/tmp/SwiftGibs.app for
 
 - `patches/NN-*.patch` are the engine changes, applied in order. Each is one focused feature (server filter, scoreboard, friends, reload feedback, flat models, and so on).
 - `overlay/` holds menus, autoexec, crosshair, and flat skins: pure data layered over the stock game.
-- `build/integrate-menus.sh` splices the SwiftGibs and Friends tabs into the stock options menu at bundle time.
+- `build/integrate-menus.sh` splices the SwiftGibs, Timing Cues, and Friends tabs into the stock options menu at bundle time.
 - `tools/strip-assets.sh` produces the flat low-res data tree from a Sauerbraten install (or the official release archive).
 
 Releases are built reproducibly in GitHub Actions from the official 2020 Sauerbraten data, so no local install is required.
