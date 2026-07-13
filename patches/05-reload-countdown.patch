@@ -381,7 +381,7 @@
      hudquad(x, y, chsize, chsize);
  }
  
-@@ -2361,6 +2362,28 @@
+@@ -2361,6 +2362,29 @@
      hudmatrix.ortho(0, w, h, 0, -1, 1);
      resethudmatrix();
  
@@ -401,6 +401,7 @@
 +            float chs = crosshairsize*w/900.0f * game::reloadcrosshairscale();
 +            if(ch->type&Texture::ALPHA) glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 +            else glBlendFunc(GL_ONE, GL_ONE);
++            glBindTexture(GL_TEXTURE_2D, ch->id);
 +            hudshader->set();
 +            gle::colorf(ccolor.x, ccolor.y, ccolor.z, game::reloadcrosshairfade());
 +            hudquad(0.5f*w - chs/2, 0.5f*h - chs/2, chs, chs);
