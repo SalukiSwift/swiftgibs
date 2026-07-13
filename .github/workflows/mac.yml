@@ -77,22 +77,6 @@ jobs:
           echo "--- first 30 lines of load log ---"
           head -30 /tmp/load.log 2>/dev/null || true
 
-      - name: Prove rcodesign ad-hoc signatures are Apple-accepted (retires the local-signing risk)
-        run: |
-          set -euo pipefail
-          # the shippable bundle is re-signed on Linux with rcodesign after data is added; confirm
-          # Apple's authoritative codesign accepts an rcodesign ad-hoc signature (with post-sign data)
-          RCVER=0.29.0
-          curl -fsSL -o /tmp/rc.tgz "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F$RCVER/apple-codesign-$RCVER-aarch64-apple-darwin.tar.gz"
-          tar -C /tmp -xzf /tmp/rc.tgz
-          RC=$(find /tmp -name rcodesign -type f -path '*apple-darwin*' | head -1); chmod +x "$RC"
-          cp -R /tmp/SwiftGibs.app /tmp/rc-test.app
-          echo "simulated post-sign game data" > /tmp/rc-test.app/Contents/Resources/dummydata.txt
-          "$RC" sign /tmp/rc-test.app
-          echo "--- Apple codesign verdict on the rcodesign-signed bundle ---"
-          codesign --verify --deep --strict --verbose=2 /tmp/rc-test.app && echo "APPLE-ACCEPTS-RCODESIGN: yes"
-          codesign -dv --verbose=4 /tmp/rc-test.app 2>&1 | grep -iE 'Signature|CDHash|flags|adhoc' | head -6 || true
-
       - name: Package artifact
         run: ditto -c -k --keepParent /tmp/SwiftGibs.app /tmp/SwiftGibs-app-code.zip
 
@@ -101,3 +85,24 @@ jobs:
           name: SwiftGibs-app-code
           path: /tmp/SwiftGibs-app-code.zip
           if-no-files-found: error
+
+      - name: Prove rcodesign ad-hoc signatures are Apple-accepted (retires the local-signing risk)
+        run: |
+          set -euo pipefail
+          # the shippable bundle is re-signed on Linux with rcodesign after data is added; confirm
+          # Apple's authoritative codesign accepts an rcodesign ad-hoc signature (with post-sign data).
+          # Runs AFTER the artifact upload above, so this proof can never block artifact delivery.
+          RCVER=0.29.0
+          curl -fsSL -o /tmp/rc.tgz "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F$RCVER/apple-codesign-$RCVER-aarch64-apple-darwin.tar.gz"
+          # extract to a clean dir at a deterministic path. (The old `find /tmp ... | head -1`
+          # returned empty -- head closing the pipe early trips `set -o pipefail` -- so the next
+          # line ran `chmod +x ""` and failed the whole run.)
+          rm -rf /tmp/rc && mkdir -p /tmp/rc
+          tar -C /tmp/rc --strip-components=1 -xzf /tmp/rc.tgz
+          RC=/tmp/rc/rcodesign; chmod +x "$RC"
+          cp -R /tmp/SwiftGibs.app /tmp/rc-test.app
+          echo "simulated post-sign game data" > /tmp/rc-test.app/Contents/Resources/dummydata.txt
+          "$RC" sign /tmp/rc-test.app
+          echo "--- Apple codesign verdict on the rcodesign-signed bundle ---"
+          codesign --verify --deep --strict --verbose=2 /tmp/rc-test.app && echo "APPLE-ACCEPTS-RCODESIGN: yes"
+          codesign -dv --verbose=4 /tmp/rc-test.app 2>&1 | grep -iE 'Signature|CDHash|flags|adhoc' | head -6 || true

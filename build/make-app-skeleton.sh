@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Assemble the code-only SwiftGibs.app: binary + embedded SDL2 frameworks + plist + icon,
 # then ad-hoc codesign. NO game data (added later by make-bundle-mac.sh). Runs on macOS.
+#
+# CFBundleExecutable is the engine binary itself (a single Mach-O -- so BOTH Apple codesign and the
+# Linux rcodesign release signer accept it). The engine locates its data root on macOS by chdir'ing
+# to the bundle's Contents/Resources at startup (patches/13-mac-datadir.patch); no launcher script.
 # Usage: make-app-skeleton.sh <built-client> <frameworks-dir> <out.app>
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -20,5 +24,5 @@ install_name_tool -add_rpath @executable_path/../Frameworks "$APP/Contents/MacOS
 # sign frameworks first, then the app (deep) -- ad-hoc; mandatory for arm64 to run at all
 for fw in "$APP"/Contents/Frameworks/*.framework; do codesign --force --sign - "$fw"; done
 codesign --force --deep --sign - "$APP"
-codesign --verify --verbose "$APP"
+codesign --verify --deep --strict --verbose=2 "$APP"
 echo "app skeleton: $APP"

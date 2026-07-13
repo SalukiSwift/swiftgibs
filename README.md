@@ -82,7 +82,8 @@ build/make-engine-win.sh            # Windows (mingw cross-compile)
 
 # assemble a playable bundle (engine + stripped data + overlay)
 build/make-bundle-win.sh            # Windows .zip
-build/make-bundle-mac.sh            # macOS .app (re-signed with rcodesign)
+build/make-bundle-mac.sh            # macOS .app (APP_DIR=/tmp/SwiftGibs.app for a local build;
+                                    #   re-signed with Apple codesign on macOS, rcodesign on Linux)
 ```
 
 - `patches/NN-*.patch` are the engine changes, applied in order. Each is one focused feature (server filter, scoreboard, friends, reload feedback, flat models, and so on).

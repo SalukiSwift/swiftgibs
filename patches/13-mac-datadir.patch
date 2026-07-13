@@ -1,0 +1,39 @@
+--- a/engine/main.cpp
++++ b/engine/main.cpp
+@@ -1,6 +1,10 @@
+ // main.cpp: initialisation & main loop
+ 
+ #include "engine.h"
++
++#ifdef __APPLE__
++#include <unistd.h>   // chdir()
++#endif
+ 
+ #ifdef SDL_VIDEO_DRIVER_X11
+ #include "SDL_syswm.h"
+@@ -1185,6 +1189,25 @@
+ 
+     setlogfile(NULL);
+ 
++    #ifdef __APPLE__
++    // Launched from a .app bundle (Finder), the working directory is "/", not the game data
++    // root, so the engine cannot find data/ + packages/ and aborts with "cannot find data
++    // files". Point CWD at the bundle's Contents/Resources (SDL_GetBasePath() returns it on
++    // macOS), where SwiftGibs ships its data. Also default the home dir (user config, saved
++    // friends, career stats) to Application Support -- the .app is read-only, so writing config
++    // next to the data would silently fail. An explicit -q on the command line still overrides.
++    {
++        char *base = SDL_GetBasePath();
++        if(base) { (void)chdir(base); SDL_free(base); }
++        const char *envhome = getenv("HOME");
++        if(envhome && envhome[0])
++        {
++            defformatstring(machome, "%s/Library/Application Support/SwiftGibs", envhome);
++            sethomedir(machome);
++        }
++    }
++    #endif
++
+     int dedicated = 0;
+     char *load = NULL, *initscript = NULL;
+ 
