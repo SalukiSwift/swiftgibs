@@ -1,0 +1,161 @@
+--- a/engine/serverbrowser.cpp
++++ b/engine/serverbrowser.cpp
+@@ -749,3 +749,158 @@
+     delete f;
+ }
+ 
++
++// --- SwiftGibs: in-game feedback -> plain-HTTP POST to the feedback relay ---
++// Reuses the master-server raw-TCP pattern above (resolverwait +
++// connectwithtimeout + enet wait loops): blocks with a progress bar, esc
++// aborts, bounded by FEEDBACKLIMIT. Plaintext on purpose - the engine has no
++// TLS and nothing secret crosses this hop (the GitHub token stays server-side).
++
++SVAR(feedbackhost, "salukiswift.com");
++VAR(feedbackport, 1, 8300, 0xFFFF);
++
++#define FEEDBACKLIMIT 8000
++
++static void feedbackencode(vector<char> &out, const char *s)
++{
++    static const char *hex = "0123456789ABCDEF";
++    for(; *s; s++)
++    {
++        uchar c = (uchar)*s;
++        if((c>='0' && c<='9') || (c>='A' && c<='Z') || (c>='a' && c<='z') ||
++           c=='-' || c=='_' || c=='.' || c=='~') out.add(c);
++        else if(c==' ') out.add('+');
++        else { out.add('%'); out.add(hex[c>>4]); out.add(hex[c&0xF]); }
++    }
++}
++
++static void feedbackstatus(const char *msg)
++{
++    alias("feedbackstatus", msg);
++    conoutf("feedback: %s", msg);
++}
++
++void sendfeedback(const char *name, const char *category, const char *version, const char *text)
++{
++    if(!text[0]) { feedbackstatus("nothing to send"); return; }
++
++    ENetAddress address;
++    address.host = ENET_HOST_ANY;
++    address.port = feedbackport;
++    if(!resolverwait(feedbackhost, &address))
++    {
++        feedbackstatus("could not resolve the feedback server");
++        return;
++    }
++    ENetSocket sock = enet_socket_create(ENET_SOCKET_TYPE_STREAM);
++    if(sock == ENET_SOCKET_NULL) { feedbackstatus("could not open a socket"); return; }
++    enet_socket_set_option(sock, ENET_SOCKOPT_NONBLOCK, 1);
++    if(connectwithtimeout(sock, feedbackhost, address))
++    {
++        enet_socket_destroy(sock);
++        feedbackstatus("could not reach the feedback server");
++        return;
++    }
++
++    vector<char> body;
++    body.put("name=", 5); feedbackencode(body, name);
++    body.put("&category=", 10); feedbackencode(body, category);
++    body.put("&version=", 9); feedbackencode(body, version);
++    body.put("&platform=", 10);
++#ifdef WIN32
++    feedbackencode(body, "windows");
++#elif defined(__APPLE__)
++    feedbackencode(body, "mac");
++#else
++    feedbackencode(body, "linux");
++#endif
++    body.put("&text=", 6); feedbackencode(body, text);
++
++    vector<char> req;
++    defformatstring(header,
++        "POST /feedback HTTP/1.1\r\n"
++        "Host: %s\r\n"
++        "User-Agent: SwiftGibs\r\n"
++        "Content-Type: application/x-www-form-urlencoded\r\n"
++        "Content-Length: %d\r\n"
++        "Connection: close\r\n"
++        "\r\n",
++        feedbackhost, body.length());
++    req.put(header, strlen(header));
++    req.put(body.getbuf(), body.length());
++
++    defformatstring(progresstext, "sending feedback to %s... (esc to abort)", feedbackhost);
++    renderprogress(0, progresstext);
++
++    int starttime = SDL_GetTicks(), timeout = 0;
++    const char *out = req.getbuf();
++    int outlen = req.length();
++    ENetBuffer buf;
++    while(outlen > 0)
++    {
++        enet_uint32 events = ENET_SOCKET_WAIT_SEND;
++        if(enet_socket_wait(sock, &events, 250) >= 0 && events)
++        {
++            buf.data = (void *)out;
++            buf.dataLength = outlen;
++            int sent = enet_socket_send(sock, NULL, &buf, 1);
++            if(sent < 0) break;
++            out += sent;
++            outlen -= sent;
++        }
++        timeout = SDL_GetTicks() - starttime;
++        renderprogress(min(float(timeout)/FEEDBACKLIMIT, 1.0f), progresstext);
++        if(interceptkey(SDLK_ESCAPE)) timeout = FEEDBACKLIMIT + 1;
++        if(timeout > FEEDBACKLIMIT) break;
++    }
++
++    vector<char> data;
++    if(outlen <= 0) for(;;)
++    {
++        enet_uint32 events = ENET_SOCKET_WAIT_RECEIVE;
++        if(enet_socket_wait(sock, &events, 250) >= 0 && events)
++        {
++            if(data.length() >= data.capacity()) data.reserve(4096);
++            buf.data = data.getbuf() + data.length();
++            buf.dataLength = data.capacity() - data.length();
++            int recv = enet_socket_receive(sock, NULL, &buf, 1);
++            if(recv <= 0) break;
++            data.advance(recv);
++        }
++        timeout = SDL_GetTicks() - starttime;
++        renderprogress(min(float(timeout)/FEEDBACKLIMIT, 1.0f), progresstext);
++        if(interceptkey(SDLK_ESCAPE)) timeout = FEEDBACKLIMIT + 1;
++        if(timeout > FEEDBACKLIMIT) break;
++    }
++    enet_socket_destroy(sock);
++
++    if(outlen > 0 || data.empty())
++    {
++        feedbackstatus(timeout > FEEDBACKLIMIT ? "timed out - try again later" : "no reply from the feedback server");
++        return;
++    }
++    data.add('\0');
++
++    int code = 0;
++    if(sscanf(data.getbuf(), "HTTP/%*s %d", &code) != 1)
++    {
++        feedbackstatus("bad reply from the feedback server");
++        return;
++    }
++    char *msg = strstr(data.getbuf(), "\r\n\r\n");
++    if(msg)
++    {
++        msg += 4;
++        char *end = strpbrk(msg, "\r\n");
++        if(end) *end = '\0';
++    }
++    if(code == 200) feedbackstatus(msg && msg[0] ? msg : "sent - thank you!");
++    else if(msg && msg[0] && code >= 400 && code < 500) feedbackstatus(msg);
++    else
++    {
++        defformatstring(err, "feedback server error (%d)", code);
++        feedbackstatus(err);
++    }
++}
++
++ICOMMAND(sendfeedback, "ssss", (const char *name, const char *category, const char *version, const char *text), sendfeedback(name, category, version, text));
