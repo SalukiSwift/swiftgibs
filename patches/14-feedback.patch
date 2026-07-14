@@ -303,7 +303,7 @@
 +            pushhudmatrix();
 +            hudmatrix.scale(conscale, conscale, 1);
 +            flushhudmatrix();
-+            defformatstring(sgvertext, "\f4SwiftGibs v%s", sgver);
++            defformatstring(sgvertext, "\f2SwiftGibs v%s", sgver);
 +            int sgtw = 0, sgth = 0;
 +            text_bounds(sgvertext, sgtw, sgth);
 +            draw_text(sgvertext, conw - sgtw - FONTH/2, conh - FONTH*3/2);
