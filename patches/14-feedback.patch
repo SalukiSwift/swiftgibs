@@ -1,6 +1,6 @@
 --- a/engine/serverbrowser.cpp
 +++ b/engine/serverbrowser.cpp
-@@ -749,3 +749,158 @@
+@@ -749,3 +749,192 @@
      delete f;
  }
  
@@ -10,24 +10,17 @@
 +// connectwithtimeout + enet wait loops): blocks with a progress bar, esc
 +// aborts, bounded by FEEDBACKLIMIT. Plaintext on purpose - the engine has no
 +// TLS and nothing secret crosses this hop (the GitHub token stays server-side).
++// The POST is multipart/form-data: text fields (feedback + telemetry the
++// engine can see: map, mode, position, fps) plus an optional JPEG screenshot
++// taken by the F8 hotkey (screenshot/feedbackshot.jpg). Match stats arrive as
++// the script-assembled "info" argument (frags/deaths/... commands live in the
++// game dll side, not here).
 +
 +SVAR(feedbackhost, "salukiswift.com");
 +VAR(feedbackport, 1, 8300, 0xFFFF);
 +
-+#define FEEDBACKLIMIT 8000
-+
-+static void feedbackencode(vector<char> &out, const char *s)
-+{
-+    static const char *hex = "0123456789ABCDEF";
-+    for(; *s; s++)
-+    {
-+        uchar c = (uchar)*s;
-+        if((c>='0' && c<='9') || (c>='A' && c<='Z') || (c>='a' && c<='z') ||
-+           c=='-' || c=='_' || c=='.' || c=='~') out.add(c);
-+        else if(c==' ') out.add('+');
-+        else { out.add('%'); out.add(hex[c>>4]); out.add(hex[c&0xF]); }
-+    }
-+}
++#define FEEDBACKLIMIT 15000
++#define FEEDBACKBOUNDARY "----SwiftGibsFeedback7d1298fa3e8a"
 +
 +static void feedbackstatus(const char *msg)
 +{
@@ -35,9 +28,64 @@
 +    conoutf("feedback: %s", msg);
 +}
 +
-+void sendfeedback(const char *name, const char *category, const char *version, const char *text)
++static void feedbackfield(vector<char> &out, const char *name, const char *value)
++{
++    defformatstring(head, "--" FEEDBACKBOUNDARY "\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n", name);
++    out.put(head, strlen(head));
++    out.put(value, strlen(value));
++    out.put("\r\n", 2);
++}
++
++void sendfeedback(const char *name, const char *category, const char *version, const char *text, int shot, const char *info)
 +{
 +    if(!text[0]) { feedbackstatus("nothing to send"); return; }
++
++    // assemble the multipart body: player fields + engine telemetry
++    vector<char> body;
++    feedbackfield(body, "name", name);
++    feedbackfield(body, "category", category);
++    feedbackfield(body, "version", version);
++#ifdef WIN32
++    feedbackfield(body, "platform", "windows");
++#elif defined(__APPLE__)
++    feedbackfield(body, "platform", "mac");
++#else
++    feedbackfield(body, "platform", "linux");
++#endif
++    feedbackfield(body, "text", text);
++    if(info[0]) feedbackfield(body, "info", info);
++
++    const char *map = game::getclientmap();
++    if(map && map[0]) feedbackfield(body, "map", map);
++    const char *mode = game::getscreenshotinfo();
++    if(mode && mode[0]) feedbackfield(body, "mode", mode);
++    if(camera1)
++    {
++        defformatstring(pos, "%d %d %d", int(camera1->o.x), int(camera1->o.y), int(camera1->o.z));
++        feedbackfield(body, "pos", pos);
++    }
++    int fps = 0, bestdiff = 0, worstdiff = 0;
++    getfps(fps, bestdiff, worstdiff);
++    defformatstring(fpsstr, "%d", fps);
++    feedbackfield(body, "fps", fpsstr);
++
++    if(shot)
++    {
++        extern char *screenshotdir;
++        defformatstring(shotpath, "%s%sfeedbackshot.jpg", screenshotdir, screenshotdir[0] ? "/" : "");
++        size_t shotlen = 0;
++        char *shotdata = loadfile(path(shotpath), &shotlen, false);
++        if(shotdata)
++        {
++            const char *head = "--" FEEDBACKBOUNDARY "\r\nContent-Disposition: form-data; name=\"shot\"; filename=\"feedbackshot.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
++            body.put(head, strlen(head));
++            body.put(shotdata, (int)shotlen);
++            body.put("\r\n", 2);
++            delete[] shotdata;
++        }
++        else conoutf("feedback: no screenshot found, sending without it");
++    }
++    body.put("--" FEEDBACKBOUNDARY "--\r\n", strlen("--" FEEDBACKBOUNDARY "--\r\n"));
 +
 +    ENetAddress address;
 +    address.host = ENET_HOST_ANY;
@@ -57,26 +105,12 @@
 +        return;
 +    }
 +
-+    vector<char> body;
-+    body.put("name=", 5); feedbackencode(body, name);
-+    body.put("&category=", 10); feedbackencode(body, category);
-+    body.put("&version=", 9); feedbackencode(body, version);
-+    body.put("&platform=", 10);
-+#ifdef WIN32
-+    feedbackencode(body, "windows");
-+#elif defined(__APPLE__)
-+    feedbackencode(body, "mac");
-+#else
-+    feedbackencode(body, "linux");
-+#endif
-+    body.put("&text=", 6); feedbackencode(body, text);
-+
 +    vector<char> req;
 +    defformatstring(header,
 +        "POST /feedback HTTP/1.1\r\n"
 +        "Host: %s\r\n"
 +        "User-Agent: SwiftGibs\r\n"
-+        "Content-Type: application/x-www-form-urlencoded\r\n"
++        "Content-Type: multipart/form-data; boundary=" FEEDBACKBOUNDARY "\r\n"
 +        "Content-Length: %d\r\n"
 +        "Connection: close\r\n"
 +        "\r\n",
@@ -158,4 +192,4 @@
 +    }
 +}
 +
-+ICOMMAND(sendfeedback, "ssss", (const char *name, const char *category, const char *version, const char *text), sendfeedback(name, category, version, text));
++ICOMMAND(sendfeedback, "ssssis", (const char *name, const char *category, const char *version, const char *text, int *shot, const char *info), sendfeedback(name, category, version, text, *shot, info));

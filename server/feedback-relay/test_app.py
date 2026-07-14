@@ -1,9 +1,14 @@
 """Tests for the SwiftGibs feedback relay. Run: python3 test_app.py
 Stdlib unittest only (mirrors the repo's no-pytest convention). The GitHub
 poster is stubbed - no network, no real issues."""
+import io
+import pathlib
+import tempfile
 import unittest
 
 import app as relay
+
+JPEG = b"\xff\xd8\xff\xe0" + b"fakejpegdata" * 4
 
 
 class RelayTest(unittest.TestCase):
@@ -17,10 +22,15 @@ class RelayTest(unittest.TestCase):
 
         self._real = relay.post_issue
         relay.post_issue = fake_post_issue
+        self._shots = tempfile.TemporaryDirectory()
+        self._real_shots = relay.SHOTS_DIR
+        relay.SHOTS_DIR = pathlib.Path(self._shots.name)
         self.client = relay.app.test_client()
 
     def tearDown(self):
         relay.post_issue = self._real
+        relay.SHOTS_DIR = self._real_shots
+        self._shots.cleanup()
 
     def post(self, ip="1.2.3.4", **form):
         return self.client.post("/feedback", data=form,
@@ -88,6 +98,66 @@ class RelayTest(unittest.TestCase):
         r = self.post(category="bug", text="A" * 200)
         self.assertEqual(r.status_code, 200)
         self.assertEqual(self.calls[0][0], "[feedback] bug: " + "A" * 60)
+
+    # ---- v2: telemetry + screenshot ----
+
+    def test_telemetry_lands_in_body(self):
+        r = self.post(text="laggy here", map="ot", mode="instagib",
+                      pos="512 301 88", fps="187",
+                      info="frags 12 deaths 3 damage 1200 shots 15 beststreak 7")
+        self.assertEqual(r.status_code, 200)
+        body = self.calls[0][1]
+        self.assertIn("**Map:** ot (instagib)", body)
+        self.assertIn("512 301 88", body)
+        self.assertIn("187", body)
+        self.assertIn("frags 12 deaths 3", body)
+
+    def test_no_telemetry_no_block(self):
+        r = self.post(text="hi")
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn("**Map:**", self.calls[0][1])
+        self.assertNotIn("Telemetry", self.calls[0][1])
+
+    def test_screenshot_saved_and_linked(self):
+        r = self.client.post("/feedback",
+                             data={"text": "look at this",
+                                   "shot": (io.BytesIO(JPEG), "feedbackshot.jpg")},
+                             headers={"X-Real-IP": "1.2.3.4"},
+                             content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 200)
+        saved = list(relay.SHOTS_DIR.glob("*.jpg"))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0].read_bytes(), JPEG)
+        self.assertIn(f"{relay.SHOTS_URL}/{saved[0].name}", self.calls[0][1])
+        self.assertIn("![screenshot]", self.calls[0][1])
+
+    def test_bad_magic_shot_ignored_feedback_still_sent(self):
+        r = self.client.post("/feedback",
+                             data={"text": "hi",
+                                   "shot": (io.BytesIO(b"not a jpeg"), "x.jpg")},
+                             headers={"X-Real-IP": "1.2.3.4"},
+                             content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(list(relay.SHOTS_DIR.iterdir()), [])
+        self.assertNotIn("![screenshot]", self.calls[0][1])
+
+    def test_oversize_shot_ignored_feedback_still_sent(self):
+        big = b"\xff\xd8\xff\xe0" + b"x" * (relay.MAX_SHOT + 1)
+        r = self.client.post("/feedback",
+                             data={"text": "hi",
+                                   "shot": (io.BytesIO(big), "x.jpg")},
+                             headers={"X-Real-IP": "1.2.3.4"},
+                             content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(list(relay.SHOTS_DIR.iterdir()), [])
+        self.assertNotIn("![screenshot]", self.calls[0][1])
+
+    def test_413_returns_short_plaintext(self):
+        r = self.client.post("/feedback", data=b"x" * (relay.MAX_BODY + 1024),
+                             content_type="application/x-www-form-urlencoded")
+        self.assertEqual(r.status_code, 413)
+        self.assertLess(len(r.data), 80)
+        self.assertNotIn(b"<", r.data)
 
 
 if __name__ == "__main__":
