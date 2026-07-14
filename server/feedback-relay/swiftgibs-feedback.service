@@ -1,0 +1,13 @@
+[Unit]
+Description=SwiftGibs in-game feedback relay (opens GitHub issues)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/swiftgibs-feedback
+ExecStart=/opt/swiftgibs-feedback/venv/bin/python /opt/swiftgibs-feedback/app.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
