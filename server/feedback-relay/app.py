@@ -104,6 +104,41 @@ def too_large(e):
     return "too big - try without the screenshot\n", 413
 
 
+VERSION_TTL = 600.0       # seconds between GitHub release lookups
+_version_cache = {"tag": None, "at": 0.0}
+
+
+def fetch_latest_tag():
+    """Latest release tag from GitHub; stubbed in tests. Uses the token for
+    rate-limit headroom (fine-grained contents:read covers releases)."""
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{REPO}/releases/latest",
+        headers={
+            "Authorization": f"Bearer {_token()}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.load(resp)["tag_name"]
+
+
+@app.get("/version")
+def version():
+    """Plaintext latest release tag - the game client polls this at launch
+    (it cannot speak TLS to GitHub itself). Cached; serves stale on failure."""
+    now = time.time()
+    if _version_cache["tag"] is None or now - _version_cache["at"] > VERSION_TTL:
+        try:
+            _version_cache["tag"] = fetch_latest_tag()
+            _version_cache["at"] = now
+        except Exception:
+            app.logger.exception("release lookup failed")
+            if _version_cache["tag"] is None:
+                return "unknown\n", 503
+    return f"{_version_cache['tag']}\n", 200
+
+
 @app.post("/feedback")
 def feedback():
     ip = request.headers.get("X-Real-IP", request.remote_addr or "?")

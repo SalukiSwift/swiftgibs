@@ -160,5 +160,51 @@ class RelayTest(unittest.TestCase):
         self.assertNotIn(b"<", r.data)
 
 
+class VersionTest(unittest.TestCase):
+    def setUp(self):
+        relay._version_cache.update(tag=None, at=0.0)
+        self.fetches = 0
+
+        def fake_fetch():
+            self.fetches += 1
+            return "v9.9.9"
+
+        self._real = relay.fetch_latest_tag
+        relay.fetch_latest_tag = fake_fetch
+        self.client = relay.app.test_client()
+
+    def tearDown(self):
+        relay.fetch_latest_tag = self._real
+        relay._version_cache.update(tag=None, at=0.0)
+
+    def test_returns_latest_tag(self):
+        r = self.client.get("/version")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.data, b"v9.9.9\n")
+
+    def test_cached_within_ttl(self):
+        self.client.get("/version")
+        self.client.get("/version")
+        self.assertEqual(self.fetches, 1)
+
+    def test_fetch_failure_without_cache_is_503(self):
+        def boom():
+            raise OSError("github down")
+        relay.fetch_latest_tag = boom
+        r = self.client.get("/version")
+        self.assertEqual(r.status_code, 503)
+
+    def test_fetch_failure_serves_stale_cache(self):
+        self.client.get("/version")                    # primes the cache
+        relay._version_cache["at"] = 0.0               # expire it
+
+        def boom():
+            raise OSError("github down")
+        relay.fetch_latest_tag = boom
+        r = self.client.get("/version")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.data, b"v9.9.9\n")
+
+
 if __name__ == "__main__":
     unittest.main()

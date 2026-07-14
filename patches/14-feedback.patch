@@ -1,6 +1,6 @@
 --- a/engine/serverbrowser.cpp
 +++ b/engine/serverbrowser.cpp
-@@ -749,3 +749,192 @@
+@@ -749,3 +749,286 @@
      delete f;
  }
  
@@ -193,3 +193,97 @@
 +}
 +
 +ICOMMAND(sendfeedback, "ssssis", (const char *name, const char *category, const char *version, const char *text, int *shot, const char *info), sendfeedback(name, category, version, text, *shot, info));
++
++// --- SwiftGibs: launch-time update check (autoexec: checkupdate $swiftgibsversion) ---
++// Asks the relay for the latest release tag (GET /version - the engine cannot
++// reach GitHub's HTTPS itself). Deliberately SILENT and short-budget: it runs
++// during init, so no progress UI and no error spam - a dead relay or an
++// offline box just means no update banner. Results land in the aliases
++// swiftgibsupdate (0/1) + swiftgibslatest, which the main-menu gui reads.
++#define CHECKUPDLIMIT 2500
++
++static bool parseversion(const char *s, int &major, int &minor, int &patch)
++{
++    if(*s == 'v' || *s == 'V') s++;
++    major = minor = patch = 0;
++    return sscanf(s, "%d.%d.%d", &major, &minor, &patch) >= 2;
++}
++
++void checkupdate(const char *current)
++{
++    alias("swiftgibsupdate", "0");
++    alias("swiftgibslatest", "");
++
++    ENetAddress address;
++    address.host = ENET_HOST_ANY;
++    address.port = feedbackport;
++    if(!resolverwait(feedbackhost, &address)) return;
++    ENetSocket sock = enet_socket_create(ENET_SOCKET_TYPE_STREAM);
++    if(sock == ENET_SOCKET_NULL) return;
++    enet_socket_set_option(sock, ENET_SOCKOPT_NONBLOCK, 1);
++
++    // silent bounded connect (connectwithtimeout would paint a 20s progress bar)
++    if(enet_socket_connect(sock, &address) < 0) { enet_socket_destroy(sock); return; }
++    enet_uint32 events = ENET_SOCKET_WAIT_SEND | ENET_SOCKET_WAIT_RECEIVE;
++    if(enet_socket_wait(sock, &events, 2000) < 0 || !events) { enet_socket_destroy(sock); return; }
++    int connerror = 0;
++    if(enet_socket_get_option(sock, ENET_SOCKOPT_ERROR, &connerror) < 0 || connerror) { enet_socket_destroy(sock); return; }
++
++    defformatstring(reqstr, "GET /version HTTP/1.1\r\nHost: %s\r\nUser-Agent: SwiftGibs\r\nConnection: close\r\n\r\n", feedbackhost);
++    int starttime = SDL_GetTicks();
++    const char *out = reqstr;
++    int outlen = strlen(reqstr);
++    ENetBuffer buf;
++    while(outlen > 0)
++    {
++        enet_uint32 ev = ENET_SOCKET_WAIT_SEND;
++        if(enet_socket_wait(sock, &ev, 250) >= 0 && ev)
++        {
++            buf.data = (void *)out;
++            buf.dataLength = outlen;
++            int sent = enet_socket_send(sock, NULL, &buf, 1);
++            if(sent < 0) break;
++            out += sent;
++            outlen -= sent;
++        }
++        if(SDL_GetTicks() - starttime > CHECKUPDLIMIT) break;
++    }
++    vector<char> data;
++    if(outlen <= 0) for(;;)
++    {
++        enet_uint32 ev = ENET_SOCKET_WAIT_RECEIVE;
++        if(enet_socket_wait(sock, &ev, 250) >= 0 && ev)
++        {
++            if(data.length() >= data.capacity()) data.reserve(4096);
++            buf.data = data.getbuf() + data.length();
++            buf.dataLength = data.capacity() - data.length();
++            int recv = enet_socket_receive(sock, NULL, &buf, 1);
++            if(recv <= 0) break;
++            data.advance(recv);
++        }
++        if(SDL_GetTicks() - starttime > CHECKUPDLIMIT) break;
++    }
++    enet_socket_destroy(sock);
++    if(outlen > 0 || data.empty()) return;
++    data.add('\0');
++
++    int code = 0;
++    if(sscanf(data.getbuf(), "HTTP/%*s %d", &code) != 1 || code != 200) return;
++    char *tag = strstr(data.getbuf(), "\r\n\r\n");
++    if(!tag) return;
++    tag += 4;
++    char *end = strpbrk(tag, "\r\n");
++    if(end) *end = '\0';
++
++    int lmaj, lmin, lpat, cmaj, cmin, cpat;
++    if(!parseversion(tag, lmaj, lmin, lpat) || !parseversion(current, cmaj, cmin, cpat)) return;
++    if(lmaj > cmaj || (lmaj == cmaj && (lmin > cmin || (lmin == cmin && lpat > cpat))))
++    {
++        if(*tag == 'v' || *tag == 'V') tag++;
++        alias("swiftgibslatest", tag);
++        alias("swiftgibsupdate", "1");
++        conoutf("\f2SwiftGibs v%s is out (you have v%s) - run update-swiftgibs.bat in the game folder", tag, current);
++    }
++}
++
++ICOMMAND(checkupdate, "s", (const char *current), checkupdate(current));
