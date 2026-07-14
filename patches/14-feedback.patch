@@ -287,3 +287,29 @@
 +}
 +
 +ICOMMAND(checkupdate, "s", (const char *current), checkupdate(current));
+--- a/engine/rendergl.cpp
++++ b/engine/rendergl.cpp
+@@ -2237,6 +2237,23 @@
+     hudshader->set();
+ 
+     int conw = int(w/conscale), conh = int(h/conscale), abovehud = conh - FONTH, limitgui = abovehud;
++
++    // SwiftGibs: always show the client version bottom-right on the main menu
++    if(mainmenu)
++    {
++        const char *sgver = getalias("swiftgibsversion");
++        if(sgver[0])
++        {
++            pushhudmatrix();
++            hudmatrix.scale(conscale, conscale, 1);
++            flushhudmatrix();
++            defformatstring(sgvertext, "\f4SwiftGibs v%s", sgver);
++            int sgtw = 0, sgth = 0;
++            text_bounds(sgvertext, sgtw, sgth);
++            draw_text(sgvertext, conw - sgtw - FONTH/2, conh - FONTH*3/2);
++            pophudmatrix();
++        }
++    }
+     if(!hidehud && !mainmenu)
+     {
+         if(!hidestats)
