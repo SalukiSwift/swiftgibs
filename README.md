@@ -19,7 +19,7 @@ SwiftGibs takes the classic open-source arena shooter and strips it to its faste
 - **Non-obscuring teammate crosshair.** Over a teammate, your crosshair tints blue instead of the aim-blocking circle-slash icon (friendly fire is usually on).
 - **Native settings.** All SwiftGibs options live in the regular Esc > options menu as SwiftGibs, Timing Cues, and Friends tabs. F3 is a quick-play launcher for instant bot matches.
 - **Live previews.** Selecting any cue demonstrates it on the spot: countdown and ready-flash styles play out right over the menu (main menu included, with a pulsing crosshair where a style needs one), and hit sounds, volumes, and the killstreak ding audition as you click.
-- **In-game feedback.** Found a bug or got an idea? Press **F8** mid-game (or Esc > options > SwiftGibs > send feedback) and your report lands on this repo's public issues, complete with a screenshot of that moment and the telemetry that helps us fix it (map, position, fps, match stats). No account needed. F8 is only claimed if you haven't bound it yourself.
+- **In-game feedback.** Found a bug or got an idea? Press **F8** mid-game (or Esc > options > SwiftGibs > send feedback) and your report lands on this repo's public issues, complete with a screenshot of that moment and the telemetry that helps us fix it (map, position, fps, match stats). Reports are anonymous unless you tick "sign with my player name". No account needed. F8 is only claimed if you haven't bound it yourself.
 - **Just works.** Auto-detects your monitor's native resolution and launches fullscreen on first run. No config needed.
 - **Server-compatible.** No protocol changes; every feature is client-side. Play on any official or public Sauerbraten server.
 
