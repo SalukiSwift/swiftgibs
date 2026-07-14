@@ -19,6 +19,7 @@ SwiftGibs takes the classic open-source arena shooter and strips it to its faste
 - **Non-obscuring teammate crosshair.** Over a teammate, your crosshair tints blue instead of the aim-blocking circle-slash icon (friendly fire is usually on).
 - **Native settings.** All SwiftGibs options live in the regular Esc > options menu as SwiftGibs, Timing Cues, and Friends tabs. F3 is a quick-play launcher for instant bot matches.
 - **Live previews.** Selecting any cue demonstrates it on the spot: countdown and ready-flash styles play out right over the menu (main menu included, with a pulsing crosshair where a style needs one), and hit sounds, volumes, and the killstreak ding audition as you click.
+- **In-game feedback.** Found a bug or got an idea? Esc > options > SwiftGibs > send feedback posts it straight to this repo's public issues. No account needed.
 - **Just works.** Auto-detects your monitor's native resolution and launches fullscreen on first run. No config needed.
 - **Server-compatible.** No protocol changes; every feature is client-side. Play on any official or public Sauerbraten server.
 
@@ -49,7 +50,7 @@ Your settings and saved friends live in your user config directory and persist b
 
 - Move and shoot like any Sauerbraten client. It's instagib: you spawn with the rifle, one hit kills.
 - **F3** opens Quick Play: launch an instant bot match (FFA, Team, or CTF), add bots, or jump into settings.
-- **Esc > options** has the SwiftGibs tab (server filter, scoreboard columns, friend highlighting, career stats, chat history, hit sounds, killstreak feedback, teammate crosshair), the Timing Cues tab (reload countdown, ready flash, and metronome with volume - every choice previews itself over the menu), and the Friends tab (quick-add, who's in game, and a full manage-friends page).
+- **Esc > options** has the SwiftGibs tab (server filter, scoreboard columns, friend highlighting, career stats, chat history, hit sounds, killstreak feedback, teammate crosshair, send feedback), the Timing Cues tab (reload countdown, ready flash, and metronome with volume - every choice previews itself over the menu), and the Friends tab (quick-add, who's in game, and a full manage-friends page).
 - The server browser is filtered to instagib-family servers by default (toggle it in the SwiftGibs tab).
 
 ### Feedback cues
