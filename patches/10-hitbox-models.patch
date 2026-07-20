@@ -2,13 +2,13 @@
 +++ b/fpsgame/render.cpp
 @@ -188,6 +188,14 @@
              if(team == 1)      mdlname = mdl.greenteam;
-             else if(team == 2) mdlname = mdl.purpleteam;
+             else if(team == 2 && enemyfriendhl) mdlname = mdl.purpleteam;
          }
 +        // SwiftGibs: flat solid team-colour skin for every player -- teammate blue, friend cyan,
 +        // enemy red, friend-on-enemy orange (supersedes the stock/friend skin choice above)
 +        int flatteam = testteam ? testteam-1 : team;
 +        bool flatfriend = highlightfriends && isfriendname(d->name);
-+        const char *fc = flatteam==1 ? (flatfriend?"flatcyan":"flatblue") : flatteam==2 ? (flatfriend?"flatorange":"flatred") : (flatfriend?"flatcyan":"flatred");
++        const char *fc = flatteam==1 ? (flatfriend?"flatcyan":"flatblue") : flatteam==2 ? ((flatfriend && enemyfriendhl)?"flatorange":"flatred") : (flatfriend?"flatcyan":"flatred");
 +        string flatname;
 +        formatstring(flatname, "%s/%s", mdl.ffa, fc);
 +        mdlname = flatname;

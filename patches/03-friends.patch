@@ -59,11 +59,12 @@
          }
          if(actor->type==ENT_AI)
              conoutf(contype, "\f2%s got killed by %s!", dname, aname);
-@@ -740,12 +774,32 @@
+@@ -740,12 +774,33 @@
          return false;
      }
  
 +    VARP(highlightfriends, 0, 1, 1);
++    VARP(enemyfriendhl, 0, 0, 1);   // SwiftGibs: also highlight friends on the ENEMY team
 +    VARP(highlightself, 0, 1, 1);
 +    SVARP(friendcolor, "0");      // \f0 green
 +    SVARP(selfcolor, "8");        // \f8 cyan (rendertext.cpp line 232: bvec(96,240,255))

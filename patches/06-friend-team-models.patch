@@ -43,7 +43,7 @@
 +        if(highlightfriends && friendmodels && isfriendname(d->name))
 +        {
 +            if(team == 1)      mdlname = mdl.greenteam;
-+            else if(team == 2) mdlname = mdl.purpleteam;
++            else if(team == 2 && enemyfriendhl) mdlname = mdl.purpleteam;
 +        }
          renderclient(d, mdlname, a[0].tag ? a : NULL, hold, attack, delay, lastaction, intermission && d->state!=CS_DEAD ? 0 : d->lastpain, fade, ragdoll && mdl.ragdoll);
  #if 0
