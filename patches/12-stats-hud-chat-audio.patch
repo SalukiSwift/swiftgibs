@@ -120,7 +120,7 @@
              lasthit = lastmillis;
          }
          if(d==h)
-@@ -425,6 +436,27 @@
+@@ -425,6 +436,36 @@
          else playsound(S_PAIN1+rnd(5), &d->o);
      }
  
@@ -134,6 +134,15 @@
 +    ICOMMAND(getkillstreak, "", (), intret(killstreak));
 +    ICOMMAND(getbeststreak, "", (), intret(beststreak));
 +    ICOMMAND(_ksset, "i", (int *n), { extern int killstreak; killstreak = *n; });
++
++    // === SwiftGibs flag-carry popup (state set by ctf.h hooks) ===
++    VARP(flagcarrypopup, 0, 1, 1);
++    int flagpopupmillis = 0, flagpopupmode = 0;
++    void flagpopup(int state)   // 1 = ctf carry, 2 = hold carry, 0 = clear
++    {
++        if(state) { flagpopupmillis = lastmillis; flagpopupmode = state; }
++        else flagpopupmillis = 0;
++    }
 +
 +    // === SwiftGibs career stats file writer (Task 6) ===
 +    ICOMMAND(writestatsfile, "iiiiii", (int *m,int *f,int *d,int *dmg,int *sh,int *bs),
@@ -156,18 +165,45 @@
              if(deathscore) showscores(true);
              disablezoom();
              if(!restore) loopi(NUMGUNS) savedammo[i] = player1->ammo[i];
-@@ -659,6 +692,7 @@
+@@ -659,6 +692,8 @@
              d->lifesequence = -1;
              d->respawned = d->suicided = -2;
          }
 +        killstreak = 0;
++        flagpopupmillis = 0;
  
          setclientmode();
  
-@@ -1409,6 +1443,32 @@
+@@ -1409,6 +1443,58 @@
          }
      }
  
++    void drawflagpopup(int w, int h)
++    {
++        if(!flagcarrypopup || !flagpopupmillis) return;
++        int t = lastmillis - flagpopupmillis;
++        if(t >= 2500) { flagpopupmillis = 0; return; }
++        int a = t < 1700 ? 255 : max(0, 255 - (t-1700)*255/800);
++        float scale = t < 120 ? 3.4f - t*0.008f : 2.44f;   // punch in, settle
++        const char *l1 = "YOU HAVE THE FLAG";
++        const char *l2 = flagpopupmode==2 ? "HOLD IT!" : "RUN IT HOME";
++        int cx = 1800*w/h/2, cy = 1800/3;
++        int tw, th; text_bounds(l1, tw, th);
++        pushhudmatrix();
++        hudmatrix.translate(cx, cy, 0);
++        hudmatrix.scale(scale, scale, 1);
++        flushhudmatrix();
++        draw_text(l1, -tw/2, -th, 255, 192, 64, a);
++        pophudmatrix();
++        int tw2, th2; text_bounds(l2, tw2, th2);
++        pushhudmatrix();
++        hudmatrix.translate(cx, cy + int(th*1.3f) + 30, 0);
++        hudmatrix.scale(1.3f, 1.3f, 1);
++        flushhudmatrix();
++        draw_text(l2, -tw2/2, 0, 255, 192, 64, a);
++        pophudmatrix();
++    }
++
 +    // === SwiftGibs killstreak HUD (top-right, escalating with streak) ===
 +    VARP(killstreakhud, 0, 1, 1);
 +    void drawkillstreak(int w, int h)
@@ -197,11 +233,12 @@
      void gameplayhud(int w, int h)
      {
          pushhudmatrix();
-@@ -1441,6 +1501,8 @@
+@@ -1441,6 +1501,9 @@
  
          drawreloadcountdown(w, h);
  
 +        drawkillstreak(w, h);
++        drawflagpopup(w, h);
 +
          pophudmatrix();
  
@@ -237,3 +274,30 @@
              lasthit = lastmillis;
          }
  
+--- a/fpsgame/ctf.h
++++ b/fpsgame/ctf.h
+@@ -850,6 +850,7 @@
+         }
+         conoutf(CON_GAMEINFO, "%s dropped %s", teamcolorname(d), teamcolorflag(f));
+         teamsound(d, S_FLAGDROP);
++        if(d==player1) { extern void flagpopup(int state); flagpopup(0); }   // SwiftGibs popup clear
+     }
+ 
+     void flagexplosion(int i, int team, const vec &loc)
+@@ -952,6 +953,7 @@
+         playsound(team==ctfteamflag(player1->team) ? S_FLAGSCORE : S_FLAGFAIL);
+ 
+         if(score >= FLAGLIMIT) conoutf(CON_GAMEINFO, "%s captured %d flags", teamcolor("your team", ctfflagteam(team), "the enemy team"), score);
++        if(d==player1) { extern void flagpopup(int state); flagpopup(0); }   // SwiftGibs popup clear
+     }
+ 
+     void takeflag(fpsent *d, int i, int version)
+@@ -966,6 +968,8 @@
+         else conoutf(CON_GAMEINFO, "%s stole %s", teamcolorname(d), teamcolorflag(f));
+         ownflag(i, d, lastmillis, m_hold ? ctfteamflag(d->team) : -1);
+         teamsound(d, S_FLAGPICKUP);
++        // SwiftGibs: flag-carry popup for the local player
++        if(d==player1 && (m_hold || f.team != ctfteamflag(player1->team))) { extern void flagpopup(int state); flagpopup(m_hold ? 2 : 1); }
+     }
+ 
+     void invisflag(int i, int invis)
