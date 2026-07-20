@@ -101,7 +101,7 @@
                  if(actor!=player1 && (!cmode || !cmode->hidefrags() || !hidefrags))
 --- a/fpsgame/fps.cpp
 +++ b/fpsgame/fps.cpp
-@@ -396,6 +396,17 @@
+@@ -396,6 +396,29 @@
  
      VARP(hitsound, 0, 0, 1);
  
@@ -114,31 +114,49 @@
 +        return n[(hitsoundsel>=0 && hitsoundsel<=5) ? hitsoundsel : 0];
 +    }
 +    ICOMMAND(playhitsoundpreview, "", (), { if(hitsoundvol>0) playsoundname(hitsndname(), NULL, hitsoundvol); });
++
++    // === SwiftGibs crosshair hit markers (visual sibling of the hit sound) ===
++    VARP(hitmarker, 0, 0, 3);   // 0 off, 1 X-flash, 2 Ring-out, 3 Notch
++    int hitmarkermillis = 0, hitmarkerdemomillis = 0;
++    float hitmarkerscale = 1.0f;
++    void triggerhitmarker(int damage)
++    {
++        if(!hitmarker) return;
++        hitmarkermillis = lastmillis;
++        hitmarkerscale = clamp(damage / 100.0f, 0.45f, 1.0f);
++    }
++    ICOMMAND(hitmarkerdemo, "", (), { hitmarkermillis = lastmillis; hitmarkerscale = 1.0f; hitmarkerdemomillis = lastmillis; });
 +    ICOMMAND(playstreaksound, "", (), playsoundname("swiftgibs/streak"));
 +
      void damaged(int damage, fpsent *d, fpsent *actor, bool local)
      {
          if((d->state!=CS_ALIVE && d->state != CS_LAGGED && d->state != CS_SPAWNING) || intermission) return;
-@@ -406,7 +417,7 @@
+@@ -406,8 +429,9 @@
          fpsent *h = hudplayer();
          if(h!=player1 && actor==h && d!=actor)
          {
 -            if(hitsound && lasthit != lastmillis) playsound(S_HIT);
 +            if(hitsound && lasthit != lastmillis && hitsoundvol>0) playsoundname(hitsndname(), NULL, hitsoundvol);
              lasthit = lastmillis;
++            triggerhitmarker(damage);
          }
          if(d==h)
-@@ -425,6 +436,44 @@
+         {
+@@ -425,6 +449,48 @@
          else playsound(S_PAIN1+rnd(5), &d->o);
      }
  
 +    // === SwiftGibs killstreak tracking (per-life; resets on death/match start) ===
 +    int killstreak = 0, beststreak = 0, matchbeststreak = 0;
 +    VARP(killstreaksound, 0, 0, 1);
++    VARP(killstreakfx, 0, 1, 2);   // milestone flourish: 0 off, 1 slam, 2 minimal counter pulse
++    int streakfxmillis = 0, streakfxval = 0, streakfxdemomillis = 0;
 +    void killstreakmilestone(int tier)
 +    {
 +        if(killstreaksound) playsoundname("swiftgibs/streak");
++        streakfxmillis = lastmillis; streakfxval = killstreak;
 +    }
++    ICOMMAND(streakfxdemo, "", (), { streakfxmillis = lastmillis; streakfxval = 5; streakfxdemomillis = lastmillis; });
 +    ICOMMAND(getkillstreak, "", (), intret(killstreak));
 +    ICOMMAND(getbeststreak, "", (), intret(beststreak));
 +    ICOMMAND(_ksset, "i", (int *n), { extern int killstreak; killstreak = *n; });
@@ -173,7 +191,7 @@
      VARP(deathscore, 0, 1, 1);
  
      void deathstate(fpsent *d, bool restore)
-@@ -438,6 +470,7 @@
+@@ -438,6 +504,7 @@
          }
          if(d==player1)
          {
@@ -181,7 +199,7 @@
              if(deathscore) showscores(true);
              disablezoom();
              if(!restore) loopi(NUMGUNS) savedammo[i] = player1->ammo[i];
-@@ -659,6 +692,10 @@
+@@ -659,6 +726,10 @@
              d->lifesequence = -1;
              d->respawned = d->suicided = -2;
          }
@@ -192,7 +210,75 @@
  
          setclientmode();
  
-@@ -1409,6 +1443,58 @@
+@@ -1435,17 +1506,65 @@
+         }
+     }
+ 
++    // === SwiftGibs hit marker + streak fx draw (reuse the cue primitives above) ===
++    static bool hitmarkerdemoing() { return lastmillis - hitmarkerdemomillis < 300 && hitmarkerdemomillis; }
++    static bool streakfxdemoing() { return lastmillis - streakfxdemomillis < 1000 && streakfxdemomillis; }
++    void drawhitmarker(int w, int h)
++    {
++        if(!hitmarker || !hitmarkermillis) return;
++        int t = lastmillis - hitmarkermillis;
++        if(t >= 240) { hitmarkermillis = 0; return; }
++        float p = t / 240.0f, a = (1.0f - p) * 0.95f, s = hitmarkerscale;
++        float cx = w * 900.0f / h, cy = 900.0f;
++        cuefamily(0, 0, 100);
++        hudnotextureshader->set();
++        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++        switch(hitmarker)
++        {
++            case 1: loopi(4) cuestroke(cx, cy, (45.0f + 90.0f*i)*(float)M_PI/180.0f, (16.0f + 10.0f*p)*s, (44.0f + 14.0f*p)*s, 9.0f*s, 1.0f, 0.95f, 0.88f, a); break;
++            case 2: reloadring(cx, cy, (20.0f + 58.0f*easeoutquad(p))*s, 6.5f, 1.0f, 0.95f, 0.88f, a); break;
++            case 3: loopi(4) cuestroke(cx, cy, (90.0f*i)*(float)M_PI/180.0f, (24.0f + 10.0f*p)*s, (42.0f + 10.0f*p)*s, 8.0f*s, 1.0f, 0.95f, 0.88f, a); break;
++        }
++        hudshader->set();
++    }
++    void drawstreakfx(int w, int h)
++    {
++        if(killstreakfx != 1 || !streakfxmillis) return;
++        int t = lastmillis - streakfxmillis;
++        if(t >= 900) return;
++        float p = t / 900.0f;
++        float a = p < 0.75f ? 1.0f : (1.0f - p) / 0.25f;
++        float scl = 3.2f - 1.8f * easeoutquad(min(p * 3.0f, 1.0f));   // slam in fast, settle
++        float cx = w * 900.0f / h, cy = 620.0f;
++        cuefamily(0, 0, 100);
++        hudnotextureshader->set();
++        glBlendFunc(GL_SRC_ALPHA, GL_ONE);
++        reloadring(cx, cy, 40.0f + 320.0f * easeoutquad(p), 14.0f, 1.0f, 0.75f, 0.25f, 0.6f * (1.0f - p));
++        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++        hudshader->set();
++        defformatstring(str, "%d STREAK", streakfxval);
++        int tw, th; text_bounds(str, tw, th);
++        pushhudmatrix();
++        hudmatrix.translate(cx, cy, 0);
++        hudmatrix.scale(scl, scl, 1);
++        flushhudmatrix();
++        draw_text(str, -tw/2, -th/2, 255, 190, 60, int(a*255.0f));
++        pophudmatrix();
++    }
++
+     // Post-gui overlay: cue demos must draw AFTER g3d_render2d or menu windows cover them
+     // (that is exactly where a player is when auditioning styles). Real reloads keep the
+     // normal gameplayhud draw above.
+     void reloadhudoverlay(int w, int h)
+     {
+-        if(!reloaddemoing()) return;
++        if(!reloaddemoing() && !hitmarkerdemoing() && !streakfxdemoing()) return;
+         reloadoverlaypass = true;
+         pushhudmatrix();
+         hudmatrix.scale(h/1800.0f, h/1800.0f, 1);
+         flushhudmatrix();
+-        drawreloadcountdown(w, h);
++        if(reloaddemoing()) drawreloadcountdown(w, h);
++        if(hitmarkerdemoing()) drawhitmarker(w, h);
++        if(streakfxdemoing()) drawstreakfx(w, h);
+         pophudmatrix();
+         reloadoverlaypass = false;
+     }
+@@ -1481,6 +1600,60 @@
          }
      }
  
@@ -238,6 +324,8 @@
 +        else if(killstreak >= 10) col = bvec(255, 150, 40);
 +        else if(killstreak >= 5) col = bvec(255, 220, 40);
 +        float scale = 1.0f + min(killstreak, 20) * 0.03f;   // grows with streak, capped
++        if(killstreakfx == 2 && streakfxmillis && lastmillis - streakfxmillis < 300)
++            scale *= 1.0f + 0.5f * (1.0f - (lastmillis - streakfxmillis) / 300.0f);
 +        defformatstring(str, "%d", killstreak);
 +        int tw, th; text_bounds(str, tw, th);
 +        pushhudmatrix();
@@ -251,12 +339,14 @@
      void gameplayhud(int w, int h)
      {
          pushhudmatrix();
-@@ -1441,6 +1501,9 @@
+@@ -1513,6 +1686,11 @@
  
          drawreloadcountdown(w, h);
  
 +        drawkillstreak(w, h);
 +        drawflagpopup(w, h);
++        if(!hitmarkerdemoing()) drawhitmarker(w, h);
++        if(!streakfxdemoing()) drawstreakfx(w, h);
 +
          pophudmatrix();
  
@@ -280,7 +370,7 @@
          }
          d->gunselect = gun;
      }
-@@ -353,8 +354,9 @@
+@@ -353,9 +354,12 @@
      {
          if(at==player1 && d!=at)
          {
@@ -290,8 +380,11 @@
 +            extern const char *hitsndname();
 +            if(hitsound && lasthit != lastmillis && hitsoundvol>0) playsoundname(hitsndname(), NULL, hitsoundvol);
              lasthit = lastmillis;
++            extern void triggerhitmarker(int damage);
++            triggerhitmarker(damage);
          }
  
+         if(d->type==ENT_INANIMATE)
 --- a/fpsgame/ctf.h
 +++ b/fpsgame/ctf.h
 @@ -850,6 +850,7 @@
@@ -319,22 +412,3 @@
      }
  
      void invisflag(int i, int invis)
---- a/fpsgame/game.h
-+++ b/fpsgame/game.h
-@@ -549,6 +549,7 @@
-     int lastpickup, lastpickupmillis, lastbase, lastrepammo, flagpickup, tokens;
-     vec lastcollect;
-     int frags, flags, deaths, totaldamage, totalshots;
-+    int cstreak, bstreak;   // SwiftGibs: current + best-this-match killstreak (scoreboard column)
-     editinfo *edit;
-     float deltayaw, deltapitch, deltaroll, newyaw, newpitch, newroll;
-     int smoothmillis;
-@@ -560,7 +561,7 @@
- 
-     vec muzzle;
- 
--    fpsent() : weight(100), clientnum(-1), privilege(PRIV_NONE), lastupdate(0), plag(0), ping(0), lifesequence(0), respawned(-1), suicided(-1), lastpain(0), attacksound(-1), attackchan(-1), idlesound(-1), idlechan(-1), frags(0), flags(0), deaths(0), totaldamage(0), totalshots(0), edit(NULL), smoothmillis(-1), playermodel(-1), ai(NULL), ownernum(-1), muzzle(-1, -1, -1)
-+    fpsent() : weight(100), clientnum(-1), privilege(PRIV_NONE), lastupdate(0), plag(0), ping(0), lifesequence(0), respawned(-1), suicided(-1), lastpain(0), attacksound(-1), attackchan(-1), idlesound(-1), idlechan(-1), frags(0), flags(0), deaths(0), totaldamage(0), totalshots(0), cstreak(0), bstreak(0), edit(NULL), smoothmillis(-1), playermodel(-1), ai(NULL), ownernum(-1), muzzle(-1, -1, -1)
-     {
-         name[0] = team[0] = info[0] = 0;
-         respawn();

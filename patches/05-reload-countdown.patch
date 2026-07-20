@@ -6,11 +6,11 @@
  
  namespace game
  {
-@@ -1104,6 +1105,296 @@
+@@ -1105,6 +1106,348 @@
          pophudmatrix();
      }
  
-+    VARP(reloadcount, 0, 0, 8);   // countdown style, 0=off; 1 Rings 2 Pulse 3 Collapse 4 Sweep 5 Pips 6 CrosshairPulse 7 Digits 8 Edge-beats
++    VARP(reloadcount, 0, 0, 8);   // countdown style, 0=off; 1 Slam 2 Pulse 3 Collapse 4 Heartbeat 5 Orbit 6 CrosshairPulse 7 Digits 8 Edge-beats
 +    VARP(reloadflash, 0, 0, 7);   // fire-ready flash, INDEPENDENT of reloadcount: 0 off; 1 Pip 2 Dot 3 ThinRing; 4 RingPing 5 Bloom 6 Burst 7 EdgePulse
 +
 +    int reloaddemostart = -100000;
@@ -49,9 +49,33 @@
 +    static inline float beatpunch(float t) { return t < 0.18f ? t / 0.18f : 1.0f; }
 +    static inline float easeoutquad(float p) { p = clamp(p, 0.0f, 1.0f); return 1.0f - (1.0f - p) * (1.0f - p); }
 +
++    // === SwiftGibs cue colour controls (hue shift / mono / opacity; defaults = neutral) ===
++    VARP(reloadcounthue, 0, 0, 359);
++    VARP(reloadcountmono, 0, 0, 1);
++    VARP(reloadcountalpha, 10, 100, 100);
++    VARP(reloadflashhue, 0, 0, 359);
++    VARP(reloadflashmono, 0, 0, 1);
++    VARP(reloadflashalpha, 10, 100, 100);
++    static int cuehue = 0, cuemono = 0, cuealphav = 100;   // active family transform
++    static void cuefamily(int hue, int mono, int alpha) { cuehue = hue; cuemono = mono; cuealphav = alpha; }
++    static void cueapply(float &r, float &g, float &b, float &a)
++    {
++        if(cuemono) { float l = 0.299f*r + 0.587f*g + 0.114f*b; r = g = b = l; }
++        else if(cuehue)
++        {
++            float U = cosf(cuehue*(float)M_PI/180.0f), W = sinf(cuehue*(float)M_PI/180.0f);
++            float nr = (.299f+.701f*U+.168f*W)*r + (.587f-.587f*U+.330f*W)*g + (.114f-.114f*U-.497f*W)*b;
++            float ng = (.299f-.299f*U-.328f*W)*r + (.587f+.413f*U+.035f*W)*g + (.114f-.114f*U+.292f*W)*b;
++            float nb = (.299f-.300f*U+1.25f*W)*r + (.587f-.588f*U-1.05f*W)*g + (.114f+.886f*U-.203f*W)*b;
++            r = clamp(nr, 0.0f, 1.0f); g = clamp(ng, 0.0f, 1.0f); b = clamp(nb, 0.0f, 1.0f);
++        }
++        a *= cuealphav / 100.0f;
++    }
++
 +    // Draw a filled annulus (ring) in the hud space centred at (cx,cy).
 +    static void reloadring(float cx, float cy, float R, float thk, float r, float g, float b, float a)
 +    {
++        cueapply(r, g, b, a);
 +        if(a < 0.01f || R <= 0.0f) return;
 +        const int N = 56; float Ro = R + thk*0.5f, Ri = max(0.0f, R - thk*0.5f);
 +        gle::colorf(r, g, b, a);
@@ -62,6 +86,7 @@
 +    }
 +    static void reloaddisc(float cx, float cy, float R, float r, float g, float b, float a)
 +    {
++        cueapply(r, g, b, a);
 +        if(a < 0.01f || R <= 0.0f) return;
 +        const int N = 40;
 +        gle::colorf(r, g, b, a);
@@ -69,6 +94,33 @@
 +        gle::begin(GL_TRIANGLE_FAN, N + 2);
 +        gle::attribf(cx, cy);
 +        for(int i = 0; i <= N; i++) { float ang = i*2.0f*(float)M_PI/N; gle::attribf(cx + R*cosf(ang), cy + R*sinf(ang)); }
++        gle::end();
++    }
++
++    // Axis-aligned filled bar centred at (cx,cy); honours the active cue colour transform.
++    static void reloadbar(float cx, float cy, float halfw, float halfh, float r, float g, float b, float a)
++    {
++        cueapply(r, g, b, a);
++        if(a < 0.01f) return;
++        gle::colorf(r, g, b, a);
++        gle::defvertex(2);
++        gle::begin(GL_QUADS);
++        gle::attribf(cx-halfw, cy-halfh); gle::attribf(cx+halfw, cy-halfh);
++        gle::attribf(cx+halfw, cy+halfh); gle::attribf(cx-halfw, cy+halfh);
++        gle::end();
++    }
++    // Rotated stroke from radius `inner` to `outer` along angle `ang`, thickness thk.
++    static void cuestroke(float cx, float cy, float ang, float inner, float outer, float thk, float r, float g, float b, float a)
++    {
++        cueapply(r, g, b, a);
++        if(a < 0.01f || outer <= inner) return;
++        float ca = cosf(ang), sa = sinf(ang), px = -sa*thk*0.5f, py = ca*thk*0.5f;
++        float x1 = cx + ca*inner, y1 = cy + sa*inner, x2 = cx + ca*outer, y2 = cy + sa*outer;
++        gle::colorf(r, g, b, a);
++        gle::defvertex(2);
++        gle::begin(GL_QUADS);
++        gle::attribf(x1+px, y1+py); gle::attribf(x2+px, y2+py);
++        gle::attribf(x2-px, y2-py); gle::attribf(x1-px, y1-py);
 +        gle::end();
 +    }
 +
@@ -131,6 +183,7 @@
 +                float a = 1.0f - p;
 +                if(reloadflash)
 +                {
++                    cuefamily(reloadflashhue, reloadflashmono, reloadflashalpha);
 +                    hudnotextureshader->set();
 +                    glBlendFunc(GL_SRC_ALPHA, GL_ONE);
 +                    switch(reloadflash)
@@ -146,7 +199,8 @@
 +                        case 7:
 +                        {
 +                            float w2 = cx*2.0f, h2 = cy*2.0f, th = 26.0f*a + 6.0f;
-+                            gle::colorf(0.30f, 1.0f, 0.45f, 0.6f*a);
++                            float fr = 0.30f, fg = 1.0f, fb = 0.45f, fa = 0.6f*a; cueapply(fr, fg, fb, fa);
++                            gle::colorf(fr, fg, fb, fa);
 +                            gle::defvertex(2); gle::begin(GL_QUADS);
 +                            gle::attribf(0,0); gle::attribf(w2,0); gle::attribf(w2,th); gle::attribf(0,th);
 +                            gle::attribf(0,h2-th); gle::attribf(w2,h2-th); gle::attribf(w2,h2); gle::attribf(0,h2);
@@ -171,17 +225,23 @@
 +        float t = (elapsed - idx * beat) / (float)beat;
 +
 +        float cr, cg, cb; reloadbeatcolor(idx, cr, cg, cb);
++        cuefamily(reloadcounthue, reloadcountmono, reloadcountalpha);
 +
 +        switch(reloadcount)
 +        {
-+            case 1: // Rings -- N solid rings (=remaining count), current-beat colour, per-beat scale punch
++            case 1: // Slam -- heavy bars slam toward the crosshair, one hit per beat, landing kick
 +            {
-+                int numRings = 3 - idx;
-+                float pop = 1.0f + 0.30f * (1.0f - beatpunch(t));
++                float p = easeoutquad(min(t * 1.6f, 1.0f));         // travel completes early in the beat
++                float land = beatpunch(t);                           // 0->1 fast right after the slam lands
++                float kick = (1.0f - land) * 16.0f;                  // brief overshoot at landing
++                float startd = 620.0f, landd = 300.0f - 90.0f * idx; // beats land closer: 300, 210, 120
++                float dcur = startd + (landd - startd) * p + kick;
 +                hudnotextureshader->set();
 +                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-+                for(int ri = 0; ri < numRings; ri++)
-+                    reloadring(cx, cy, (46.0f + 40.0f * ri) * pop, 20.0f, cr, cg, cb, 0.90f - 0.16f * ri);
++                reloadbar(cx - dcur, cy, 17.0f, 95.0f, cr, cg, cb, 0.95f);
++                reloadbar(cx + dcur, cy, 17.0f, 95.0f, cr, cg, cb, 0.95f);
++                if(land < 1.0f)                                       // impact shockwave right at landing
++                    reloadring(cx, cy, landd * (0.55f + 0.45f * land), 8.0f, cr, cg, cb, 0.55f * (1.0f - land));
 +                hudshader->set();
 +                return;
 +            }
@@ -206,40 +266,32 @@
 +                hudshader->set();
 +                return;
 +            }
-+            case 4: // Sweep -- arc fills clockwise, full circle at fire-time, tick each beat
++            case 4: // Heartbeat -- a single dot beside the crosshair beats in time, double-time on the last
 +            {
-+                const int N = 72; const float Ro = 128.0f, Ri = 106.0f;
-+                float frac = elapsed / (float)RC_DUR;
-+                int segs = max(1, (int)(N * frac + 0.5f));
-+                float tick = 1.0f - min(1.0f, (elapsed % beat) / 110.0f);
-+                float a = 0.80f + 0.20f * tick;
++                float phase = (idx == 2) ? fmodf(t * 2.0f, 1.0f) : t; // final beat goes double-time
++                float pop = 1.0f + 0.85f * (1.0f - beatpunch(phase)); // sharp pop at each beat onset
++                float R = 9.0f * pop;
 +                hudnotextureshader->set();
 +                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-+                gle::colorf(cr, cg, cb, a);
-+                gle::defvertex(2);
-+                gle::begin(GL_TRIANGLE_STRIP, (segs + 1) * 2);
-+                for(int i = 0; i <= segs; i++) { float ang = -(float)M_PI/2.0f + (i/(float)N)*2.0f*(float)M_PI, cc = cosf(ang), ss = sinf(ang); gle::attribf(cx+Ro*cc, cy+Ro*ss); gle::attribf(cx+Ri*cc, cy+Ri*ss); }
-+                gle::end();
++                reloaddisc(cx + 46.0f, cy, R, cr, cg, cb, 0.90f);
++                reloadring(cx + 46.0f, cy, R + 8.0f + 26.0f * phase, 3.0f, cr, cg, cb, 0.45f * (1.0f - phase));
 +                hudshader->set();
 +                return;
 +            }
-+            case 5: // Pips -- 3 charges ring the crosshair; deplete one per beat (ghost when spent)
++            case 5: // Orbit -- a comet laps the crosshair once per beat, spiralling inward
 +            {
-+                const float ringR = 82.0f, pipR = 21.0f;
++                float R = 150.0f - 44.0f * idx - 44.0f * t;           // collapses across the countdown
++                float ang = -(float)M_PI/2.0f + t * 2.0f*(float)M_PI; // one full lap per beat
 +                hudnotextureshader->set();
-+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-+                reloadring(cx, cy, ringR, 3.0f, cr, cg, cb, 0.22f);   // faint connecting ring
-+                for(int k = 0; k < 3; k++)
++                glBlendFunc(GL_SRC_ALPHA, GL_ONE);
++                reloadring(cx, cy, R, 2.5f, cr, cg, cb, 0.16f);       // faint orbit track
++                for(int k = 0; k < 6; k++)                             // comet head + fading trail
 +                {
-+                    float ang = -(float)M_PI/2.0f + k * (2.0f*(float)M_PI/3.0f);
-+                    float px = cx + ringR*cosf(ang), py = cy + ringR*sinf(ang);
-+                    bool lit = (k < number);
-+                    bool spending = (k == number - 1);
-+                    if(!lit) { reloadring(px, py, pipR*0.85f, 4.0f, cr, cg, cb, 0.20f); continue; }  // ghost
-+                    float a = spending ? (1.0f - easeoutquad(t)) : 0.92f;
-+                    float sc = spending ? (1.0f + 0.6f * beatpunch(t) * (1.0f - t)) : 1.0f;
-+                    reloaddisc(px, py, pipR * sc, cr, cg, cb, a);
++                    float ta = ang - k * 0.30f;
++                    float rr = 11.0f - k * 1.5f;
++                    reloaddisc(cx + R*cosf(ta), cy + R*sinf(ta), rr, cr, cg, cb, 0.95f - 0.15f*k);
 +                }
++                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 +                hudshader->set();
 +                return;
 +            }
@@ -259,7 +311,7 @@
 +                hudmatrix.translate(cx, cy + 165.0f, 0);
 +                hudmatrix.scale(s, s, 1);
 +                flushhudmatrix();
-+                draw_text(numstr, -tw/2, -th/2, int(cr*255.0f), int(cg*255.0f), int(cb*255.0f), int(alpha*255.0f));
++                { float dr = cr, dg = cg, db = cb, da = alpha; cueapply(dr, dg, db, da); draw_text(numstr, -tw/2, -th/2, int(dr*255.0f), int(dg*255.0f), int(db*255.0f), int(da*255.0f)); }
 +                pophudmatrix();
 +                return;
 +            }
@@ -270,7 +322,7 @@
 +                float w2 = cx*2.0f, h2 = cy*2.0f;
 +                hudnotextureshader->set();
 +                glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-+                gle::colorf(cr, cg, cb, 0.80f * pulse);
++                { float er = cr, eg = cg, eb = cb, ea = 0.80f * pulse; cueapply(er, eg, eb, ea); gle::colorf(er, eg, eb, ea); }
 +                gle::defvertex(2); gle::begin(GL_QUADS);
 +                gle::attribf(0,0); gle::attribf(w2,0); gle::attribf(w2,th); gle::attribf(0,th);
 +                gle::attribf(0,h2-th); gle::attribf(w2,h2-th); gle::attribf(w2,h2); gle::attribf(0,h2);
@@ -303,7 +355,7 @@
      void gameplayhud(int w, int h)
      {
          pushhudmatrix();
-@@ -1134,6 +1425,8 @@
+@@ -1135,6 +1478,8 @@
              if(cmode) cmode->drawhud(d, w, h);
          }
  
@@ -312,7 +364,7 @@
          pophudmatrix();
  
          if(d->state!=CS_EDITING && d->state!=CS_SPECTATOR && d->state!=CS_DEAD)
-@@ -1167,6 +1460,8 @@
+@@ -1168,6 +1513,8 @@
          }
      }
  
@@ -321,7 +373,7 @@
      int selectcrosshair(vec &color)
      {
          fpsent *d = hudplayer();
-@@ -1175,18 +1470,24 @@
+@@ -1176,18 +1523,24 @@
          if(d->state!=CS_ALIVE) return 0;
  
          int crosshair = 0;
