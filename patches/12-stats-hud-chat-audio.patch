@@ -76,16 +76,17 @@
                  break;
              }
  
-@@ -1570,6 +1584,14 @@
+@@ -1570,6 +1584,15 @@
                         *actor = getclient(acn);
                  if(!actor) break;
                  actor->frags = frags;
-+                extern int killstreak, beststreak;
++                extern int killstreak, beststreak, matchbeststreak;
 +                extern void killstreakmilestone(int tier);
 +                if(actor == player1 && victim != player1 && (!victim || !m_teammode || !isteam(actor->team, victim->team)))
 +                {
 +                    killstreak++;
 +                    if(killstreak > beststreak) beststreak = killstreak;
++                    if(killstreak > matchbeststreak) matchbeststreak = killstreak;
 +                    if(killstreak % 5 == 0 && killstreak <= 20) killstreakmilestone(killstreak/5);
 +                }
                  if(m_teammode) setteaminfo(actor->team, tfrags);
@@ -120,12 +121,12 @@
              lasthit = lastmillis;
          }
          if(d==h)
-@@ -425,6 +436,36 @@
+@@ -425,6 +436,44 @@
          else playsound(S_PAIN1+rnd(5), &d->o);
      }
  
 +    // === SwiftGibs killstreak tracking (per-life; resets on death/match start) ===
-+    int killstreak = 0, beststreak = 0;
++    int killstreak = 0, beststreak = 0, matchbeststreak = 0;
 +    VARP(killstreaksound, 0, 0, 1);
 +    void killstreakmilestone(int tier)
 +    {
@@ -134,6 +135,13 @@
 +    ICOMMAND(getkillstreak, "", (), intret(killstreak));
 +    ICOMMAND(getbeststreak, "", (), intret(beststreak));
 +    ICOMMAND(_ksset, "i", (int *n), { extern int killstreak; killstreak = *n; });
++    ICOMMAND(getmatchbeststreak, "", (), intret(matchbeststreak));
++    ICOMMAND(getdatestr, "", (),
++    {
++        time_t now = time(NULL); struct tm *lt = localtime(&now);
++        defformatstring(ds, "%04d-%02d-%02d", lt->tm_year+1900, lt->tm_mon+1, lt->tm_mday);
++        result(ds);
++    });
 +
 +    // === SwiftGibs flag-carry popup (state set by ctf.h hooks) ===
 +    VARP(flagcarrypopup, 0, 1, 1);
@@ -145,12 +153,13 @@
 +    }
 +
 +    // === SwiftGibs career stats file writer (Task 6) ===
-+    ICOMMAND(writestatsfile, "iiiiii", (int *m,int *f,int *d,int *dmg,int *sh,int *bs),
++    ICOMMAND(writestatsfile, "iiiiiis", (int *m,int *f,int *d,int *dmg,int *sh,int *bs,char *ts),
 +    {
 +        stream *o = openutf8file(path("stats.cfg", true), "w");
 +        if(!o) return;
 +        o->printf("// SwiftGibs career stats (auto-written)\n");
 +        o->printf("alias st_matches %d\nalias st_frags %d\nalias st_deaths %d\nalias st_damage %d\nalias st_shots %d\nalias st_beststreak %d\n", *m,*f,*d,*dmg,*sh,*bs);
++        o->printf("alias st_topstreaks [%s]\n", ts && ts[0] ? ts : "");
 +        delete o;
 +    });
 +
@@ -165,11 +174,12 @@
              if(deathscore) showscores(true);
              disablezoom();
              if(!restore) loopi(NUMGUNS) savedammo[i] = player1->ammo[i];
-@@ -659,6 +692,8 @@
+@@ -659,6 +692,9 @@
              d->lifesequence = -1;
              d->respawned = d->suicided = -2;
          }
 +        killstreak = 0;
++        matchbeststreak = 0;
 +        flagpopupmillis = 0;
  
          setclientmode();
