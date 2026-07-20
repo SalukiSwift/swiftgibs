@@ -13,7 +13,6 @@ SwiftGibs takes the classic open-source arena shooter and strips it to its faste
 - **Flat low-detail world.** World textures crushed to a flat competitive look; fonts, HUD, and map thumbnails stay crisp. Runs on potatoes.
 - **Expanded scoreboard.** Frags in every mode (including CTF), deaths, KDR, captures, optional accuracy and damage. All toggleable.
 - **Friends system.** Name-based friends list; friends are highlighted in-game and on the minimap. Manage them from a dedicated Friends settings tab.
-- **Swifties Bog.** A private server for Swift's crew. Type the password once in the Friends tab and the join button takes you straight there. (Power users: `keepserver salukiswift.com 28785 <password>` makes the browser row one-click too.)
 - **Reload feedback, your way.** An optional 3-2-1 rifle-reload countdown (9 styles including Collapse and Edge-beats), an independent fire-ready flash (8 styles from a subtle Thin-ring to a bold Edge-pulse), and a tick-tick-tick-ding metronome. All off by default. Mix and match.
 - **Hit and streak feedback.** Selectable hit-marker sounds with an adjustable volume and a preview button, a per-life killstreak counter with optional milestone dings, and a career stats page tracking your frags, deaths, accuracy, damage, and best streak.
 - **Readable chat.** Scroll back through chat with the mouse wheel while you type, or open a dedicated Chat History page.
@@ -52,7 +51,7 @@ Your settings and saved friends live in your user config directory and persist b
 
 - Move and shoot like any Sauerbraten client. It's instagib: you spawn with the rifle, one hit kills.
 - **F3** opens Quick Play: launch an instant bot match (FFA, Team, or CTF), add bots, or jump into settings.
-- **Esc > options** has the SwiftGibs tab (server filter, scoreboard columns, friend highlighting, career stats, chat history, hit sounds, killstreak feedback, teammate crosshair, send feedback), the Timing Cues tab (reload countdown, ready flash, and metronome with volume - every choice previews itself over the menu), and the Friends tab (quick-add, who's in game, joining Swifties Bog, and a full manage-friends page).
+- **Esc > options** has the SwiftGibs tab (server filter, scoreboard columns, friend highlighting, career stats, chat history, hit sounds, killstreak feedback, teammate crosshair, send feedback), the Timing Cues tab (reload countdown, ready flash, and metronome with volume - every choice previews itself over the menu), and the Friends tab (quick-add, who's in game, and a full manage-friends page).
 - The server browser is filtered to instagib-family servers by default (toggle it in the SwiftGibs tab).
 
 ### Feedback cues
