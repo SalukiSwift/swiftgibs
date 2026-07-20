@@ -139,7 +139,7 @@
 +    ICOMMAND(playreloadpreview, "", (), { if(reloadsound && reloadsoundvol>0) playsoundpitched(reloadsndname(), reloadsoundvol, reloadsoundpitch, NULL); });
 +
 +    // === SwiftGibs crosshair hit markers (visual sibling of the hit sound) ===
-+    VARP(hitmarker, 0, 0, 3);   // 0 off, 1 X-flash, 2 Ring-out, 3 Notch
++    VARP(hitmarker, 0, 1, 3);   // 0 off, 1 X-flash (default), 2 Ring-out, 3 Notch
 +    int hitmarkermillis = 0, hitmarkerdemomillis = 0;
 +    float hitmarkerscale = 1.0f;
 +    void triggerhitmarker(int damage)
