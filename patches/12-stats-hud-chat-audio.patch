@@ -76,7 +76,7 @@
                  break;
              }
  
-@@ -1570,6 +1584,15 @@
+@@ -1570,6 +1584,22 @@
                         *actor = getclient(acn);
                  if(!actor) break;
                  actor->frags = frags;
@@ -89,6 +89,13 @@
 +                    if(killstreak > matchbeststreak) matchbeststreak = killstreak;
 +                    if(killstreak % 5 == 0 && killstreak <= 20) killstreakmilestone(killstreak/5);
 +                }
++                // SwiftGibs: per-player streak for the scoreboard column (all players)
++                if(victim && victim != actor && (!m_teammode || !isteam(actor->team, victim->team)))
++                {
++                    actor->cstreak++;
++                    if(actor->cstreak > actor->bstreak) actor->bstreak = actor->cstreak;
++                }
++                if(victim) victim->cstreak = 0;
                  if(m_teammode) setteaminfo(actor->team, tfrags);
                  extern int hidefrags;
                  if(actor!=player1 && (!cmode || !cmode->hidefrags() || !hidefrags))
@@ -174,13 +181,14 @@
              if(deathscore) showscores(true);
              disablezoom();
              if(!restore) loopi(NUMGUNS) savedammo[i] = player1->ammo[i];
-@@ -659,6 +692,9 @@
+@@ -659,6 +692,10 @@
              d->lifesequence = -1;
              d->respawned = d->suicided = -2;
          }
 +        killstreak = 0;
 +        matchbeststreak = 0;
 +        flagpopupmillis = 0;
++        loopv(players) { players[i]->cstreak = 0; players[i]->bstreak = 0; }
  
          setclientmode();
  
@@ -311,3 +319,22 @@
      }
  
      void invisflag(int i, int invis)
+--- a/fpsgame/game.h
++++ b/fpsgame/game.h
+@@ -549,6 +549,7 @@
+     int lastpickup, lastpickupmillis, lastbase, lastrepammo, flagpickup, tokens;
+     vec lastcollect;
+     int frags, flags, deaths, totaldamage, totalshots;
++    int cstreak, bstreak;   // SwiftGibs: current + best-this-match killstreak (scoreboard column)
+     editinfo *edit;
+     float deltayaw, deltapitch, deltaroll, newyaw, newpitch, newroll;
+     int smoothmillis;
+@@ -560,7 +561,7 @@
+ 
+     vec muzzle;
+ 
+-    fpsent() : weight(100), clientnum(-1), privilege(PRIV_NONE), lastupdate(0), plag(0), ping(0), lifesequence(0), respawned(-1), suicided(-1), lastpain(0), attacksound(-1), attackchan(-1), idlesound(-1), idlechan(-1), frags(0), flags(0), deaths(0), totaldamage(0), totalshots(0), edit(NULL), smoothmillis(-1), playermodel(-1), ai(NULL), ownernum(-1), muzzle(-1, -1, -1)
++    fpsent() : weight(100), clientnum(-1), privilege(PRIV_NONE), lastupdate(0), plag(0), ping(0), lifesequence(0), respawned(-1), suicided(-1), lastpain(0), attacksound(-1), attackchan(-1), idlesound(-1), idlechan(-1), frags(0), flags(0), deaths(0), totaldamage(0), totalshots(0), cstreak(0), bstreak(0), edit(NULL), smoothmillis(-1), playermodel(-1), ai(NULL), ownernum(-1), muzzle(-1, -1, -1)
+     {
+         name[0] = team[0] = info[0] = 0;
+         respawn();

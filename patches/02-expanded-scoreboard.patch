@@ -1,6 +1,6 @@
 --- a/fpsgame/scoreboard.cpp
 +++ b/fpsgame/scoreboard.cpp
-@@ -14,6 +14,10 @@
+@@ -14,6 +14,11 @@
      VARP(showconnecting, 0, 0, 1);
      VARP(hidefrags, 0, 1, 1);
      VARP(showdeaths, 0, 0, 1);
@@ -8,10 +8,11 @@
 +    VARP(showacc, 0, 0, 1);   // SwiftGibs: accuracy % (local row; remote needs extinfo)
 +    VARP(showdmg, 0, 0, 1);   // SwiftGibs: total damage (local row; remote needs extinfo)
 +    VARP(showcaptures, 0, 1, 1);   // SwiftGibs: flag captures, shown in CTF modes (all players)
++    VARP(showstreakcol, 0, 0, 1);   // SwiftGibs: best killstreak this match (all players; off by default)
  
      static hashset<teaminfo> teaminfos;
  
-@@ -258,6 +262,42 @@
+@@ -258,6 +262,51 @@
                  g.poplist();
              }
  
@@ -30,6 +31,15 @@
 +                g.strut(6);
 +                g.text("kdr", fgcolor);
 +                loopscoregroup(o, g.textf("%.2f", 0xFFFFDD, NULL, o->deaths ? float(o->frags)/o->deaths : float(o->frags)));
++                g.poplist();
++            }
++
++            if(showstreakcol)
++            {
++                g.pushlist();
++                g.strut(6);
++                g.text("streak", fgcolor);
++                loopscoregroup(o, g.textf("%d", 0xFFFFDD, NULL, o->bstreak));
 +                g.poplist();
 +            }
 +
