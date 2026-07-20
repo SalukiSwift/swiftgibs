@@ -101,7 +101,7 @@
                  if(actor!=player1 && (!cmode || !cmode->hidefrags() || !hidefrags))
 --- a/fpsgame/fps.cpp
 +++ b/fpsgame/fps.cpp
-@@ -396,6 +396,29 @@
+@@ -396,6 +396,52 @@
  
      VARP(hitsound, 0, 0, 1);
  
@@ -113,7 +113,30 @@
 +        static const char *n[6] = { "free/hit", "swiftgibs/hit_tf2","swiftgibs/hit_quake","swiftgibs/hit_cod","swiftgibs/hit_custom1","swiftgibs/hit_custom2" };
 +        return n[(hitsoundsel>=0 && hitsoundsel<=5) ? hitsoundsel : 0];
 +    }
-+    ICOMMAND(playhitsoundpreview, "", (), { if(hitsoundvol>0) playsoundname(hitsndname(), NULL, hitsoundvol); });
++    VARP(hitsoundpitch, 50, 100, 200);   // SwiftGibs: hit sound pitch percent (100 = neutral)
++    ICOMMAND(playhitsoundpreview, "", (), { if(hitsoundvol>0) playsoundpitched(hitsndname(), hitsoundvol, hitsoundpitch, NULL); });
++
++    // === SwiftGibs selectable fire + reload-charge sounds (local player only) ===
++    VARP(firesound, 0, 0, 3);        // 0 stock rifle, 1 laser, 2 zap, 3 thump
++    VARP(firesoundvol, 0, 200, 255);
++    VARP(firesoundpitch, 50, 100, 200);
++    const char *firesndname()
++    {
++        static const char *n[4] = { "", "swiftgibs/fire_laser", "swiftgibs/fire_zap", "swiftgibs/fire_thump" };
++        return n[(firesound>=0 && firesound<=3) ? firesound : 0];
++    }
++    int firesoundsel() { return firesound; }
++    VARP(reloadsound, 0, 0, 2);      // reload-charge soundscape: 0 off, 1 laser charge, 2 rising hum
++    VARP(reloadsoundvol, 0, 180, 255);
++    VARP(reloadsoundpitch, 50, 100, 200);   // note: pitch also stretches/shrinks the 1.5s charge
++    const char *reloadsndname()
++    {
++        static const char *n[3] = { "", "swiftgibs/reload_laser", "swiftgibs/reload_hum" };
++        return n[(reloadsound>=0 && reloadsound<=2) ? reloadsound : 0];
++    }
++    int reloadsoundsel() { return reloadsound; }
++    ICOMMAND(playfirepreview, "", (), { if(firesound && firesoundvol>0) playsoundpitched(firesndname(), firesoundvol, firesoundpitch, NULL); });
++    ICOMMAND(playreloadpreview, "", (), { if(reloadsound && reloadsoundvol>0) playsoundpitched(reloadsndname(), reloadsoundvol, reloadsoundpitch, NULL); });
 +
 +    // === SwiftGibs crosshair hit markers (visual sibling of the hit sound) ===
 +    VARP(hitmarker, 0, 0, 3);   // 0 off, 1 X-flash, 2 Ring-out, 3 Notch
@@ -131,18 +154,18 @@
      void damaged(int damage, fpsent *d, fpsent *actor, bool local)
      {
          if((d->state!=CS_ALIVE && d->state != CS_LAGGED && d->state != CS_SPAWNING) || intermission) return;
-@@ -406,8 +429,9 @@
+@@ -406,8 +452,9 @@
          fpsent *h = hudplayer();
          if(h!=player1 && actor==h && d!=actor)
          {
 -            if(hitsound && lasthit != lastmillis) playsound(S_HIT);
-+            if(hitsound && lasthit != lastmillis && hitsoundvol>0) playsoundname(hitsndname(), NULL, hitsoundvol);
++            if(hitsound && lasthit != lastmillis && hitsoundvol>0) playsoundpitched(hitsndname(), hitsoundvol, hitsoundpitch, NULL);
              lasthit = lastmillis;
 +            triggerhitmarker(damage);
          }
          if(d==h)
          {
-@@ -425,6 +449,48 @@
+@@ -425,6 +472,48 @@
          else playsound(S_PAIN1+rnd(5), &d->o);
      }
  
@@ -191,7 +214,7 @@
      VARP(deathscore, 0, 1, 1);
  
      void deathstate(fpsent *d, bool restore)
-@@ -438,6 +504,7 @@
+@@ -438,6 +527,7 @@
          }
          if(d==player1)
          {
@@ -199,7 +222,7 @@
              if(deathscore) showscores(true);
              disablezoom();
              if(!restore) loopi(NUMGUNS) savedammo[i] = player1->ammo[i];
-@@ -659,6 +726,10 @@
+@@ -659,6 +749,10 @@
              d->lifesequence = -1;
              d->respawned = d->suicided = -2;
          }
@@ -210,7 +233,7 @@
  
          setclientmode();
  
-@@ -1435,17 +1506,65 @@
+@@ -1424,17 +1518,65 @@
          }
      }
  
@@ -278,7 +301,7 @@
          pophudmatrix();
          reloadoverlaypass = false;
      }
-@@ -1481,6 +1600,60 @@
+@@ -1470,6 +1612,60 @@
          }
      }
  
@@ -339,7 +362,7 @@
      void gameplayhud(int w, int h)
      {
          pushhudmatrix();
-@@ -1513,6 +1686,11 @@
+@@ -1502,6 +1698,11 @@
  
          drawreloadcountdown(w, h);
  
@@ -376,15 +399,35 @@
          {
 -            extern int hitsound;
 -            if(hitsound && lasthit != lastmillis) playsound(S_HIT);
-+            extern int hitsound, hitsoundvol;
++            extern int hitsound, hitsoundvol, hitsoundpitch;
 +            extern const char *hitsndname();
-+            if(hitsound && lasthit != lastmillis && hitsoundvol>0) playsoundname(hitsndname(), NULL, hitsoundvol);
++            if(hitsound && lasthit != lastmillis && hitsoundvol>0) playsoundpitched(hitsndname(), hitsoundvol, hitsoundpitch, NULL);
              lasthit = lastmillis;
 +            extern void triggerhitmarker(int damage);
 +            triggerhitmarker(damage);
          }
  
          if(d->type==ENT_INANIMATE)
+@@ -670,7 +674,18 @@
+                 d->attackchan = playsound(sound, d==h ? NULL : &d->o, NULL, 0, -1, 100, d->attackchan);
+                 break;
+             default:
+-                playsound(sound, d==h ? NULL : &d->o);
++                // SwiftGibs: the local player's rifle can use a custom fire sound + pitch
++                if(d == player1 && gun == GUN_RIFLE)
++                {
++                    extern int firesoundsel(), reloadsoundsel();
++                    extern int firesoundvol, firesoundpitch, reloadsoundvol, reloadsoundpitch;
++                    extern const char *firesndname(); extern const char *reloadsndname();
++                    if(firesoundsel() && firesoundvol > 0) playsoundpitched(firesndname(), firesoundvol, firesoundpitch, NULL);
++                    else playsound(sound, NULL);
++                    // reload-charge soundscape rides the 1.5s rifle reload window
++                    if(reloadsoundsel() && reloadsoundvol > 0) playsoundpitched(reloadsndname(), reloadsoundvol, reloadsoundpitch, NULL);
++                }
++                else playsound(sound, d==h ? NULL : &d->o);
+                 break;
+         }
+         if(d->quadmillis && lastmillis-prevaction>200 && !looped) playsound(S_ITEMPUP, d==h ? NULL : &d->o);
 --- a/fpsgame/ctf.h
 +++ b/fpsgame/ctf.h
 @@ -850,6 +850,7 @@

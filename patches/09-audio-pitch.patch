@@ -1,0 +1,83 @@
+--- a/engine/sound.cpp
++++ b/engine/sound.cpp
+@@ -834,6 +834,70 @@
+ 
+ ICOMMAND(sound, "i", (int *n), playsound(*n));
+ 
++// === SwiftGibs pitch-shifted playback ===
++// Pitched variants live in the sample registry as pseudo-samples keyed "name#p<pct>"
++// with a pre-resampled chunk, so the normal slot/channel machinery plays them
++// untouched (slot load is skipped when sample->chunk is already set).
++static Mix_Chunk *resamplechunk(Mix_Chunk *src, int pct)
++{
++    int mixerfreq = 0, mixerchannels = 0; Uint16 mixerformat = 0;
++    if(!src || !src->abuf || !Mix_QuerySpec(&mixerfreq, &mixerformat, &mixerchannels)) return NULL;
++    if((mixerformat&0xFF) != 16) return NULL;             // expect S16 mixer output
++    int ch = mixerchannels;
++    int srcframes = int(src->alen / (2*ch));
++    int dstframes = int((llong)srcframes * 100 / pct);    // pitch up = shorter buffer
++    if(srcframes <= 1 || dstframes <= 1) return NULL;
++    short *sbuf = (short *)src->abuf;
++    short *dbuf = (short *)SDL_malloc(dstframes * 2 * ch);
++    if(!dbuf) return NULL;
++    loopi(dstframes)
++    {
++        double pos = (double)i * pct / 100.0;
++        int i0 = min((int)pos, srcframes - 1), i1 = min(i0 + 1, srcframes - 1);
++        float f = float(pos - i0);
++        loopj(ch) dbuf[i*ch + j] = (short)(sbuf[i0*ch + j] * (1.0f - f) + sbuf[i1*ch + j] * f);
++    }
++    Mix_Chunk *c = Mix_QuickLoad_RAW((Uint8 *)dbuf, dstframes * 2 * ch);
++    if(!c) { SDL_free(dbuf); return NULL; }
++    c->allocated = 1;                                     // Mix_FreeChunk frees the buffer
++    c->volume = src->volume;
++    return c;
++}
++
++int playsoundpitched(const char *s, int vol, int pitch, const vec *loc)
++{
++    pitch = clamp(pitch, 50, 200);
++    if(nosound || pitch == 100) return playsoundname(s, loc, vol);
++    defformatstring(pname, "%s#p%d", s, pitch);
++    soundsample *ps = samples.access(pname);
++    if(!ps || !ps->chunk)   // also rebuilds after a sound reset frees the chunk
++    {
++        soundsample *base = samples.access(s);
++        if(!base)
++        {
++            char *n = newstring(s);
++            base = &samples[n];
++            base->name = n;
++            base->chunk = NULL;
++        }
++        if(!base->chunk && !base->load()) return -1;
++        Mix_Chunk *rc = resamplechunk(base->chunk, pitch);
++        if(!rc) return playsoundname(s, loc, vol);        // graceful fallback: unpitched
++        if(!ps)
++        {
++            char *pn = newstring(pname);
++            ps = &samples[pn];
++            ps->name = pn;
++        }
++        ps->chunk = rc;
++    }
++    if(!vol) vol = 100;
++    int id = gamesounds.findsound(pname, vol);
++    if(id < 0) id = gamesounds.addsound(pname, vol);
++    return playsound(id, loc);
++}
++ICOMMAND(playpitched, "sii", (char *s, int *vol, int *pitch), intret(playsoundpitched(s, *vol, *pitch, NULL)));
++
+ void resetsound()
+ {
+     clearchanges(CHANGE_SOUND);
+--- a/shared/iengine.h
++++ b/shared/iengine.h
+@@ -409,6 +409,7 @@
+ 
+ extern int playsound(int n, const vec *loc = NULL, extentity *ent = NULL, int flags = 0, int loops = 0, int fade = 0, int chanid = -1, int radius = 0, int expire = -1);
+ extern int playsoundname(const char *s, const vec *loc = NULL, int vol = 0, int flags = 0, int loops = 0, int fade = 0, int chanid = -1, int radius = 0, int expire = -1);
++extern int playsoundpitched(const char *s, int vol = 0, int pitch = 100, const vec *loc = NULL);   // SwiftGibs
+ extern void preloadsound(int n);
+ extern void preloadmapsound(int n);
+ extern bool stopsound(int n, int chanid, int fade = 0);
