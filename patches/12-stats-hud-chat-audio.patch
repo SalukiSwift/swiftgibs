@@ -139,16 +139,16 @@
 +    ICOMMAND(playreloadpreview, "", (), { if(reloadsound && reloadsoundvol>0) playsoundpitched(reloadsndname(), reloadsoundvol, reloadsoundpitch, NULL); });
 +
 +    // === SwiftGibs crosshair hit markers (visual sibling of the hit sound) ===
-+    VARP(hitmarker, 0, 1, 3);   // 0 off, 1 X-flash (default), 2 Ring-out, 3 Notch
++    VARP(hitmarker, 0, 1, 4);   // 0 off, 1 Classic crosshair-swap (default), 2 X-flash, 3 Ring-out, 4 Notch
 +    int hitmarkermillis = 0, hitmarkerdemomillis = 0;
 +    float hitmarkerscale = 1.0f;
 +    void triggerhitmarker(int damage)
 +    {
-+        if(!hitmarker) return;
++        if(hitmarker < 2) return;   // 0 = off, 1 = classic stock crosshair-swap (no overlay)
 +        hitmarkermillis = lastmillis;
 +        hitmarkerscale = clamp(damage / 100.0f, 0.45f, 1.0f);
 +    }
-+    ICOMMAND(hitmarkerdemo, "", (), { hitmarkermillis = lastmillis; hitmarkerscale = 1.0f; hitmarkerdemomillis = lastmillis; });
++    ICOMMAND(hitmarkerdemo, "", (), { if(hitmarker == 1) lasthit = lastmillis; else { hitmarkermillis = lastmillis; hitmarkerscale = 1.0f; hitmarkerdemomillis = lastmillis; } });
 +    ICOMMAND(playstreaksound, "", (), playsoundname("swiftgibs/streak"));
 +
      void damaged(int damage, fpsent *d, fpsent *actor, bool local)
@@ -307,9 +307,9 @@
 +        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 +        switch(hitmarker)
 +        {
-+            case 1: loopi(4) cuestroke(cx, cy, (45.0f + 90.0f*i)*(float)M_PI/180.0f, (16.0f + 10.0f*p)*s, (44.0f + 14.0f*p)*s, 9.0f*s, 1.0f, 0.95f, 0.88f, a); break;
-+            case 2: reloadring(cx, cy, (20.0f + 58.0f*easeoutquad(p))*s, 6.5f, 1.0f, 0.95f, 0.88f, a); break;
-+            case 3: loopi(4) cuestroke(cx, cy, (90.0f*i)*(float)M_PI/180.0f, (24.0f + 10.0f*p)*s, (42.0f + 10.0f*p)*s, 8.0f*s, 1.0f, 0.95f, 0.88f, a); break;
++            case 2: loopi(4) cuestroke(cx, cy, (45.0f + 90.0f*i)*(float)M_PI/180.0f, (16.0f + 10.0f*p)*s, (44.0f + 14.0f*p)*s, 9.0f*s, 1.0f, 0.95f, 0.88f, a); break;
++            case 3: reloadring(cx, cy, (20.0f + 58.0f*easeoutquad(p))*s, 6.5f, 1.0f, 0.95f, 0.88f, a); break;
++            case 4: loopi(4) cuestroke(cx, cy, (90.0f*i)*(float)M_PI/180.0f, (24.0f + 10.0f*p)*s, (42.0f + 10.0f*p)*s, 8.0f*s, 1.0f, 0.95f, 0.88f, a); break;
 +        }
 +        hudshader->set();
 +    }
@@ -430,6 +430,15 @@
          pophudmatrix();
  
          if(d->state!=CS_EDITING && d->state!=CS_SPECTATOR && d->state!=CS_DEAD)
+@@ -1546,7 +1803,7 @@
+ 
+         int crosshair = 0;
+         bool onteam = false;
+-        if(lasthit && lastmillis - lasthit < hitcrosshair) crosshair = 2;
++        if(hitmarker == 1 && lasthit && lastmillis - lasthit < hitcrosshair) crosshair = 2;   // SwiftGibs: stock swap = the Classic hit-marker style only
+         else if(teamcrosshair)
+         {
+             dynent *o = intersectclosest(d->o, worldpos, d);
 --- a/fpsgame/weapon.cpp
 +++ b/fpsgame/weapon.cpp
 @@ -16,6 +16,7 @@
