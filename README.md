@@ -13,8 +13,14 @@ SwiftGibs takes the classic open-source arena shooter and strips it to its faste
 - **Flat low-detail world.** World textures crushed to a flat competitive look; fonts, HUD, and map thumbnails stay crisp. Runs on potatoes.
 - **Expanded scoreboard.** Frags in every mode (including CTF), deaths, KDR, captures, optional accuracy and damage. All toggleable.
 - **Friends system.** Name-based friends list; friends are highlighted in-game and on the minimap. Manage them from a dedicated Friends settings tab.
-- **Reload feedback, your way.** An optional 3-2-1 rifle-reload countdown (9 styles including Collapse and Edge-beats), an independent fire-ready flash (8 styles from a subtle Thin-ring to a bold Edge-pulse), and a tick-tick-tick-ding metronome. All off by default. Mix and match.
-- **Hit and streak feedback.** Selectable hit-marker sounds with an adjustable volume and a preview button, a per-life killstreak counter with optional milestone dings, and a career stats page tracking your frags, deaths, accuracy, damage, and best streak.
+- **Reload feedback, your way.** An optional 3-2-1 rifle-reload countdown (beat-locked styles from the hammering Slam to the spiralling Orbit), an independent fire-ready flash (8 styles from a subtle Thin-ring to a bold Edge-pulse), and a tick-tick-tick-ding metronome. Recolour any of it with hue, mono, and opacity controls. All off by default. Mix and match, with live previews.
+- **Hit and streak feedback.** Crosshair hit markers (X-flash, Ring-out, or Notch) plus selectable hit sounds with volume and pitch, a per-life killstreak counter with milestone dings and centre-screen streak fx, a top-5 killstreak leaderboard with map and date, and a career stats page tracking your frags, deaths, accuracy, damage, and best streaks.
+- **Weapon sounds.** Give your own rifle a Laser, Zap, or Thump fire sound and an optional reload-charge soundscape, each with volume and continuous pitch control. Enemies always sound stock, so you can still read their shots.
+- **Expanded map.** Press M for a whole-stage overhead view with your position, teammates, friends, and flag positions. Teammates only, never enemies.
+- **Deep zoom.** Hold a thumb button for a much tighter zoom than right-click, for very distant targets.
+- **Flag awareness.** A punchy "YOU HAVE THE FLAG" popup the moment you grab it, so a flag never goes unnoticed.
+- **Sensitivity translator.** Convert your sens from CS/Source/TF2, Quake, Apex, Overwatch, CoD, or Valorant to the exact SwiftGibs equivalent and apply it in one click.
+- **Blocky lighting (optional).** A crisp pixelated-shadow look for the flat world. Community-discovered via in-game feedback.
 - **Readable chat.** Scroll back through chat with the mouse wheel while you type, or open a dedicated Chat History page.
 - **Non-obscuring teammate crosshair.** Over a teammate, your crosshair tints blue instead of the aim-blocking circle-slash icon (friendly fire is usually on).
 - **Native settings.** All SwiftGibs options live in the regular Esc > options menu as SwiftGibs, Timing Cues, and Friends tabs. F3 is a quick-play launcher for instant bot matches.
