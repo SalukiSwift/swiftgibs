@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Attach the SwiftGibs + Friends tabs to the stock Esc->options gui by splicing four literal lines
+# Attach the SwiftGibs / Cues / Audio / Friends tabs to the stock Esc->options gui by splicing four literal lines
 # (which call aliases defined in overlay/menus_settings.cfg) into the staged data/menus.cfg, right
 # before the options gui's closing `] "game"`. Idempotent.
 # Usage: integrate-menus.sh <staged-root-containing-data/menus.cfg>
@@ -19,7 +19,8 @@ assert i >= 0, "integrate-menus: options anchor (showfileeditor autoexec.cfg) no
 close = b.find(b'] "game"', i)                     # the options gui closing bracket after the anchor
 assert close >= 0, "integrate-menus: options closing `] \"game\"` not found after anchor"
 ins = (b'    guitab "SwiftGibs"' + nl + b'    sgSwiftgibsTab' + nl +
-       b'    guitab "Timing Cues"' + nl + b'    sgTimingTab' + nl +
+       b'    guitab "Cues"' + nl + b'    sgCuesTab' + nl +
+       b'    guitab "Audio"' + nl + b'    sgAudioTab' + nl +
        b'    guitab "Friends"' + nl + b'    sgFriendsTab' + nl)
 open(p, "wb").write(b[:close] + ins + b[close:])
 print("integrate-menus: attached SwiftGibs + Friends tabs to", p)
