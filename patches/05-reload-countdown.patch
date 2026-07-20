@@ -266,15 +266,15 @@
 +                hudshader->set();
 +                return;
 +            }
-+            case 4: // Heartbeat -- a single dot beside the crosshair beats in time, double-time on the last
++            case 4: // Heartbeat -- a dot centred under the crosshair beats in time, double-time on the last
 +            {
 +                float phase = (idx == 2) ? fmodf(t * 2.0f, 1.0f) : t; // final beat goes double-time
 +                float pop = 1.0f + 0.85f * (1.0f - beatpunch(phase)); // sharp pop at each beat onset
 +                float R = 9.0f * pop;
 +                hudnotextureshader->set();
 +                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-+                reloaddisc(cx + 46.0f, cy, R, cr, cg, cb, 0.90f);
-+                reloadring(cx + 46.0f, cy, R + 8.0f + 26.0f * phase, 3.0f, cr, cg, cb, 0.45f * (1.0f - phase));
++                reloaddisc(cx, cy + 70.0f, R, cr, cg, cb, 0.90f);
++                reloadring(cx, cy + 70.0f, R + 8.0f + 26.0f * phase, 3.0f, cr, cg, cb, 0.45f * (1.0f - phase));
 +                hudshader->set();
 +                return;
 +            }
