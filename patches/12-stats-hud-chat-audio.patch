@@ -233,10 +233,65 @@
  
          setclientmode();
  
-@@ -1424,17 +1518,65 @@
+@@ -1424,17 +1518,120 @@
          }
      }
  
++    // === SwiftGibs expanded map overlay: whole stage, north-up, teammate/flag blips ===
++    VAR(expandedmap, 0, 0, 1);   // momentary view; deliberately NOT persisted
++    ICOMMAND(toggleexpandedmap, "", (), expandedmap = !expandedmap);
++    void expmapblip(float bx, float by, float r, float cr, float cg, float cb, float a)
++    {
++        cuefamily(0, 0, 100);
++        reloaddisc(bx, by, r, cr, cg, cb, a);
++    }
++    void drawexpandedmap(int w, int h)
++    {
++        if(!expandedmap) return;
++        fpsent *d = hudplayer();
++        float S = 1560.0f, cx = w*900.0f/h, cy = 900.0f;
++        float x0 = cx - S*0.5f, y0 = cy - S*0.5f;
++        hudnotextureshader->set();
++        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++        gle::colorf(0.0f, 0.0f, 0.0f, 0.45f);       // dim the game behind
++        gle::defvertex(2);
++        gle::begin(GL_QUADS);
++        gle::attribf(0, 0); gle::attribf(cx*2, 0); gle::attribf(cx*2, cy*2); gle::attribf(0, cy*2);
++        gle::end();
++        hudshader->set();
++        bindminimap();                                // the whole world in one quad
++        gle::colorf(1, 1, 1, 0.92f);
++        gle::defvertex(2);
++        gle::deftexcoord0();
++        gle::begin(GL_QUADS);
++        gle::attribf(x0, y0);     gle::attribf(0.0f, 0.0f);
++        gle::attribf(x0+S, y0);   gle::attribf(1.0f, 0.0f);
++        gle::attribf(x0+S, y0+S); gle::attribf(1.0f, 1.0f);
++        gle::attribf(x0, y0+S);   gle::attribf(0.0f, 1.0f);
++        gle::end();
++        hudnotextureshader->set();
++        // teammates (and friends in cyan) - never enemies
++        loopv(players)
++        {
++            fpsent *o = players[i];
++            if(o == d || o->state != CS_ALIVE || !m_teammode || !isteam(o->team, d->team)) continue;
++            vec t = vec(o->o).sub(minimapcenter).mul(minimapscale).add(0.5f);
++            extern bool isfriendname(const char *name);
++            extern int highlightfriends;
++            if(highlightfriends && isfriendname(o->name)) expmapblip(x0+t.x*S, y0+t.y*S, 14.0f, 0.30f, 0.95f, 1.0f, 0.95f);
++            else expmapblip(x0+t.x*S, y0+t.y*S, 14.0f, 0.35f, 0.55f, 1.0f, 0.95f);
++        }
++        if(cmode) cmode->expandedblips(x0, y0, S);    // mode extras (ctf flags)
++        // self: yellow dot + facing tick
++        vec st = vec(d->o).sub(minimapcenter).mul(minimapscale).add(0.5f);
++        float sx = x0 + st.x*S, sy = y0 + st.y*S;
++        expmapblip(sx, sy, 18.0f, 1.0f, 0.85f, 0.20f, 1.0f);
++        vec dir;
++        vecfromyawpitch(d->yaw, 0, 1, 0, dir);
++        expmapblip(sx + dir.x*(minimapscale.x < 0 ? -30.0f : 30.0f), sy + dir.y*(minimapscale.y < 0 ? -30.0f : 30.0f), 7.0f, 1.0f, 1.0f, 1.0f, 1.0f);
++        hudshader->set();
++    }
++
 +    // === SwiftGibs hit marker + streak fx draw (reuse the cue primitives above) ===
 +    static bool hitmarkerdemoing() { return lastmillis - hitmarkerdemomillis < 300 && hitmarkerdemomillis; }
 +    static bool streakfxdemoing() { return lastmillis - streakfxdemomillis < 1000 && streakfxdemomillis; }
@@ -301,7 +356,7 @@
          pophudmatrix();
          reloadoverlaypass = false;
      }
-@@ -1470,6 +1612,60 @@
+@@ -1470,6 +1667,60 @@
          }
      }
  
@@ -362,10 +417,11 @@
      void gameplayhud(int w, int h)
      {
          pushhudmatrix();
-@@ -1502,6 +1698,11 @@
+@@ -1502,6 +1753,12 @@
  
          drawreloadcountdown(w, h);
  
++        drawexpandedmap(w, h);
 +        drawkillstreak(w, h);
 +        drawflagpopup(w, h);
 +        if(!hitmarkerdemoing()) drawhitmarker(w, h);
@@ -438,15 +494,31 @@
      }
  
      void flagexplosion(int i, int team, const vec &loc)
-@@ -952,6 +953,7 @@
+@@ -952,6 +953,23 @@
          playsound(team==ctfteamflag(player1->team) ? S_FLAGSCORE : S_FLAGFAIL);
  
          if(score >= FLAGLIMIT) conoutf(CON_GAMEINFO, "%s captured %d flags", teamcolor("your team", ctfflagteam(team), "the enemy team"), score);
 +        if(d==player1) { extern void flagpopup(int state); flagpopup(0); }   // SwiftGibs popup clear
++    }
++
++    void expandedblips(float x0, float y0, float S)
++    {
++        // SwiftGibs expanded map: flag positions (live, dropped, or carried)
++        extern void expmapblip(float bx, float by, float r, float cr, float cg, float cb, float a);
++        loopv(flags)
++        {
++            flag &f = flags[i];
++            vec loc = interpflagpos(f);
++            if(loc.x < 0) continue;
++            vec t = vec(loc).sub(minimapcenter).mul(minimapscale).add(0.5f);
++            if(m_hold) expmapblip(x0+t.x*S, y0+t.y*S, 16.0f, 1.0f, 1.0f, 1.0f, 0.95f);
++            else if(f.team==ctfteamflag(player1->team)) expmapblip(x0+t.x*S, y0+t.y*S, 16.0f, 0.25f, 0.45f, 1.0f, 0.95f);
++            else expmapblip(x0+t.x*S, y0+t.y*S, 16.0f, 1.0f, 0.30f, 0.20f, 0.95f);
++        }
      }
  
      void takeflag(fpsent *d, int i, int version)
-@@ -966,6 +968,8 @@
+@@ -966,6 +984,8 @@
          else conoutf(CON_GAMEINFO, "%s stole %s", teamcolorname(d), teamcolorflag(f));
          ownflag(i, d, lastmillis, m_hold ? ctfteamflag(d->team) : -1);
          teamsound(d, S_FLAGPICKUP);
@@ -455,3 +527,13 @@
      }
  
      void invisflag(int i, int invis)
+--- a/fpsgame/game.h
++++ b/fpsgame/game.h
+@@ -682,6 +682,7 @@
+         virtual void preload() {}
+         virtual int clipconsole(int w, int h) { return 0; }
+         virtual void drawhud(fpsent *d, int w, int h) {}
++        virtual void expandedblips(float x0, float y0, float S) {}   // SwiftGibs expanded map
+         virtual void rendergame() {}
+         virtual void respawned(fpsent *d) {}
+         virtual void setup() {}
