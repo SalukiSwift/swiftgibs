@@ -6,11 +6,11 @@
  
  namespace game
  {
-@@ -1105,6 +1106,348 @@
+@@ -1105,6 +1106,337 @@
          pophudmatrix();
      }
  
-+    VARP(reloadcount, 0, 0, 8);   // countdown style, 0=off; 1 Slam 2 Pulse 3 Collapse 4 Heartbeat 5 Orbit 6 CrosshairPulse 7 Digits 8 Edge-beats
++    VARP(reloadcount, 0, 0, 8);   // countdown style, 0=off; 1 Slam 2 Pulse 3 Collapse 4 unused 5 Orbit 6 CrosshairPulse 7 Digits 8 Edge-beats
 +    VARP(reloadflash, 0, 0, 7);   // fire-ready flash, INDEPENDENT of reloadcount: 0 off; 1 Pip 2 Dot 3 ThinRing; 4 RingPing 5 Bloom 6 Burst 7 EdgePulse
 +
 +    int reloaddemostart = -100000;
@@ -266,18 +266,7 @@
 +                hudshader->set();
 +                return;
 +            }
-+            case 4: // Heartbeat -- a dot centred under the crosshair beats in time, double-time on the last
-+            {
-+                float phase = (idx == 2) ? fmodf(t * 2.0f, 1.0f) : t; // final beat goes double-time
-+                float pop = 1.0f + 0.85f * (1.0f - beatpunch(phase)); // sharp pop at each beat onset
-+                float R = 9.0f * pop;
-+                hudnotextureshader->set();
-+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-+                reloaddisc(cx, cy + 70.0f, R, cr, cg, cb, 0.90f);
-+                reloadring(cx, cy + 70.0f, R + 8.0f + 26.0f * phase, 3.0f, cr, cg, cb, 0.45f * (1.0f - phase));
-+                hudshader->set();
-+                return;
-+            }
++            case 4: return;   // slot unused (Heartbeat scrapped by April 2026-07-20; Sweep before it)
 +            case 5: // Orbit -- a comet laps the crosshair once per beat, spiralling inward
 +            {
 +                float R = 150.0f - 44.0f * idx - 44.0f * t;           // collapses across the countdown
@@ -355,7 +344,7 @@
      void gameplayhud(int w, int h)
      {
          pushhudmatrix();
-@@ -1135,6 +1478,8 @@
+@@ -1135,6 +1467,8 @@
              if(cmode) cmode->drawhud(d, w, h);
          }
  
@@ -364,7 +353,7 @@
          pophudmatrix();
  
          if(d->state!=CS_EDITING && d->state!=CS_SPECTATOR && d->state!=CS_DEAD)
-@@ -1168,6 +1513,8 @@
+@@ -1168,6 +1502,8 @@
          }
      }
  
@@ -373,7 +362,7 @@
      int selectcrosshair(vec &color)
      {
          fpsent *d = hudplayer();
-@@ -1176,18 +1523,24 @@
+@@ -1176,18 +1512,24 @@
          if(d->state!=CS_ALIVE) return 0;
  
          int crosshair = 0;
