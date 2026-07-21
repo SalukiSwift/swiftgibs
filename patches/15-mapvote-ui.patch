@@ -1,6 +1,6 @@
 --- a/fpsgame/client.cpp
 +++ b/fpsgame/client.cpp
-@@ -596,6 +596,205 @@
+@@ -596,6 +596,206 @@
      ICOMMANDS("m_dmsp", "i", (int *mode), { int gamemode = *mode; intret(m_dmsp); });
      ICOMMANDS("m_classicsp", "i", (int *mode), { int gamemode = *mode; intret(m_classicsp); });
  
@@ -38,6 +38,7 @@
 +
 +    void clearvotes()
 +    {
++        hidegui("mapvote");   // map changed / vote over -> the panel dismisses itself
 +        votepicks.shrink(0); votecands.shrink(0);
 +        myvotemap[0] = '\0'; myvotemode = -1;
 +        votedialect = 0; mbarmed = false; votewinner[0] = '\0';
@@ -192,10 +193,10 @@
 +    {
 +        if(!votecands.inrange(*i)) return;
 +        votecand &c = votecands[*i];
-+        if(c.saynum >= 0)   // MAPBATTLE: vote exactly like a human - say the number
-+        {
++        if(c.saynum >= 0)   // MAPBATTLE: send the number as chat, but WITHOUT the local echo
++        {                   // (the server eats it; this way the voter's own console stays clean too)
 +            defformatstring(num, "%d", c.saynum);
-+            toserver(num);
++            addmsg(N_TEXT, "rcs", player1, num);
 +            copystring(myvotemap, c.map); myvotemode = c.mode;
 +        }
 +        else changemap(c.map, c.mode);   // stock: N_MAPVOTE
@@ -206,7 +207,7 @@
      void changemap(const char *name, int mode) // request map change, server may ignore
      {
          if(!remote)
-@@ -603,7 +802,11 @@
+@@ -603,7 +803,11 @@
              server::forcemap(name, mode);
              if(!isconnected()) localconnect();
          }
@@ -219,7 +220,7 @@
      }
      void changemap(const char *name)
      {
-@@ -1392,6 +1595,7 @@
+@@ -1392,6 +1596,7 @@
                  fixmapname(text);
                  changemapserv(text, getint(p));
                  mapchanged = true;
@@ -227,7 +228,7 @@
                  if(getint(p)) entities::spawnitems();
                  else senditemstoserver = false;
                  break;
-@@ -1828,6 +2032,7 @@
+@@ -1828,6 +2033,7 @@
              case N_SERVMSG:
                  getstring(text, p);
                  conoutf("%s", text);
@@ -235,3 +236,13 @@
                  break;
  
              case N_SENDDEMOLIST:
+--- a/shared/iengine.h
++++ b/shared/iengine.h
+@@ -214,6 +214,7 @@
+ extern vec menuinfrontofplayer();
+ extern void newgui(char *name, char *contents, char *header = NULL, char *init = NULL);
+ extern void showgui(const char *name);
++extern void hidegui(const char *name);   // SwiftGibs
+ extern int cleargui(int n = 0);
+ 
+ // octa

@@ -17,7 +17,7 @@
          interm = 0;
          nextexceeded = 0;
          copystring(smapname, s);
-@@ -2244,6 +2245,53 @@
+@@ -2244,6 +2245,55 @@
          return true;
      }
  
@@ -29,6 +29,7 @@
 +    int mbvotes[3];
 +    int mbclientvote[MAXCLIENTS];
 +    bool mbactive = false;
++    int mbendmillis = 0;
 +
 +    void mbstart()
 +    {
@@ -36,6 +37,7 @@
 +        mbpoolpos = (mbpoolpos + 1) % 6;
 +        loopi(MAXCLIENTS) mbclientvote[i] = -1;
 +        mbactive = true;
++        mbendmillis = totalmillis + 20000;   // votes always conclude 20s after they start
 +        // deliberately ONE message with embedded newlines - the real server batches like this
 +        sendservmsgf("[MAPBATTLE] Vote with a number:\n[MAPBATTLE] %s: (1) - %s: (2) - %s: (3)",
 +            mbcand[0], mbcand[1], mbcand[2]);
@@ -71,7 +73,7 @@
      void checkintermission(bool force = false)
      {
          if(gamemillis >= gamelimit && !interm && (force || !checkovertime()))
-@@ -2251,7 +2299,8 @@
+@@ -2251,7 +2301,8 @@
              sendf(-1, 1, "ri2", N_TIMEUP, 0);
              if(smode) smode->intermission();
              changegamespeed(100);
@@ -81,7 +83,15 @@
          }
      }
  
-@@ -2525,7 +2574,7 @@
+@@ -2501,6 +2552,7 @@
+             }
+         }
+ 
++        if(mbactive && totalmillis > mbendmillis) mbfinish();   // MAPBATTLE replica: vote timeout
+         while(bannedips.length() && bannedips[0].expire-totalmillis <= 0) bannedips.remove(0);
+         loopv(connects) if(totalmillis-connects[i]->connectmillis>15000) disconnect_client(connects[i]->clientnum, DISC_TIMEOUT);
+ 
+@@ -2525,7 +2577,7 @@
              {
                  if(demorecord) enddemorecord();
                  interm = -1;
@@ -90,7 +100,7 @@
              }
          }
  
-@@ -3274,11 +3323,13 @@
+@@ -3274,11 +3326,13 @@
  
              case N_TEXT:
              {
