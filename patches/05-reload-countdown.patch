@@ -6,7 +6,7 @@
  
  namespace game
  {
-@@ -1105,6 +1106,337 @@
+@@ -1105,6 +1106,339 @@
          pophudmatrix();
      }
  
@@ -24,6 +24,8 @@
 +    static bool reloadoverlaypass = false;   // set while drawing the post-gui overlay
 +    static bool reloaddemoing() { int de = lastmillis - reloaddemostart; return de >= 0 && de < RC_DUR + RC_POP; }
 +    bool reloaddemoactive() { return reloaddemoing(); }
++    int hmclassicdemomillis = 0;   // set by hitmarkerdemo (patch 12) when auditioning the Classic style
++    bool hitmarkerclassicdemo() { return hmclassicdemomillis && lastmillis - hmclassicdemomillis < 600; }
 +
 +    // Returns elapsed ms in [0,RC_DUR) when any countdown source is active, else -1.
 +    int reloadcountdownElapsed()
@@ -344,7 +346,7 @@
      void gameplayhud(int w, int h)
      {
          pushhudmatrix();
-@@ -1135,6 +1467,8 @@
+@@ -1135,6 +1469,8 @@
              if(cmode) cmode->drawhud(d, w, h);
          }
  
@@ -353,7 +355,7 @@
          pophudmatrix();
  
          if(d->state!=CS_EDITING && d->state!=CS_SPECTATOR && d->state!=CS_DEAD)
-@@ -1168,6 +1502,8 @@
+@@ -1168,6 +1504,8 @@
          }
      }
  
@@ -362,7 +364,7 @@
      int selectcrosshair(vec &color)
      {
          fpsent *d = hudplayer();
-@@ -1176,18 +1512,24 @@
+@@ -1176,18 +1514,24 @@
          if(d->state!=CS_ALIVE) return 0;
  
          int crosshair = 0;
@@ -392,7 +394,7 @@
              else if(d->health<=50) color = vec(1, 0.5f, 0);
 --- a/shared/igame.h
 +++ b/shared/igame.h
-@@ -82,6 +82,10 @@
+@@ -82,6 +82,11 @@
      extern void g3d_gamemenus();
      extern const char *defaultcrosshair(int index);
      extern int selectcrosshair(vec &color);
@@ -400,6 +402,7 @@
 +    extern float reloadcrosshairfade();
 +    extern void reloadhudoverlay(int w, int h);
 +    extern bool reloaddemoactive();
++    extern bool hitmarkerclassicdemo();
      extern void lighteffects(dynent *d, vec &color, vec &dir);
      extern void setupcamera();
      extern bool allowthirdperson(bool msg = false);
@@ -427,7 +430,7 @@
      resethudmatrix();
  
 +    game::reloadhudoverlay(w, h);   // cue demos over any open menu (must come after the ortho reset)
-+    if(game::reloaddemoactive() && (mainmenu || g3d_windowhit(true, false)))
++    if((game::reloaddemoactive() || game::hitmarkerclassicdemo()) && (mainmenu || g3d_windowhit(true, false)))
 +    {
 +        // menus show the gui cursor, not the crosshair - draw a centered crosshair during
 +        // demos so crosshair-linked cues (Crosshair-Pulse, fade, ready pop) can be auditioned

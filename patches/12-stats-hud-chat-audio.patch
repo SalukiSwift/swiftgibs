@@ -148,7 +148,7 @@
 +        hitmarkermillis = lastmillis;
 +        hitmarkerscale = clamp(damage / 100.0f, 0.45f, 1.0f);
 +    }
-+    ICOMMAND(hitmarkerdemo, "", (), { if(hitmarker == 1) lasthit = lastmillis; else { hitmarkermillis = lastmillis; hitmarkerscale = 1.0f; hitmarkerdemomillis = lastmillis; } });
++    ICOMMAND(hitmarkerdemo, "", (), { if(hitmarker == 1) { lasthit = lastmillis; extern int hmclassicdemomillis; hmclassicdemomillis = lastmillis; } else { hitmarkermillis = lastmillis; hitmarkerscale = 1.0f; hitmarkerdemomillis = lastmillis; } });
 +    ICOMMAND(playstreaksound, "", (), playsoundname("swiftgibs/streak"));
 +
      void damaged(int damage, fpsent *d, fpsent *actor, bool local)
