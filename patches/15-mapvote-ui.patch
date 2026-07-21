@@ -1,0 +1,225 @@
+--- a/fpsgame/client.cpp
++++ b/fpsgame/client.cpp
+@@ -596,6 +596,193 @@
+     ICOMMANDS("m_dmsp", "i", (int *mode), { int gamemode = *mode; intret(m_dmsp); });
+     ICOMMANDS("m_classicsp", "i", (int *mode), { int gamemode = *mode; intret(m_classicsp); });
+ 
++    // SwiftGibs: map-vote panel - client-side tally + one-click voting -----------------------
++    // Two server dialects, auto-detected from broadcasts:
++    //   STOCK (vanilla server.cpp): "<name> suggests <mode> on map <map> (select map to vote)"
++    //     -> tally reconstructed per-voter; voting sends the stock N_MAPVOTE (changemap).
++    //   MAPBATTLE (RUGBY-family mods; captured live 2026-07-21):
++    //     "[MAPBATTLE] Vote with a number:"
++    //     "[MAPBATTLE] twinforts: (1) - metro: (2) - campo: (3 - player suggestion)"
++    //     "[MAPBATTLE] twinforts: 1 - metro: 0 - campo: 2 (Voted by <name>)"
++    //     "WINNER >> campo (4 votes)"
++    //     -> candidates + authoritative counts parsed from the lines; voting SAYS the number
++    //        in chat (the server eats it), exactly like a human player.
++    // Best-effort: unrecognised formats simply yield no candidates, never a crash.
++    void changemap(const char *name, int mode); // fwd decl
++    void toserver(char *text);                  // fwd decl (chat say)
++
++    VARP(mapvotepopup, 0, 1, 1); // auto-open the panel when a vote starts
++
++    struct votepick { string voter, map, modename; int mode; };            // stock: latest pick per voter
++    struct votecand { string map, modename; int mode, count, saynum; };    // saynum >= 0 -> MAPBATTLE
++    struct votecandless { bool operator()(const votecand &a, const votecand &b) const {
++        if(a.saynum >= 0 && b.saynum >= 0) return a.saynum < b.saynum;     // MAPBATTLE: server order
++        if(a.count != b.count) return a.count > b.count;                   // stock: most votes first
++        return strcmp(a.map, b.map) < 0;
++    } };
++    vector<votepick> votepicks;
++    vector<votecand> votecands;
++    string myvotemap = "";
++    int myvotemode = -1;
++    int votedialect = 0;      // 0 stock, 1 mapbattle
++    bool mbarmed = false;     // "Vote with a number:" seen -> next [MAPBATTLE] line = candidates
++    string votewinner = "";
++
++    void clearvotes()
++    {
++        votepicks.shrink(0); votecands.shrink(0);
++        myvotemap[0] = '\0'; myvotemode = -1;
++        votedialect = 0; mbarmed = false; votewinner[0] = '\0';
++    }
++
++    // copy src -> dst dropping "\fX" colour codes (\f = 0x0c followed by one arg char)
++    void stripvotecolors(char *dst, const char *src)
++    {
++        int n = 0;
++        for(; *src && n < MAXSTRLEN-1; src++)
++        {
++            if(*src == '\f') { if(src[1]) src++; continue; }
++            dst[n++] = *src;
++        }
++        dst[n] = '\0';
++    }
++
++    // MAPBATTLE candidates line: "<map>: (<num>[ - player suggestion]) - <map>: (<num>) ..."
++    void mbparsecands(const char *s)
++    {
++        votecands.shrink(0);
++        const char *p = s;
++        for(;;)
++        {
++            const char *open = strstr(p, ": (");
++            if(!open) break;
++            const char *start = p;
++            while(start < open && (*start == ' ' || *start == '-')) start++;
++            int nlen = min(int(open - start), MAXSTRLEN-1);
++            if(nlen > 0)
++            {
++                votecand &c = votecands.add();
++                memcpy(c.map, start, nlen); c.map[nlen] = '\0';
++                c.saynum = atoi(open + 3);
++                c.count = 0; c.mode = gamemode;
++                copystring(c.modename, server::modename(gamemode, ""));
++            }
++            const char *close = strchr(open, ')');
++            if(!close) break;
++            p = close + 1;
++        }
++    }
++
++    // MAPBATTLE tally line: "<map>: <count> - ... (Voted by <name>)" - counts are authoritative
++    void mbparsetally(const char *s)
++    {
++        loopv(votecands)
++        {
++            defformatstring(key, "%s: ", votecands[i].map);
++            const char *hit = strstr(s, key);
++            if(hit) votecands[i].count = atoi(hit + strlen(key));
++        }
++    }
++
++    void rebuildvotecands()
++    {
++        votecands.shrink(0);
++        loopv(votepicks)
++        {
++            votepick &vp = votepicks[i];
++            votecand *c = NULL;
++            loopvj(votecands) if(!strcmp(votecands[j].map, vp.map) && votecands[j].mode == vp.mode)
++                { c = &votecands[j]; break; }
++            if(!c)
++            {
++                c = &votecands.add(); copystring(c->map, vp.map); copystring(c->modename, vp.modename);
++                c->mode = vp.mode; c->count = 0; c->saynum = -1;
++            }
++            c->count++;
++        }
++        votecands.sort(votecandless());
++    }
++
++    void recordvote(const char *voter, const char *map, const char *modestr)
++    {
++        if(!voter[0] || !map[0]) return;
++        int mode = gamemode;
++        loopi(NUMGAMEMODES) { int m = STARTGAMEMODE+i; if(!strcmp(server::modename(m, ""), modestr)) { mode = m; break; } }
++        votepick *vp = NULL;
++        loopv(votepicks) if(!strcmp(votepicks[i].voter, voter)) { vp = &votepicks[i]; break; }
++        if(!vp) { vp = &votepicks.add(); copystring(vp->voter, voter); }
++        copystring(vp->map, map); copystring(vp->modename, modestr); vp->mode = mode;
++        rebuildvotecands();
++    }
++
++    void parsevotemsg(const char *msg)
++    {
++        string clean;
++        stripvotecolors(clean, msg);
++        const char *mb = strstr(clean, "[MAPBATTLE]");
++        if(mb)
++        {
++            const char *body = mb + 11;
++            while(*body == ' ') body++;
++            if(strstr(body, "Vote with a number")) { clearvotes(); votedialect = 1; mbarmed = true; return; }
++            if(mbarmed && strstr(body, ": ("))
++            {
++                mbparsecands(body);
++                mbarmed = false;
++                if(mapvotepopup && votecands.length()) execute("showgui \"mapvote\"");
++                return;
++            }
++            if(votedialect == 1 && strstr(body, "(Voted by")) mbparsetally(body);
++            return;
++        }
++        if(votedialect == 1 && !strncmp(clean, "WINNER >> ", 10))
++        {
++            copystring(votewinner, clean + 10);
++            char *par = strstr(votewinner, " (");
++            if(par) *par = '\0';
++            return;
++        }
++        // STOCK dialect
++        const char *sug = strstr(clean, " suggests ");
++        if(!sug) return;
++        const char *onmap = strstr(sug, " on map ");
++        if(!onmap) return;
++        const char *tail = strstr(onmap, " (select map to vote)");
++        if(!tail) return;
++        string voter, modestr, mapstr;
++        int vlen = min(int(sug - clean), MAXSTRLEN-1); if(vlen <= 0) return;
++        memcpy(voter, clean, vlen); voter[vlen] = '\0';
++        const char *ms = sug + 10;
++        int mlen = min(int(onmap - ms), MAXSTRLEN-1); if(mlen <= 0) return;
++        memcpy(modestr, ms, mlen); modestr[mlen] = '\0';
++        const char *ps = onmap + 8;
++        int plen = min(int(tail - ps), MAXSTRLEN-1); if(plen <= 0) return;
++        memcpy(mapstr, ps, plen); mapstr[plen] = '\0';
++        recordvote(voter, mapstr, modestr);
++    }
++
++    ICOMMAND(numvotemaps, "", (), intret(votecands.length()));
++    ICOMMAND(getvotemap,  "i", (int *i), result(votecands.inrange(*i) ? votecands[*i].map : ""));
++    ICOMMAND(getvotemode, "i", (int *i), result(votecands.inrange(*i) ? votecands[*i].modename : ""));
++    ICOMMAND(getvotecount,"i", (int *i), intret(votecands.inrange(*i) ? votecands[*i].count : 0));
++    ICOMMAND(getvotenum,  "i", (int *i), intret(votecands.inrange(*i) ? votecands[*i].saynum : -1));
++    ICOMMAND(getvotemymap, "", (), result(myvotemap));
++    ICOMMAND(getvotewinner, "", (), result(votewinner));
++    ICOMMAND(castmapvote, "i", (int *i),
++    {
++        if(!votecands.inrange(*i)) return;
++        votecand &c = votecands[*i];
++        if(c.saynum >= 0)   // MAPBATTLE: vote exactly like a human - say the number
++        {
++            defformatstring(num, "%d", c.saynum);
++            toserver(num);
++            copystring(myvotemap, c.map); myvotemode = c.mode;
++        }
++        else changemap(c.map, c.mode);   // stock: N_MAPVOTE
++    });
++    ICOMMAND(_mapvoteparse, "s", (char *msg), parsevotemsg(msg)); // test: feed a raw server line
++    // ----------------------------------------------------------------------------------------
++
+     void changemap(const char *name, int mode) // request map change, server may ignore
+     {
+         if(!remote)
+@@ -603,7 +790,11 @@
+             server::forcemap(name, mode);
+             if(!isconnected()) localconnect();
+         }
+-        else if(player1->state!=CS_SPECTATOR || player1->privilege) addmsg(N_MAPVOTE, "rsi", name, mode);
++        else if(player1->state!=CS_SPECTATOR || player1->privilege)
++        {
++            addmsg(N_MAPVOTE, "rsi", name, mode);
++            copystring(myvotemap, name); myvotemode = mode; // SwiftGibs: remember my pick
++        }
+     }
+     void changemap(const char *name)
+     {
+@@ -1392,6 +1583,7 @@
+                 fixmapname(text);
+                 changemapserv(text, getint(p));
+                 mapchanged = true;
++                clearvotes(); // SwiftGibs: votes do not carry across games
+                 if(getint(p)) entities::spawnitems();
+                 else senditemstoserver = false;
+                 break;
+@@ -1828,6 +2020,7 @@
+             case N_SERVMSG:
+                 getstring(text, p);
+                 conoutf("%s", text);
++                parsevotemsg(text); // SwiftGibs: map-vote tally
+                 break;
+ 
+             case N_SENDDEMOLIST:
