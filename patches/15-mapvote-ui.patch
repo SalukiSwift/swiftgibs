@@ -1,6 +1,6 @@
 --- a/fpsgame/client.cpp
 +++ b/fpsgame/client.cpp
-@@ -596,6 +596,206 @@
+@@ -596,6 +596,212 @@
      ICOMMANDS("m_dmsp", "i", (int *mode), { int gamemode = *mode; intret(m_dmsp); });
      ICOMMANDS("m_classicsp", "i", (int *mode), { int gamemode = *mode; intret(m_classicsp); });
  
@@ -192,14 +192,20 @@
 +    ICOMMAND(castmapvote, "i", (int *i),
 +    {
 +        if(!votecands.inrange(*i)) return;
++        if(votewinner[0]) { conoutf(CON_INFO, "\f4the vote is already over (winner: %s)", votewinner); return; }
 +        votecand &c = votecands[*i];
 +        if(c.saynum >= 0)   // MAPBATTLE: send the number as chat, but WITHOUT the local echo
 +        {                   // (the server eats it; this way the voter's own console stays clean too)
 +            defformatstring(num, "%d", c.saynum);
 +            addmsg(N_TEXT, "rcs", player1, num);
 +            copystring(myvotemap, c.map); myvotemode = c.mode;
++            conoutf(CON_INFO, "\f2vote sent for %s \f4(watch for the tally to confirm)", c.map);
 +        }
-+        else changemap(c.map, c.mode);   // stock: N_MAPVOTE
++        else
++        {
++            changemap(c.map, c.mode);   // stock: N_MAPVOTE
++            conoutf(CON_INFO, "\f2vote sent for %s", c.map);
++        }
 +    });
 +    ICOMMAND(_mapvoteparse, "s", (char *msg), parsevotemsg(msg)); // test: feed a raw server line
 +    // ----------------------------------------------------------------------------------------
@@ -207,7 +213,7 @@
      void changemap(const char *name, int mode) // request map change, server may ignore
      {
          if(!remote)
-@@ -603,7 +803,11 @@
+@@ -603,7 +809,11 @@
              server::forcemap(name, mode);
              if(!isconnected()) localconnect();
          }
@@ -220,7 +226,7 @@
      }
      void changemap(const char *name)
      {
-@@ -1392,6 +1596,7 @@
+@@ -1392,6 +1602,7 @@
                  fixmapname(text);
                  changemapserv(text, getint(p));
                  mapchanged = true;
@@ -228,7 +234,7 @@
                  if(getint(p)) entities::spawnitems();
                  else senditemstoserver = false;
                  break;
-@@ -1828,6 +2033,7 @@
+@@ -1828,6 +2039,7 @@
              case N_SERVMSG:
                  getstring(text, p);
                  conoutf("%s", text);
