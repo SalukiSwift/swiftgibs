@@ -10,4 +10,5 @@ vendor/sauer2020/**/*.o
 # Internal development docs — kept local, never published to the public repo
 docs/superpowers/
 docs/HANDOFF*
+docs/*handoff*
 docs/*playtest-checklist*
