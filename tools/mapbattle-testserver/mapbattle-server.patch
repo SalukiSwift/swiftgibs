@@ -1,0 +1,106 @@
+--- a/fpsgame/server.cpp
++++ b/fpsgame/server.cpp
+@@ -387,6 +387,7 @@
+     bool notgotitems = true;        // true when map has changed and waiting for clients to send item
+     int gamemode = 0;
+     int gamemillis = 0, gamelimit = 0, nextexceeded = 0, gamespeed = 100;
++    VAR(mbtestminutes, 1, 1, 10);   // MAPBATTLE test replica: match length in minutes
+     bool gamepaused = false, shouldstep = true;
+ 
+     string smapname = "";
+@@ -2041,7 +2042,7 @@
+ 
+         gamemode = mode;
+         gamemillis = 0;
+-        gamelimit = 10*60000;
++        gamelimit = mbtestminutes*60000;   // MAPBATTLE test replica: short matches
+         interm = 0;
+         nextexceeded = 0;
+         copystring(smapname, s);
+@@ -2244,6 +2245,53 @@
+         return true;
+     }
+ 
++    // === MAPBATTLE test replica: reproduces the RUGBY-family intermission vote flow ===
++    // (for testing the SwiftGibs map-vote panel locally; NOT shipped in any bundle)
++    const char *mbpool[6] = { "reissen", "earthstation", "luna", "forge", "campo", "metro" };
++    int mbpoolpos = 0;
++    string mbcand[3];
++    int mbvotes[3];
++    int mbclientvote[MAXCLIENTS];
++    bool mbactive = false;
++
++    void mbstart()
++    {
++        loopi(3) { copystring(mbcand[i], mbpool[(mbpoolpos + i) % 6]); mbvotes[i] = 0; }
++        mbpoolpos = (mbpoolpos + 1) % 6;
++        loopi(MAXCLIENTS) mbclientvote[i] = -1;
++        mbactive = true;
++        // deliberately ONE message with embedded newlines - the real server batches like this
++        sendservmsgf("[MAPBATTLE] Vote with a number:\n[MAPBATTLE] %s: (1) - %s: (2) - %s: (3)",
++            mbcand[0], mbcand[1], mbcand[2]);
++    }
++
++    void mbstart();
++    bool mbhandlesay(clientinfo *ci, const char *text)
++    {
++        if(ci && !mbactive && !strcmp(text, "startvote")) { mbstart(); return true; }
++        if(!mbactive || !ci) return false;
++        if(strlen(text) != 1 || text[0] < '1' || text[0] > '3') return false;
++        int pick = text[0] - '1', cn = ci->clientnum;
++        if(cn < 0 || cn >= MAXCLIENTS) return false;
++        if(mbclientvote[cn] >= 0) mbvotes[mbclientvote[cn]]--;
++        mbclientvote[cn] = pick;
++        mbvotes[pick]++;
++        sendservmsgf("[MAPBATTLE] %s: %d - %s: %d - %s: %d (Voted by %s)",
++            mbcand[0], mbvotes[0], mbcand[1], mbvotes[1], mbcand[2], mbvotes[2], colorname(ci));
++        return true;
++    }
++
++    void mbfinish()
++    {
++        if(!mbactive) return;
++        mbactive = false;
++        int best = 0;
++        loopi(3) if(mbvotes[i] > mbvotes[best]) best = i;
++        sendservmsgf("WINNER >> %s (%d votes)", mbcand[best], mbvotes[best]);
++        changemap(mbcand[best], gamemode);
++    }
++    // === end MAPBATTLE test replica ===
++
+     void checkintermission(bool force = false)
+     {
+         if(gamemillis >= gamelimit && !interm && (force || !checkovertime()))
+@@ -2251,7 +2299,8 @@
+             sendf(-1, 1, "ri2", N_TIMEUP, 0);
+             if(smode) smode->intermission();
+             changegamespeed(100);
+-            interm = gamemillis + 10000;
++            interm = gamemillis + 25000;
++            mbstart();
+         }
+     }
+ 
+@@ -2525,7 +2574,7 @@
+             {
+                 if(demorecord) enddemorecord();
+                 interm = -1;
+-                checkvotes(true);
++                if(mbactive) mbfinish(); else checkvotes(true);
+             }
+         }
+ 
+@@ -3274,11 +3323,13 @@
+ 
+             case N_TEXT:
+             {
++                int mbqlen = cq ? cq->messages.length() : 0;
+                 QUEUE_AI;
+                 QUEUE_MSG;
+                 getstring(text, p);
+                 filtertext(text, text, true, true);
+                 QUEUE_STR(text);
++                if(cq && mbhandlesay(cq, text)) { cq->messages.setsize(mbqlen); break; }   // vote eaten
+                 if(isdedicatedserver() && cq) logoutf("%s: %s", colorname(cq), text);
+                 break;
+             }
