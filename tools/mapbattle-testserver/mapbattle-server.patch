@@ -17,7 +17,7 @@
          interm = 0;
          nextexceeded = 0;
          copystring(smapname, s);
-@@ -2244,6 +2245,55 @@
+@@ -2244,6 +2245,60 @@
          return true;
      }
  
@@ -46,7 +46,12 @@
 +    void mbstart();
 +    bool mbhandlesay(clientinfo *ci, const char *text)
 +    {
-+        if(ci && !mbactive && !strcmp(text, "startvote")) { mbstart(); return true; }
++        if(ci && !strcmp(text, "startvote"))
++        {
++            if(!mbactive) mbstart();
++            else sendf(ci->clientnum, 1, "ris", N_SERVMSG, "[MAPBATTLE] a vote is already running");
++            return true;
++        }
 +        if(!mbactive || !ci) return false;
 +        if(strlen(text) != 1 || text[0] < '1' || text[0] > '3') return false;
 +        int pick = text[0] - '1', cn = ci->clientnum;
@@ -73,7 +78,7 @@
      void checkintermission(bool force = false)
      {
          if(gamemillis >= gamelimit && !interm && (force || !checkovertime()))
-@@ -2251,7 +2301,8 @@
+@@ -2251,7 +2306,8 @@
              sendf(-1, 1, "ri2", N_TIMEUP, 0);
              if(smode) smode->intermission();
              changegamespeed(100);
@@ -83,7 +88,7 @@
          }
      }
  
-@@ -2501,6 +2552,7 @@
+@@ -2501,6 +2557,7 @@
              }
          }
  
@@ -91,7 +96,7 @@
          while(bannedips.length() && bannedips[0].expire-totalmillis <= 0) bannedips.remove(0);
          loopv(connects) if(totalmillis-connects[i]->connectmillis>15000) disconnect_client(connects[i]->clientnum, DISC_TIMEOUT);
  
-@@ -2525,7 +2577,7 @@
+@@ -2525,7 +2582,7 @@
              {
                  if(demorecord) enddemorecord();
                  interm = -1;
@@ -100,7 +105,7 @@
              }
          }
  
-@@ -3274,11 +3326,13 @@
+@@ -3274,11 +3331,13 @@
  
              case N_TEXT:
              {
