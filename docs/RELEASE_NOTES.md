@@ -1,12 +1,15 @@
-# SwiftGibs v1.1.6
+# SwiftGibs v1.1.7
 
-Quick follow-up to v1.1.5 fixing the hit-marker system.
+Map votes without squinting at chat.
 
-## Fixed
+## New
 
-- **Hit markers no longer double-draw.** v1.1.5 layered the new overlay markers on top of the classic crosshair-swap. The classic swap is now its own style in the picker: choose **Off, Classic** (the original crosshair-swap, still the default), **X-flash, Ring-out,** or **Notch** - exactly one draws at a time.
-- **Slimmer X-flash and Notch.** Both overlay markers lost some weight so they read crisp instead of chunky.
-- **Classic previews too.** Auditioning Classic in the Cues tab now flashes the real crosshair-swap over the menu, like every other cue demo.
+- **Map-vote panel.** When a vote kicks off, SwiftGibs now builds a live panel: map thumbnails, running tallies, and a one-click **vote** button per map - no more decoding wall-of-text chat spam or typing numbers. A winner banner appears when the vote closes and the panel dismisses itself on map change. Works with two server flavours, auto-detected:
+  - **MAPBATTLE-style servers** (RUGBY and friends): the panel votes by quietly saying the right number for you.
+  - **Stock servers:** the panel tallies map suggestions and votes the proper way.
+
+  Open it with **V** during a vote, or turn on auto-open in Esc > options > SwiftGibs. Note for RUGBY-family servers: some only count votes from players who are actually playing - if your vote isn't tallying, frag someone first.
+- **Zoom: hold or toggle.** New option in the SwiftGibs tab (Aim section): keep the stock click-to-toggle zoom (default) or switch to hold-to-zoom, where MOUSE2/G/Z zoom only while held. Deep zoom is unaffected and stays hold-to-use.
 
 ## Download
 
