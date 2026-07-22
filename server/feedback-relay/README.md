@@ -14,7 +14,7 @@ Flow: game `sendfeedback` -> salukiswift.com:8300/feedback (nginx) ->
 
 (needs flask; no network - the GitHub call is stubbed)
 
-## Deploy (Hetzner box)
+## Deploy (the salukiswift.com VPS)
 
     mkdir -p /opt/swiftgibs-feedback
     cp app.py /opt/swiftgibs-feedback/

@@ -268,7 +268,7 @@
 +                hudshader->set();
 +                return;
 +            }
-+            case 4: return;   // slot unused (Heartbeat scrapped by April 2026-07-20; Sweep before it)
++            case 4: return;   // slot unused (Heartbeat scrapped by Swift 2026-07-20; Sweep before it)
 +            case 5: // Orbit -- a comet laps the crosshair once per beat, spiralling inward
 +            {
 +                float R = 150.0f - 44.0f * idx - 44.0f * t;           // collapses across the countdown

@@ -21,7 +21,7 @@ mkdir -p "$OUT"
 FF="ffmpeg -y -loglevel error"
 
 # (hit_tf2, hit_quake and hit_cod are real game rips now -- committed directly, not
-#  synthesized. The Unreal slot was removed entirely -- no source audio and April cut it.)
+#  synthesized. The Unreal slot was removed entirely -- no source audio and Swift cut it.)
 
 # --- hit_custom1: satisfying rising synth ping (perfect-fifth two-tone) ---
 $FF -f lavfi -i "sine=f=660:d=0.05" -f lavfi -i "sine=f=990:d=0.08" \
