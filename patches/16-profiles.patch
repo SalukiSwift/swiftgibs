@@ -1,0 +1,56 @@
+--- a/fpsgame/fps.cpp
++++ b/fpsgame/fps.cpp
+@@ -581,6 +581,53 @@
+     ICOMMAND(numplayers, "", (), intret(players.length()));
+     ICOMMAND(getplayername, "i", (int *i), result(players.inrange(*i) ? players[*i]->name : ""));
+ 
++    // === SwiftGibs preferences profiles (Task 3): named save/load/delete slots for the
++    // full settings set. The canonical list of ident names lives in CubeScript (overlay
++    // alias sgProfileVars) so it can be edited without touching the engine; C++ only
++    // sanitises the profile name and writes the correct syntax per ident type (VARP vs
++    // alias), mirroring how the stock engine's writecfg() persists config.cfg. Loading
++    // needs no C++ (just `exec profiles/<name>.cfg`); listing reuses the stock loopfiles
++    // ICOMMAND directly from CubeScript.
++    bool validprofilename(const char *name)
++    {
++        if(!name || !name[0]) return false;
++        for(const char *s = name; *s; s++) if(!iscubealnum(*s) && *s!='-' && *s!='_') return false;
++        return true;
++    }
++    ICOMMAND(saveprofile, "s", (char *name),
++    {
++        if(!validprofilename(name)) { conoutf("invalid profile name: use letters, numbers, - and _ only"); return; }
++        const char *varlist = getalias("sgProfileVars");
++        if(!varlist || !varlist[0]) { conoutf("saveprofile: sgProfileVars not defined"); return; }
++        vector<char *> names;
++        explodelist(varlist, names);
++        defformatstring(fname, "profiles/%s.cfg", name);
++        stream *f = openutf8file(path(fname, true), "w");
++        if(!f) { conoutf("could not write profile: %s", name); names.deletearrays(); return; }
++        f->printf("// SwiftGibs profile: %s (auto-written by saveprofile)\n\n", name);
++        loopv(names)
++        {
++            ident *id = getident(names[i]);
++            if(!id) continue;
++            switch(id->type)
++            {
++                case ID_VAR:   f->printf("%s %d\n", names[i], *id->storage.i); break;
++                case ID_FVAR:  f->printf("%s %s\n", names[i], floatstr(*id->storage.f)); break;
++                case ID_ALIAS: f->printf("%s = [%s]\n", names[i], id->getstr()); break;
++            }
++        }
++        delete f;
++        names.deletearrays();
++        conoutf("profile %s saved", name);
++    });
++    ICOMMAND(delprofile, "s", (char *name),
++    {
++        if(!validprofilename(name)) { conoutf("invalid profile name: use letters, numbers, - and _ only"); return; }
++        defformatstring(fname, "profiles/%s.cfg", name);
++        remove(findfile(path(fname, true), "rb"));
++        conoutf("profile %s deleted", name);
++    });
++
+     void killed(fpsent *d, fpsent *actor)
+     {
+         if(d->state==CS_EDITING)
