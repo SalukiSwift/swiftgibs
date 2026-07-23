@@ -36,7 +36,7 @@ leftovers = [
     b'guicheckbox "bilinear filtering"',
     b'guicheckbox "chat console" miniconfilter',
 ]
-pointer = b'guitext "^f4player brightness is managed in the SwiftGibs tabs"'
+pointer = b'guitext "^f4player brightness is tuned for SwiftGibs flat colours"'
 ok = all(b.count(pat) == 0 for pat in leftovers) and b.count(pointer) >= 1
 sys.exit(0 if ok else 1)
 PY
@@ -102,7 +102,7 @@ surgeries = [
         b'        ]',
         b'    ]',
     ), block(
-        b'    guitext "^f4player brightness is managed in the SwiftGibs tabs"',
+        b'    guitext "^f4player brightness is tuned for SwiftGibs flat colours"',
     )),
     ("game tab: forceplayermodels checkbox removed (keep teamskins)", block(
         b'    guilist [',
