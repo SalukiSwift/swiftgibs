@@ -1,6 +1,6 @@
 --- a/fpsgame/fps.cpp
 +++ b/fpsgame/fps.cpp
-@@ -581,6 +581,53 @@
+@@ -581,6 +581,59 @@
      ICOMMAND(numplayers, "", (), intret(players.length()));
      ICOMMAND(getplayername, "i", (int *i), result(players.inrange(*i) ? players[*i]->name : ""));
  
@@ -50,6 +50,12 @@
 +        remove(findfile(path(fname, true), "rb"));
 +        conoutf("profile %s deleted", name);
 +    });
++    // Exposed to CubeScript so the profiles gui can skip rendering rows for files
++    // whose names do not conform to the saveprofile charset (defence in depth: filenames on
++    // disk are not guaranteed to have been written by saveprofile - a downloaded profile
++    // pack or manual copy could contain CubeScript metacharacters, which would otherwise be
++    // baked verbatim into a clickable guibutton action and executed on click).
++    ICOMMAND(profilenamevalid, "s", (char *name), intret(validprofilename(name) ? 1 : 0));
 +
      void killed(fpsent *d, fpsent *actor)
      {
