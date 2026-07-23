@@ -26,7 +26,7 @@
          if(!maptime) { maptime = lastmillis; maprealtime = totalmillis; return; }
          if(!curtime) { gets2c(); if(player1->clientnum>=0) c2sinfo(); return; }
  
-@@ -398,6 +414,46 @@
+@@ -398,6 +414,81 @@
      int respawncountat[3] = { -1, -1, -1 };      // lastmillis timestamps; -1 = not scheduled this death
      bool respawncountfired[3] = { false, false, false };
  
@@ -70,10 +70,45 @@
 +    bool squadactive() { return squadsess.state == SQUADSTATE_ACTIVE; }        // window visually open (past the cut-in) - gates doattack()'s fire-vs-respawn branch
 +    bool squadsessionopen() { return squadsess.state != SQUADSTATE_NONE; }     // a session exists at all (pending OR active) - gates the checkautorespawn() hold (amendment 1: the hold covers the pre-cut-in beat too)
 +
++    // === SwiftGibs Reverse Firing Squad (Task 2, ADR-0003): the dummy pool - lazily-
++    // allocated, session-lifetime fpsents (memory-resident once created, per the PRD's
++    // zero-hitch requirement), fixed size SQUADSIZE (amendment 3: always exactly 3, no
++    // ladder). fpsgame/render.cpp's squadrender() (Task 2, engine-visible via
++    // shared/igame.h) reads this pool through the three accessors below rather than a
++    // new shared header, since it's fpsgame-internal-only cross-file state (same module,
++    // no engine visibility needed). Each dead flag resets in squadenter() below, so every
++    // new session starts with a fresh line of 3; Task 3's hitscan will be the only thing
++    // that ever sets one true. ===
++    fpsent *squadpoolents[SQUADSIZE] = { NULL, NULL, NULL };
++    bool squaddead[SQUADSIZE] = { false, false, false };
++    // ADR-0003 placement: the arena's own "forward" reference direction - the yaw the
++    // player was looking at the instant the void cut in (snapshotted in squadupdate()'s
++    // PENDING->ACTIVE transition below), NOT re-sampled every frame. The dummy line is
++    // placed relative to this fixed direction so it stays put in arena space while the
++    // player's live yaw/pitch (camera1, driven by ordinary mouse look) freely looks
++    // around it - see fpsgame/render.cpp squadrender().
++    float squadfacingyaw = 0;
++
++    int squadpoolsize() { return SQUADSIZE; }
++
++    fpsent *squadpoolent(int idx)
++    {
++        if(!squadpoolents[idx])
++        {
++            fpsent *d = new fpsent;   // ctor already zeroes health/armour/quadmillis/lastaction/lasttaunt etc. via its own respawn() call
++            d->gunselect = GUN_RIFLE;                     // ADR-0003: visibly holding the instagib rifle, matching real enemies
++            d->light.dir = vec(0, -1, 2).normalize();     // ADR-0001/0003: explicit flat-white entitylight, same as renderplayerpreview
++            squadpoolents[idx] = d;
++        }
++        return squadpoolents[idx];
++    }
++
++    bool squadpooldead(int idx) { return squaddead[idx]; }
++
      // inputs
  
      VARP(attackspawn, 0, 1, 1);
-@@ -405,7 +461,14 @@
+@@ -405,7 +496,14 @@
      void doattack(bool on)
      {
          if(!connected || intermission) return;
@@ -89,7 +124,7 @@
      }
  
      VARP(jumpspawn, 0, 1, 1);
-@@ -413,6 +476,15 @@
+@@ -413,6 +511,15 @@
      bool canjump()
      {
          if(!connected || intermission) return false;
@@ -105,7 +140,7 @@
          if(jumpspawn) respawn();
          return player1->state!=CS_DEAD;
      }
-@@ -594,6 +666,14 @@
+@@ -594,6 +701,14 @@
                      respawncountfired[i] = true;
                  }
              }
@@ -120,7 +155,7 @@
          }
          else
          {
-@@ -749,6 +829,9 @@
+@@ -749,6 +864,9 @@
          else
          {
              intermission = true;
@@ -130,7 +165,7 @@
              player1->attacking = false;
              if(cmode) cmode->gameover();
              conoutf(CON_GAMEINFO, "\f2intermission:");
-@@ -840,6 +923,10 @@
+@@ -840,6 +958,10 @@
  
      void startgame()
      {
@@ -141,7 +176,7 @@
          clearmovables();
          clearmonsters();
  
-@@ -1782,13 +1869,93 @@
+@@ -1782,13 +1904,98 @@
              respawnreadyfired = true;
              if(respawnreadysound) playsoundname("swiftgibs/respawnready");
          }
@@ -187,6 +222,7 @@
 +        squadsess.kills = 0;
 +        squadsess.cleared = false;
 +        squadsess.lastfire = -1000000;
++        loopi(SQUADSIZE) squaddead[i] = false;   // SwiftGibs Task 2 (ADR-0003): fresh line of 3 every session
 +    }
 +
 +    void squadexit(int reason)
@@ -218,7 +254,11 @@
 +            squadexit(SQUADEND_ABORT);
 +            return;
 +        }
-+        if(squadsess.state == SQUADSTATE_PENDING && lastmillis >= squadsess.start) squadsess.state = SQUADSTATE_ACTIVE;
++        if(squadsess.state == SQUADSTATE_PENDING && lastmillis >= squadsess.start)
++        {
++            squadsess.state = SQUADSTATE_ACTIVE;
++            squadfacingyaw = player1->yaw;   // ADR-0003: snapshot once, right as the void appears
++        }
 +        if(lastmillis >= squadsess.end) squadexit(SQUADEND_TIMEOUT);
 +    }
 +
@@ -236,3 +276,211 @@
      // === SwiftGibs reload metronome (audio tick/ding over the rifle reload) ===
      VARP(reloadmetronome, 0, 0, 2);      // 0=off, 1=flat, 2=rising
      VARP(reloadmetrovol, 0, 200, 255);   // playsound volume (0..255; 255=full)
+@@ -1950,7 +2157,13 @@
+     int selectcrosshair(vec &color)
+     {
+         fpsent *d = hudplayer();
+-        if(d->state==CS_SPECTATOR || d->state==CS_DEAD) return -1;
++        // SwiftGibs Reverse Firing Squad (Task 2): the squad plays out entirely while
++        // player1->state==CS_DEAD (ADR-0002) - stock code hides the crosshair for any
++        // non-alive state, which would leave the squad-view pass with nothing to aim
++        // with. Exempt the active squad window only (falls through to the plain
++        // default crosshair below, same as any other non-alive state); ordinary
++        // death/spectator are unaffected.
++        if((d->state==CS_SPECTATOR || d->state==CS_DEAD) && !squadactive()) return -1;
+ 
+         if(d->state!=CS_ALIVE) return 0;
+ 
+--- a/fpsgame/render.cpp
++++ b/fpsgame/render.cpp
+@@ -512,6 +512,53 @@
+         renderplayer(previewent, *mdlinfo, team >= 0 && team <= 2 ? team : 0, 1, false);
+     }
+ 
++    // === SwiftGibs Reverse Firing Squad (Task 2, ADR-0001/0003): squad-view render pass.
++    // Called from engine::gl_drawframe (via shared/igame.h) while game::squadactive() -
++    // see engine/rendergl.cpp's squadview:: namespace, which has already swapped camera1
++    // to the arena eye position by the time this runs. Draws the pooled dummy fpsents
++    // (Task 2, fpsgame/fps.cpp) through the exact same renderplayer() the real match
++    // uses (team 2 -> flat-red skin, ADR-0003), skipping any already-dead member. The
++    // dummy pool itself (squadpoolsize()/squadpoolent()/squadpooldead()) is defined in
++    // fps.cpp, alongside the session it belongs to - forward-declared here rather than
++    // added to fpsgame/game.h, since render.cpp is the only other file that needs them
++    // (Task 2 brief keeps this patch's touched files to
++    // fps.cpp/render.cpp/rendergl.cpp/igame.h). ===
++    extern int squadpoolsize();
++    extern fpsent *squadpoolent(int idx);
++    extern bool squadpooldead(int idx);
++    extern float squadfacingyaw;
++
++    VAR(squaddummydistance, 1, 40, 1000);   // ADR-0003 placement: distance from the arena eye, engine units (Task 5 tunable)
++    VAR(squaddummyspacing, 1, 12, 1000);    // ADR-0003 placement: spacing between adjacent dummies, engine units (Task 5 tunable)
++
++    void squadrender()
++    {
++        int n = squadpoolsize();
++        startmodelbatches();
++        loopi(n)
++        {
++            if(squadpooldead(i)) continue;   // ADR-0003: a killed member is skipped by the render
++            fpsent *d = squadpoolent(i);
++            float xoffset = (i - (n - 1)/2.0f) * squaddummyspacing;
++            // ADR-0003: placed relative to the arena's fixed facing (squadfacingyaw,
++            // snapshotted once at cut-in - fpsgame/fps.cpp), not the live camera yaw
++            // (which the player freely mouse-looks with) - otherwise the line would
++            // chase the player's view instead of standing still to be aimed at.
++            vec fwd(-sinf(squadfacingyaw*RAD), cosf(squadfacingyaw*RAD), 0);
++            vec right(cosf(squadfacingyaw*RAD), sinf(squadfacingyaw*RAD), 0);
++            d->o = vec(camera1->o).add(vec(fwd).mul(squaddummydistance)).add(vec(right).mul(xoffset));
++            float yaw, pitch;
++            vectoyawpitch(vec(camera1->o).sub(d->o), yaw, pitch);   // ADR-0003: centred line facing the camera (arena) origin
++            d->yaw = yaw;
++            d->pitch = 0;
++            d->light.color = vec(1, 1, 1);
++            d->light.dir = vec(0, -1, 2).normalize();
++            d->light.millis = -1;                                   // ADR-0001: explicit flat-white entitylight, same pattern as renderplayerpreview above
++            renderplayer(d, getplayermodelinfo(d), 2, 1, false);    // team 2 -> flat-red skin (ADR-0003), same renderer real enemies use
++        }
++        endmodelbatches();
++    }
++
+     vec hudgunorigin(int gun, const vec &from, const vec &to, fpsent *d)
+     {
+         if(d->muzzle.x >= 0) return d->muzzle;
+--- a/engine/rendergl.cpp
++++ b/engine/rendergl.cpp
+@@ -1861,6 +1861,82 @@
+ 
+ int xtraverts, xtravertsva;
+ 
++// SwiftGibs Reverse Firing Squad (Task 2, ADR-0001): a modelpreview-style camera/
++// projection/clear-colour swap for the squad-view pass, mirroring the modelpreview::
++// namespace above but full-screen, off-white, and driven by the player's own live
++// yaw/pitch (camera1's, preserved from before the swap) instead of an auto-rotating
++// menu preview. See docs/adr/0001-squad-arena-as-overlay-scene-not-map-swap.md.
++VAR(squadeyeheight, 1, 14, 100);   // arena eye height, engine units (brief default 14u; Task 5 tunable)
++
++namespace squadview
++{
++    physent *oldcamera;
++    physent camera;
++
++    float oldaspect, oldfovy, oldfov;
++    int oldfarplane;
++    matrix4 oldprojmatrix;
++
++    void start()
++    {
++        drawtex = DRAWTEX_MODELPREVIEW;   // strips MDL_LIGHT in renderclient() -> explicit entitylight only, no octree light sampling (ADR-0001)
++
++        oldcamera = camera1;
++        camera = *camera1;
++        camera.reset();
++        camera.type = ENT_CAMERA;
++        camera.o = vec(0, 0, squadeyeheight);
++        camera.yaw = oldcamera->yaw;     // player's live view direction drives the squad camera
++        camera.pitch = oldcamera->pitch;
++        camera.roll = 0;
++        camera1 = &camera;
++
++        oldaspect = aspect;
++        oldfovy = fovy;
++        oldfov = curfov;
++        oldfarplane = farplane;
++        oldprojmatrix = projmatrix;
++
++        aspect = forceaspect ? forceaspect : screenw/float(screenh);
++        curfov = fov;
++        fovy = 2*atan2(tan(curfov/2*RAD), aspect)/RAD;
++        farplane = 1024;
++
++        clearfogdist();
++        zerofogcolor();
++        glClearColor(242/255.0f, 242/255.0f, 242/255.0f, 1);   // PRD off-white void, ~#f2f2f2
++
++        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
++
++        projmatrix.perspective(fovy, aspect, nearplane, farplane);
++        setcamprojmatrix();
++
++        glEnable(GL_CULL_FACE);
++        glEnable(GL_DEPTH_TEST);
++    }
++
++    void end()
++    {
++        glDisable(GL_CULL_FACE);
++        glDisable(GL_DEPTH_TEST);
++
++        resetfogdist();
++        resetfogcolor();
++        glClearColor(curfogcolor.r, curfogcolor.g, curfogcolor.b, 1);
++
++        aspect = oldaspect;
++        fovy = oldfovy;
++        curfov = oldfov;
++        farplane = oldfarplane;
++
++        camera1 = oldcamera;
++        drawtex = 0;
++
++        projmatrix = oldprojmatrix;
++        setcamprojmatrix();
++    }
++}
++
+ void gl_drawframe()
+ {
+     if(deferdrawtextures) drawtextures();
+@@ -1890,6 +1966,20 @@
+         aspect += blend*sinf(lastmillis/1000.0+M_PI)*0.1f;
+     }
+ 
++    // SwiftGibs Reverse Firing Squad (Task 2, ADR-0001): skip the world render entirely
++    // this frame and run the squad-view pass instead - the match world (octree, VAs,
++    // lightmaps, entity state) is never touched, so pop-in/pop-out cost nothing more
++    // than this one branch. The HUD pass below is untouched either way.
++    if(game::squadactive())
++    {
++        xtravertsva = xtraverts = glde = gbatches = 0;
++        squadview::start();
++        game::squadrender();
++        renderparticles(true);   // gib effects appear in-scene (ADR-0001)
++        squadview::end();
++        goto squaddone;
++    }
++
+     farplane = worldsize*2;
+ 
+     projmatrix.perspective(fovy, aspect, nearplane, farplane);
+@@ -1943,12 +2033,15 @@
+ 
+     renderparticles(true);
+ 
++    squaddone:
+     glDisable(GL_CULL_FACE);
+     glDisable(GL_DEPTH_TEST);
+ 
+     addmotionblur();
+     addglare();
+-    if(isliquid(fogmat&MATF_VOLUME)) drawfogoverlay(fogmat, fogblend, abovemat);
++    // SwiftGibs Task 2: never overlay real-world water-fog tint on the squad void (e.g. a
++    // death that happened underwater) - squadview:: already zeroed fog for this frame.
++    if(!game::squadactive() && isliquid(fogmat&MATF_VOLUME)) drawfogoverlay(fogmat, fogblend, abovemat);
+     renderpostfx();
+ 
+     gl_drawhud();
+--- a/shared/igame.h
++++ b/shared/igame.h
+@@ -76,6 +76,11 @@
+     extern void rendergame(bool mainpass);
+     extern void renderavatar();
+     extern void renderplayerpreview(int model, int team, int weap);
++    // SwiftGibs Reverse Firing Squad (Task 2): gl_drawframe asks the game module whether
++    // to render the squad view this frame (ADR-0001) and, if so, draws the dummy pool.
++    // See docs/adr/0001-squad-arena-as-overlay-scene-not-map-swap.md.
++    extern bool squadactive();
++    extern void squadrender();
+     extern void writegamedata(vector<char> &extras);
+     extern void readgamedata(vector<char> &extras);
+     extern int clipconsole(int w, int h);
