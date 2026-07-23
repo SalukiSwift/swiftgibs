@@ -1,6 +1,23 @@
 --- a/fpsgame/fps.cpp
 +++ b/fpsgame/fps.cpp
-@@ -238,9 +238,25 @@
+@@ -1,6 +1,16 @@
+ #include "game.h"
+ #include "texture.h"
+ 
++// SwiftGibs Reverse Firing Squad (Task 3, ADR-0003): squadeyeheight is a plain global
++// tunable defined in engine/rendergl.cpp (Task 2's squadview:: camera swap) at file
++// scope, not inside `namespace game` and not declared in any shared header. The
++// virtual rifle's hitscan ray origin must match the squad camera's arena position
++// exactly (both are "arena origin at eye height"), so this extern is declared here,
++// OUTSIDE namespace game (matching the real symbol's global-namespace linkage) rather
++// than inside it below (which would declare a distinct, unlinkable game::squadeyeheight
++// that could never link against the real definition).
++extern int squadeyeheight;
++
+ namespace game
+ {
+     bool intermission = false;
+@@ -238,9 +248,25 @@
  
      void updatereloadmetronome();
      void checkautorespawn();   // SwiftGibs Task 7: defined below, after the cue-demo helpers it checks
@@ -26,7 +43,7 @@
          if(!maptime) { maptime = lastmillis; maprealtime = totalmillis; return; }
          if(!curtime) { gets2c(); if(player1->clientnum>=0) c2sinfo(); return; }
  
-@@ -398,6 +414,81 @@
+@@ -398,6 +424,90 @@
      int respawncountat[3] = { -1, -1, -1 };      // lastmillis timestamps; -1 = not scheduled this death
      bool respawncountfired[3] = { false, false, false };
  
@@ -49,23 +66,32 @@
 +                                            // the Task 1 fire stub below, real hitscan is Task 3)
 +
 +    enum { SQUADSTATE_NONE = 0, SQUADSTATE_PENDING, SQUADSTATE_ACTIVE };
-+    enum { SQUADEND_TIMEOUT = 0, SQUADEND_BAIL, SQUADEND_ABORT };
++    // SwiftGibs Task 3: SQUADEND_CLEARED is new (additive - 0/1/2 keep their Task 1
++    // identity) - a distinct reason from SQUADEND_TIMEOUT so a full clear that closes
++    // the session itself (squadfire()'s grace beat, below) is never confused with the
++    // window simply running out. squadexit()'s result-line text keys off `cleared`
++    // (kills>=SQUADSIZE), not `reason`, so this is bookkeeping/clarity, not load-bearing
++    // for the message itself - see squadexit() below.
++    enum { SQUADEND_TIMEOUT = 0, SQUADEND_BAIL, SQUADEND_ABORT, SQUADEND_CLEARED };
 +    static const int SQUADENTRYBEAT = 400;   // PRD: brief beat to register the death as normal
 +    static const int SQUADSIZE = 3;          // amendment 3: fixed squad size, no ladder/progression
++    static const int SQUADCLEARGRACE = 400;  // Task 3: beat between the 3rd kill and squadexit(SQUADEND_CLEARED) - long enough for the final gibeffect/particles to actually render before the void disappears
 +
 +    struct squadsession
 +    {
 +        int state;       // SQUADSTATE_*
 +        int start;       // lastmillis the void cuts in (death + SQUADENTRYBEAT)
 +        int end;         // lastmillis the window locks (death + max(cmode wait, squadwindow))
-+        int kills;       // squad kills this session (Task 3 increments; always 0 in Task 1)
++        int kills;       // squad kills this session (Task 3 increments)
 +        bool cleared;    // kills reached SQUADSIZE by the time the session ended - read by
 +                         // Task 4's end-of-session result line; persists after state resets
 +                         // to NONE, until the next squadenter() overwrites it
 +        int lastreason;  // SQUADEND_* passed to the most recent squadexit(), same persistence
-+        int lastfire;    // lastmillis of the last squadfire() stub call, for the cooldown
++        int lastfire;    // lastmillis of the last squadfire() call, for the cooldown
++        int clearedat;   // Task 3: lastmillis of the killing 3rd blow, -1 if not yet cleared -
++                         // drives the SQUADCLEARGRACE close in squadupdate()
 +    };
-+    squadsession squadsess = { SQUADSTATE_NONE, 0, 0, 0, false, -1, -1000000 };
++    squadsession squadsess = { SQUADSTATE_NONE, 0, 0, 0, false, -1, -1000000, -1 };
 +
 +    bool squadactive() { return squadsess.state == SQUADSTATE_ACTIVE; }        // window visually open (past the cut-in) - gates doattack()'s fire-vs-respawn branch
 +    bool squadsessionopen() { return squadsess.state != SQUADSTATE_NONE; }     // a session exists at all (pending OR active) - gates the checkautorespawn() hold (amendment 1: the hold covers the pre-cut-in beat too)
@@ -108,7 +134,7 @@
      // inputs
  
      VARP(attackspawn, 0, 1, 1);
-@@ -405,7 +496,14 @@
+@@ -405,7 +515,14 @@
      void doattack(bool on)
      {
          if(!connected || intermission) return;
@@ -124,7 +150,7 @@
      }
  
      VARP(jumpspawn, 0, 1, 1);
-@@ -413,6 +511,15 @@
+@@ -413,6 +530,15 @@
      bool canjump()
      {
          if(!connected || intermission) return false;
@@ -140,7 +166,7 @@
          if(jumpspawn) respawn();
          return player1->state!=CS_DEAD;
      }
-@@ -594,6 +701,14 @@
+@@ -594,6 +720,14 @@
                      respawncountfired[i] = true;
                  }
              }
@@ -155,7 +181,7 @@
          }
          else
          {
-@@ -749,6 +864,9 @@
+@@ -749,6 +883,9 @@
          else
          {
              intermission = true;
@@ -165,7 +191,7 @@
              player1->attacking = false;
              if(cmode) cmode->gameover();
              conoutf(CON_GAMEINFO, "\f2intermission:");
-@@ -840,6 +958,10 @@
+@@ -840,6 +977,10 @@
  
      void startgame()
      {
@@ -176,7 +202,7 @@
          clearmovables();
          clearmonsters();
  
-@@ -1782,13 +1904,98 @@
+@@ -1782,13 +1923,189 @@
              respawnreadyfired = true;
              if(respawnreadysound) playsoundname("swiftgibs/respawnready");
          }
@@ -222,6 +248,7 @@
 +        squadsess.kills = 0;
 +        squadsess.cleared = false;
 +        squadsess.lastfire = -1000000;
++        squadsess.clearedat = -1;   // SwiftGibs Task 3: no clear pending yet this session
 +        loopi(SQUADSIZE) squaddead[i] = false;   // SwiftGibs Task 2 (ADR-0003): fresh line of 3 every session
 +    }
 +
@@ -236,6 +263,16 @@
 +        squadsess.cleared = squadsess.kills >= SQUADSIZE;
 +        squadsess.lastreason = reason;
 +        squadsess.state = SQUADSTATE_NONE;
++        // SwiftGibs Task 3 (design spec: "all-3-dead ends the session with a cleared
++        // result line; window end = failed result line"): a full clear always prints the
++        // cleared line, however the session actually closed (the SQUADCLEARGRACE exit in
++        // squadupdate() below, or a natural window-end SQUADEND_TIMEOUT landing in the
++        // very same frame as the 3rd kill - `cleared` is the source of truth here, not
++        // `reason`). An incomplete wave only prints on a natural SQUADEND_TIMEOUT
++        // ("window end without clear"); a deliberate SQUADEND_BAIL (jump) or an external
++        // SQUADEND_ABORT (map change/disconnect/etc.) stay silent - no result to report.
++        if(squadsess.cleared) conoutf(CON_GAMEINFO, "squad cleared: %d/%d", squadsess.kills, SQUADSIZE);
++        else if(reason == SQUADEND_TIMEOUT) conoutf(CON_GAMEINFO, "squad survived: you got %d/%d", squadsess.kills, SQUADSIZE);
 +    }
 +
 +    void squadupdate()
@@ -259,24 +296,104 @@
 +            squadsess.state = SQUADSTATE_ACTIVE;
 +            squadfacingyaw = player1->yaw;   // ADR-0003: snapshot once, right as the void appears
 +        }
++        // SwiftGibs Task 3: all-3-dead grace beat. squadfire() stamps clearedat on the
++        // killing 3rd blow rather than closing the session synchronously, so the final
++        // gibeffect/particles get at least one squad-view render pass before the void
++        // disappears (brief: "if instant exit would cut the final gib, a short grace
++        // beat is acceptable" - SQUADCLEARGRACE, 400ms, same order as SQUADENTRYBEAT).
++        // Checked ahead of the window-end check below so a clear landing just before
++        // squadsess.end still gets its own grace beat rather than being swallowed by the
++        // window closing first (and even if the window DOES close first in the same
++        // frame, squadexit()'s message logic keys off `cleared`, not `reason`, so the
++        // printed wording is correct either way).
++        if(squadsess.clearedat >= 0 && lastmillis - squadsess.clearedat >= SQUADCLEARGRACE)
++        {
++            squadexit(SQUADEND_CLEARED);
++            return;
++        }
 +        if(lastmillis >= squadsess.end) squadexit(SQUADEND_TIMEOUT);
 +    }
 +
++    // SwiftGibs Reverse Firing Squad (Task 3, ADR-0003): tunables for the virtual rifle's
++    // cosmetic feedback. SQUADGIBDAMAGE only feeds gibeffect() (dummies have no health) -
++    // chosen to match a real instagib kill (weapon.cpp's guns[] table: GUN_RIFLE damage
++    // 100; game.h's m_insta spawnstate(): 1hp spawn health -> a real kill's effective
++    // "damage" is max(-health,0) = 99) so the gib looks identical to a real frag rather
++    // than an arbitrary number. SQUADRAYLEN matches engine/rendergl.cpp squadview::'s own
++    // farplane (1024) - comfortably past any dummy at squaddummydistance.
++    static const int SQUADGIBDAMAGE = 99;
++    static const float SQUADRAYLEN = 1024.0f;
++
 +    void squadfire()
 +    {
-+        // Stub for Task 1: proves input ownership only (doattack() calls here instead of
-+        // respawn() while the window is visually active). Real hitscan against the
-+        // pooled dummy fpsents and kill accounting arrive in Task 3 (ADR-0003); this only
-+        // exercises the squadfirerate cooldown so the VARP is meaningfully wired from day
-+        // one rather than sitting inert.
++        // Edge-triggered cooldown from Task 1 - unchanged, still gates every call here.
 +        if(lastmillis - squadsess.lastfire < squadfirerate) return;
 +        squadsess.lastfire = lastmillis;
++
++        // ADR-0003: ray "from the squad camera through the live view direction". The
++        // squad camera (engine/rendergl.cpp's squadview::, Task 2) only exists as a
++        // transient camera1 swap *inside* gl_drawframe(), already reverted by the time
++        // this game-logic-tick function runs, so the ray is rebuilt independently here
++        // from the same "arena origin at eye height" squadview::start() itself uses
++        // (squadeyeheight, extern'd above - Task 2's own tunable, kept in sync rather
++        // than duplicating the constant) and the player's LIVE yaw/pitch (player1->yaw/
++        // pitch - the same live values squadview::start() copies from camera1==player1;
++        // NOT squadfacingyaw, which is the frozen direction the dummy line itself faces).
++        vec from(0, 0, float(squadeyeheight));
++        vec dir;
++        vecfromyawpitch(player1->yaw, player1->pitch, 1, 0, dir);
++        vec to = vec(dir).mul(SQUADRAYLEN).add(from);
++
++        // ADR-0003: "test vs ALIVE pool members with the same bbox intersect() the real
++        // rifle uses" - NOT intersectclosest(), which walks numdynents()/iterdynents(),
++        // the real client/bot entity list the squad dummies are deliberately never part
++        // of (ADR-0003's consequences: "squad members can never be confused with real
++        // clients"). Same closest-hit pattern as intersectclosest(), just over the pool.
++        extern bool intersect(dynent *d, const vec &from, const vec &to, float &dist);
++        int best = -1;
++        float bestdist = 1e16f;
++        loopi(SQUADSIZE)
++        {
++            if(squaddead[i]) continue;
++            float dist;
++            if(intersect(squadpoolent(i), from, to, dist) && dist < bestdist)
++            {
++                best = i;
++                bestdist = dist;
++            }
++        }
++        if(best < 0) return;   // miss: no side effect beyond the cooldown stamp above (time cost only)
++
++        // Hit: one shot, one kill - mark dead (Task 2's render already skips dead pool
++        // members), gib at the dummy's position, hit-sound + hit-marker via the exact
++        // patch-12 pathway (fpsgame/weapon.cpp's hit()), kills++.
++        squaddead[best] = true;
++        squadsess.kills++;
++
++        fpsent *target = squadpoolent(best);
++        extern void gibeffect(int damage, const vec &vel, fpsent *d);
++        gibeffect(SQUADGIBDAMAGE, vec(0, 0, 0), target);   // vel is unused inside spawnbouncer() (verified against weapon.cpp) - a static dummy has no physics velocity to report anyway
++
++        // Patch-12 hit-sound + hit-marker pathway, verbatim (mirrors fpsgame/weapon.cpp's
++        // hit()): hitsound/hitsoundvol/hitsoundpitch/hitsndname()/lasthit/
++        // triggerhitmarker() are all defined earlier in this same file (patch 12's
++        // fps.cpp hunk, above squadfire()), so no extern is needed here.
++        if(hitsound && lasthit != lastmillis && hitsoundvol>0) playsoundpitched(hitsndname(), hitsoundvol, hitsoundpitch, NULL);
++        lasthit = lastmillis;
++        triggerhitmarker(SQUADGIBDAMAGE);
++
++        // amendment 3 / this task: all 3 dead ends the session - but not synchronously.
++        // An instant squadexit() here would flip squadactive() false before this frame's
++        // gibeffect/particles ever get a render pass, cutting the final kill's gib.
++        // Just mark the moment; squadupdate() closes the session SQUADCLEARGRACE ms
++        // later, once the gib has had a moment on screen (see squadupdate() below).
++        if(squadsess.kills >= SQUADSIZE && squadsess.clearedat < 0) squadsess.clearedat = lastmillis;
 +    }
 +
      // === SwiftGibs reload metronome (audio tick/ding over the rifle reload) ===
      VARP(reloadmetronome, 0, 0, 2);      // 0=off, 1=flat, 2=rising
      VARP(reloadmetrovol, 0, 200, 255);   // playsound volume (0..255; 255=full)
-@@ -1950,7 +2157,13 @@
+@@ -1950,7 +2267,13 @@
      int selectcrosshair(vec &color)
      {
          fpsent *d = hudplayer();
