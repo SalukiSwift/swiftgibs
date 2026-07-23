@@ -1,6 +1,65 @@
 --- a/fpsgame/fps.cpp
 +++ b/fpsgame/fps.cpp
-@@ -581,6 +581,59 @@
+@@ -237,6 +237,7 @@
+     }
+ 
+     void updatereloadmetronome();
++    void checkautorespawn();   // SwiftGibs Task 7: defined below, after the cue-demo helpers it checks
+     void updateworld()        // main game update loop
+     {
+         updatereloadmetronome();
+@@ -260,6 +261,7 @@
+         {
+             if(player1->state == CS_DEAD)
+             {
++                checkautorespawn();   // SwiftGibs Task 7: auto-respawn + ready pip, no-op unless dead+eligible
+                 if(player1->ragdoll) moveragdoll(player1);
+                 else if(lastmillis-player1->lastpain<2000)
+                 {
+@@ -369,6 +371,25 @@
+     }
+     COMMAND(respawn, "");
+ 
++    // === SwiftGibs auto-respawn + ready pip (Task 7): persisted toggles + per-death
++    // state. autorespawn re-invokes respawn() (above) on a ~250ms retry while dead, so
++    // it inherits every existing safety check there for free (dead-state gate,
++    // cmode->respawnwait() per-mode cooldown, spawnwait, the m_dmsp map-restart special
++    // case) and is a harmless no-op if the server still refuses. respawnreadysound plays
++    // a single subtle pip once per death, the moment a "ready at" estimate (set in
++    // deathstate() below) says a respawn attempt should succeed. That estimate only
++    // drives the pip's timing - it never gates the real respawn() call - so a wrong
++    // guess can only make the pip a beat early/late, never break or spam a respawn
++    // attempt. checkautorespawn() itself is defined later in this file (after
++    // reloaddemoing()/hitmarkerdemoing()/streakfxdemoing(), which it checks) and is
++    // called from updateworld()'s CS_DEAD branch above.
++    VARP(autorespawn, 0, 1, 1);
++    VARP(respawnreadysound, 0, 1, 1);
++    static const int RESPAWNREADYFLOOR = 300;   // mirrors server DEATHMILLIS (fpsgame/server.cpp)'s post-death settle window
++    int respawnreadyat = -1;      // lastmillis timestamp; (re)armed on every player1 death, see deathstate()
++    bool respawnreadyfired = false;
++    int lastautorespawn = 0;      // throttle: retry respawn() at most every ~250ms, never every frame
++
+     // inputs
+ 
+     VARP(attackspawn, 0, 1, 1);
+@@ -535,6 +556,16 @@
+             //d->pitch = 0;
+             d->roll = 0;
+             playsound(S_DIE1+rnd(2));
++            // SwiftGibs Task 7: (re)arm the ready-pip/auto-respawn estimate for this
++            // death. lastpain was just set to lastmillis above, so cmode->respawnwait()
++            // returns the FULL per-mode cooldown from this exact moment (ctf/capture/
++            // collect RESPAWNSECS=5s; 0 for ffa/dm/insta) - the same formula respawn()
++            // itself uses to gate a real attempt, so this stays correct if that ever
++            // changes. spawnwait is folded in too since respawn() also gates on it
++            // (stock manual-tune cvar, default 0). RESPAWNREADYFLOOR is a floor, not an
++            // addition, mirroring the server's own DEATHMILLIS settle window.
++            respawnreadyat = lastmillis + max(RESPAWNREADYFLOOR, max(spawnwait, cmode ? cmode->respawnwait(d)*1000 : 0));
++            respawnreadyfired = false;
+         }
+         else
+         {
+@@ -581,6 +612,59 @@
      ICOMMAND(numplayers, "", (), intret(players.length()));
      ICOMMAND(getplayername, "i", (int *i), result(players.inrange(*i) ? players[*i]->name : ""));
  
@@ -60,3 +119,39 @@
      void killed(fpsent *d, fpsent *actor)
      {
          if(d->state==CS_EDITING)
+@@ -1639,6 +1723,35 @@
+         reloadoverlaypass = false;
+     }
+ 
++    // === SwiftGibs auto-respawn + ready pip (Task 7): checkautorespawn() itself, placed
++    // here (not next to its VARPs above) because it needs reloaddemoing()/
++    // hitmarkerdemoing()/streakfxdemoing() (all defined above this point) - forward-
++    // declared near updateworld() and called from its CS_DEAD branch, same pattern as
++    // updatereloadmetronome() below. ===
++    void checkautorespawn()
++    {
++        // m_mp only: m_dmsp restarts the map on death instead of respawning, and
++        // m_classicsp has its own wasted-life/corpse-loot flow (see respawn() above) -
++        // both special-case death enough that this feature explicitly excludes them
++        // (m_mp is false for every M_LOCAL mode, which covers both). Cue-preview demos
++        // never put the real player in CS_DEAD, but are checked explicitly anyway so a
++        // preview running during a real death can't be read as part of this feature's
++        // own timeline.
++        if(!connected || intermission || !m_mp(gamemode)) return;
++        if(player1->state != CS_DEAD) return;
++        if(reloaddemoing() || hitmarkerdemoing() || streakfxdemoing()) return;
++        if(respawnreadyat >= 0 && !respawnreadyfired && lastmillis >= respawnreadyat)
++        {
++            respawnreadyfired = true;
++            if(respawnreadysound) playsoundname("swiftgibs/respawnready");
++        }
++        if(autorespawn && lastmillis - lastautorespawn >= 250)
++        {
++            lastautorespawn = lastmillis;
++            respawn();
++        }
++    }
++
+     // === SwiftGibs reload metronome (audio tick/ding over the rifle reload) ===
+     VARP(reloadmetronome, 0, 0, 2);      // 0=off, 1=flat, 2=rising
+     VARP(reloadmetrovol, 0, 200, 255);   // playsound volume (0..255; 255=full)
