@@ -1,15 +1,39 @@
-# SwiftGibs v1.1.7
+# SwiftGibs v1.1.8
 
-Map votes without squinting at chat.
+Die less boring. Respawn smarter, save your setups, and stop fighting the menus.
 
 ## New
 
-- **Map-vote panel.** When a vote kicks off, SwiftGibs now builds a live panel: map thumbnails, running tallies, and a one-click **vote** button per map - no more decoding wall-of-text chat spam or typing numbers. A winner banner appears when the vote closes and the panel dismisses itself on map change. Works with two server flavours, auto-detected:
-  - **MAPBATTLE-style servers** (RUGBY and friends): the panel votes by quietly saying the right number for you.
-  - **Stock servers:** the panel tallies map suggestions and votes the proper way.
+- **Auto-respawn.** The instant your respawn wait is up, you are back in - no click.
+  Honours CTF-family servers' spawn delays properly. Paired with a **respawn countdown**:
+  three soft low tones count the final seconds (clearly distinct from the reload
+  metronome), then a brighter go tone at the moment you can spawn. Both on by default,
+  both toggleable in the SwiftGibs tab.
+- **Preference profiles.** Save your entire SwiftGibs setup under a name and switch
+  between profiles in a click: Esc > options > SwiftGibs > "profiles..". Captures every
+  SwiftGibs setting; leaves your name, friends, stats and keybinds alone.
+- **Clean screenshots.** F12 now takes a screenshot without the HUD (toggle "clean
+  screenshots" off if you want the HUD in). Your own F12 rebind is respected.
+- **Rebindable SwiftGibs keys.** Expanded map, vote panel, feedback shot, quick play,
+  deep zoom and screenshot all appear in the stock keys menu, rebindable like any
+  other action.
+- **Chat scrollback polish.** A subtle scrollbar shows where you are while scrolling
+  chat history, and closing chat snaps you back to the newest messages.
 
-  Open it with **V** during a vote, or turn on auto-open in Esc > options > SwiftGibs. Note for RUGBY-family servers: some only count votes from players who are actually playing - if your vote isn't tallying, frag someone first.
-- **Zoom: hold or toggle.** New option in the SwiftGibs tab (Aim section): keep the stock click-to-toggle zoom (default) or switch to hold-to-zoom, where MOUSE2/G/Z zoom only while held. Deep zoom is unaffected and stays hold-to-use.
+## Fixed
+
+- **Cue previews work mid-match.** Auditioning countdowns, flashes and hit markers from
+  the Esc menu now works while you are dead or spectating - previously the demos
+  silently refused exactly when you had time to browse them.
+- **Hit-marker previews show a crosshair.** X-flash, Ring-out and Notch now demo
+  against a crosshair reference like Classic always did.
+- **Deep zoom obeys your zoom mode.** If you use click-to-toggle zoom, the thumb-button
+  deep zoom now toggles too (hold mode unchanged).
+- **Flag popup reworded.** "FLAG TAKEN" with "RUN IT HOME" (or "HOLD IT!" in hold modes).
+- **Stock options no longer fight SwiftGibs.** Six stock settings rows that silently
+  broke SwiftGibs-managed features (crosshair picker, hit-crosshair, fullbright radios,
+  force-models, bilinear, chat-console) are removed or replaced with pointers.
+- Cue colours button sits in its own row instead of hiding at the screen edge.
 
 ## Download
 
