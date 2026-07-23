@@ -171,7 +171,7 @@
 +        if(reloadcount == 0 && reloadflash == 0) return;   // draw if EITHER the countdown or the ready-flash is on
 +        if(reloaddemoing() && !reloadoverlaypass) return;   // demos draw AFTER the gui pass (menus would cover them)
 +        fpsent *d = hudplayer();
-+        if(d->state == CS_SPECTATOR || d->state == CS_DEAD) return;
++        if(!reloaddemoing() && (d->state == CS_SPECTATOR || d->state == CS_DEAD)) return;
 +
 +        float cx = w * 900.0f / h;
 +        float cy = 900.0f;

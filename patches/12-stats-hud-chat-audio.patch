@@ -233,7 +233,7 @@
  
          setclientmode();
  
-@@ -1424,17 +1518,120 @@
+@@ -1426,17 +1520,121 @@
          }
      }
  
@@ -294,6 +294,7 @@
 +
 +    // === SwiftGibs hit marker + streak fx draw (reuse the cue primitives above) ===
 +    static bool hitmarkerdemoing() { return lastmillis - hitmarkerdemomillis < 300 && hitmarkerdemomillis; }
++    bool hitmarkeranydemo() { return hitmarkerdemoing(); }   // exported: any overlay hit-marker style being previewed
 +    static bool streakfxdemoing() { return lastmillis - streakfxdemomillis < 1000 && streakfxdemomillis; }
 +    void drawhitmarker(int w, int h)
 +    {
@@ -356,7 +357,7 @@
          pophudmatrix();
          reloadoverlaypass = false;
      }
-@@ -1470,6 +1667,60 @@
+@@ -1472,6 +1670,60 @@
          }
      }
  
@@ -417,7 +418,7 @@
      void gameplayhud(int w, int h)
      {
          pushhudmatrix();
-@@ -1502,6 +1753,12 @@
+@@ -1504,6 +1756,12 @@
  
          drawreloadcountdown(w, h);
  
@@ -430,7 +431,7 @@
          pophudmatrix();
  
          if(d->state!=CS_EDITING && d->state!=CS_SPECTATOR && d->state!=CS_DEAD)
-@@ -1546,7 +1803,7 @@
+@@ -1548,7 +1806,7 @@
  
          int crosshair = 0;
          bool onteam = false;
@@ -546,3 +547,24 @@
          virtual void rendergame() {}
          virtual void respawned(fpsent *d) {}
          virtual void setup() {}
+--- a/shared/igame.h
++++ b/shared/igame.h
+@@ -87,6 +87,7 @@
+     extern void reloadhudoverlay(int w, int h);
+     extern bool reloaddemoactive();
+     extern bool hitmarkerclassicdemo();
++    extern bool hitmarkeranydemo();
+     extern void lighteffects(dynent *d, vec &color, vec &dir);
+     extern void setupcamera();
+     extern bool allowthirdperson(bool msg = false);
+--- a/engine/rendergl.cpp
++++ b/engine/rendergl.cpp
+@@ -2363,7 +2363,7 @@
+     resethudmatrix();
+ 
+     game::reloadhudoverlay(w, h);   // cue demos over any open menu (must come after the ortho reset)
+-    if((game::reloaddemoactive() || game::hitmarkerclassicdemo()) && (mainmenu || g3d_windowhit(true, false)))
++    if((game::reloaddemoactive() || game::hitmarkerclassicdemo() || game::hitmarkeranydemo()) && (mainmenu || g3d_windowhit(true, false)))
+     {
+         // menus show the gui cursor, not the crosshair - draw a centered crosshair during
+         // demos so crosshair-linked cues (Crosshair-Pulse, fade, ready pop) can be auditioned
