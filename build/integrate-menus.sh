@@ -5,14 +5,47 @@
 # rows that clash with settings SwiftGibs manages itself (player brightness, forced player models,
 # hit-crosshair markers, the built-in crosshair picker, bilinear filtering, the chat-console checkbox)
 # so a fresh stock data/menus.cfg can never silently ship those foot-guns next to SwiftGibs' own tabs.
-# Idempotent (splice + surgery are gated on the same "already integrated" check).
+# Idempotent (splice + surgery are gated on the same "already integrated" check). The splice heredoc
+# writes to disk immediately, but the surgery heredoc below only writes after all its checks pass, so
+# a run interrupted (or a surgery pattern that failed to match) between the two steps can leave a
+# staged menus.cfg that is spliced but NOT surgered. The tab-splice marker alone is therefore not
+# proof the file is fully integrated: a re-run below re-verifies surgery completion (all six leftover
+# patterns absent and the replacement pointer row present) before trusting the marker, and if the file
+# is spliced-but-not-surgered it completes the surgery step (safe to re-run: its patterns match
+# pre-surgery text) rather than silently reporting success.
 # Usage: integrate-menus.sh <staged-root-containing-data/menus.cfg>
 set -euo pipefail
 ROOT="${1:?staged root}"
 M="$ROOT/data/menus.cfg"
 [ -f "$M" ] || { echo "integrate-menus: no $M"; exit 1; }
-if grep -q 'guitab "SwiftGibs"' "$M"; then echo "integrate-menus: already integrated"; exit 0; fi
-python3 - "$M" <<'PY'
+
+SPLICE_DONE=0
+if grep -q 'guitab "SwiftGibs"' "$M"; then SPLICE_DONE=1; fi
+
+if [ "$SPLICE_DONE" = "1" ]; then
+    # Marker present: don't trust it blindly, verify the surgery step actually completed too.
+    if python3 - "$M" <<'PY'
+import sys
+p = sys.argv[1]
+b = open(p, "rb").read()
+leftovers = [
+    b"fullbrightmodels",
+    b'guicheckbox "force matching player models" forceplayermodels',
+    b'guicheckbox "hits" hitcrosshair',
+    b'guibutton "crosshair: "',
+    b'guicheckbox "bilinear filtering"',
+    b'guicheckbox "chat console" miniconfilter',
+]
+pointer = b'guitext "^f4player brightness is managed in the SwiftGibs tabs"'
+ok = all(b.count(pat) == 0 for pat in leftovers) and b.count(pointer) >= 1
+sys.exit(0 if ok else 1)
+PY
+    then
+        echo "integrate-menus: already integrated"; exit 0
+    fi
+    echo "integrate-menus: staged menus.cfg is spliced but not surgered (previous run interrupted?) - completing surgery" >&2
+else
+    python3 - "$M" <<'PY'
 import sys
 p = sys.argv[1]
 b = open(p, "rb").read()
@@ -29,8 +62,12 @@ ins = (b'    guitab "SwiftGibs"' + nl + b'    sgSwiftgibsTab' + nl +
 open(p, "wb").write(b[:close] + ins + b[close:])
 print("integrate-menus: attached SwiftGibs + Friends tabs to", p)
 PY
+fi
 
 # --- Stock options surgery -------------------------------------------------
+# Also runs to complete a spliced-but-not-surgered file left behind by an interrupted prior run
+# (see the SPLICE_DONE branch above) - safe to re-run because every pattern below still matches
+# pre-surgery text exactly once in that case.
 # Six stock options rows clash with settings SwiftGibs manages itself (its own player-brightness
 # controls, forced-model/hitmarker/crosshair/filtering behaviour that would otherwise fight the
 # SwiftGibs tabs). Remove/replace them here, on the STAGED copy only, never edit vendor/ or a real
