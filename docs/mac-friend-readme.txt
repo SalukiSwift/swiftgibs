@@ -22,6 +22,23 @@ SwiftGibs for Mac — quick start
    scoreboard columns, the reload countdown + metronome, the map-vote panel,
    and the flat team-colour player models are all included.
 
+Updating
+--------
+When a new version comes out, update-swiftgibs.command (it ships right next
+to SwiftGibs.app in the same download) fetches it for you:
+
+1. FIRST USE ONLY - right-click to open: right-click (or Control-click)
+   update-swiftgibs.command -> Open -> Open again in the dialog. Same
+   one-time step as SwiftGibs.app itself, and only needed once, ever.
+2. After that, just double-click update-swiftgibs.command any time. A
+   Terminal window opens, downloads the latest release, and swaps in the new
+   SwiftGibs.app. Close the window when it says done.
+3. Your settings, friends and stats live in ~/Library/Application Support,
+   not inside the app, so they're never touched by an update.
+4. The updated SwiftGibs.app opens normally afterward, no second
+   right-click needed - that ritual is only for apps downloaded straight
+   through a browser.
+
 Notes
 -----
 - Works on Apple Silicon (M1/M2/M3/M4). Built natively for it.
