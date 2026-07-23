@@ -1,0 +1,238 @@
+--- a/fpsgame/fps.cpp
++++ b/fpsgame/fps.cpp
+@@ -238,9 +238,25 @@
+ 
+     void updatereloadmetronome();
+     void checkautorespawn();   // SwiftGibs Task 7: defined below, after the cue-demo helpers it checks
++    // SwiftGibs Reverse Firing Squad (Task 1): forward-declared for the same reason as
++    // checkautorespawn() above - squadenter() needs reloaddemoing()/hitmarkerdemoing()/
++    // streakfxdemoing(), defined much later in this file, so its body lives down there
++    // too; squadexit()/squadupdate()/squadfire() are grouped alongside it for cohesion.
++    // See docs/prd/reverse-firing-squad.md, docs/adr/0002 (this task's core ADR) and
++    // docs/superpowers/specs/2026-07-23-reverse-firing-squad-design.md amendment 1
++    // (autorespawn interaction), amendment 2 (this is patch 17, not 16) and amendment 3
++    // (fixed squad size 3 - no ladder/progression).
++    void squadenter();
++    void squadexit(int reason);
++    void squadupdate();
++    void squadfire();
+     void updateworld()        // main game update loop
+     {
+         updatereloadmetronome();
++        squadupdate();   // SwiftGibs Task 1: unconditional per-frame poll (session window
++                          // transitions + external aborts) - must run before the early
++                          // returns below and before checkautorespawn() further down, so
++                          // this frame's transitions are visible to both.
+         if(!maptime) { maptime = lastmillis; maprealtime = totalmillis; return; }
+         if(!curtime) { gets2c(); if(player1->clientnum>=0) c2sinfo(); return; }
+ 
+@@ -398,6 +414,46 @@
+     int respawncountat[3] = { -1, -1, -1 };      // lastmillis timestamps; -1 = not scheduled this death
+     bool respawncountfired[3] = { false, false, false };
+ 
++    // === SwiftGibs Reverse Firing Squad (Task 1): session state, window timing, input
++    // ownership, autorespawn hold. See docs/prd/reverse-firing-squad.md, docs/adr/0002
++    // (this task's core ADR: window formula + input ownership) and docs/superpowers/
++    // specs/2026-07-23-reverse-firing-squad-design.md amendment 1 (checkautorespawn()
++    // must hold for the WHOLE session - including the pre-cut-in beat below - not just
++    // once the window is visually open; amendment 2: this is patch 17, not 16; amendment
++    // 3: fixed squad size 3 - the PRD's wave ladder, rung state and promote/demote are
++    // OUT of scope, superseded by April 2026-07-23).
++    //
++    // squadenter()/squadexit()/squadupdate()/squadfire() bodies live further down this
++    // file (after reloaddemoing()/hitmarkerdemoing()/streakfxdemoing(), which squadenter()
++    // checks) - forward-declared near updateworld() above, same pattern checkautorespawn()
++    // itself already uses.
++    VARP(squad, 0, 1, 1);                  // feature toggle (menu-exposed in Task 4)
++    VARP(squadwindow, 2000, 5000, 15000);  // FFA/team window, ms (ADR-0002)
++    VARP(squadfirerate, 150, 350, 1000);   // virtual-rifle cooldown, ms (ADR-0003; wired to
++                                            // the Task 1 fire stub below, real hitscan is Task 3)
++
++    enum { SQUADSTATE_NONE = 0, SQUADSTATE_PENDING, SQUADSTATE_ACTIVE };
++    enum { SQUADEND_TIMEOUT = 0, SQUADEND_BAIL, SQUADEND_ABORT };
++    static const int SQUADENTRYBEAT = 400;   // PRD: brief beat to register the death as normal
++    static const int SQUADSIZE = 3;          // amendment 3: fixed squad size, no ladder/progression
++
++    struct squadsession
++    {
++        int state;       // SQUADSTATE_*
++        int start;       // lastmillis the void cuts in (death + SQUADENTRYBEAT)
++        int end;         // lastmillis the window locks (death + max(cmode wait, squadwindow))
++        int kills;       // squad kills this session (Task 3 increments; always 0 in Task 1)
++        bool cleared;    // kills reached SQUADSIZE by the time the session ended - read by
++                         // Task 4's end-of-session result line; persists after state resets
++                         // to NONE, until the next squadenter() overwrites it
++        int lastreason;  // SQUADEND_* passed to the most recent squadexit(), same persistence
++        int lastfire;    // lastmillis of the last squadfire() stub call, for the cooldown
++    };
++    squadsession squadsess = { SQUADSTATE_NONE, 0, 0, 0, false, -1, -1000000 };
++
++    bool squadactive() { return squadsess.state == SQUADSTATE_ACTIVE; }        // window visually open (past the cut-in) - gates doattack()'s fire-vs-respawn branch
++    bool squadsessionopen() { return squadsess.state != SQUADSTATE_NONE; }     // a session exists at all (pending OR active) - gates the checkautorespawn() hold (amendment 1: the hold covers the pre-cut-in beat too)
++
+     // inputs
+ 
+     VARP(attackspawn, 0, 1, 1);
+@@ -405,7 +461,14 @@
+     void doattack(bool on)
+     {
+         if(!connected || intermission) return;
+-        if((player1->attacking = on) && attackspawn) respawn();
++        player1->attacking = on;
++        if(!on) return;
++        // SwiftGibs Task 1 (ADR-0002 input ownership): while the squad window is visually
++        // active, the click fires the virtual rifle instead of ever reaching respawn() -
++        // no N_TRYSPAWN is ever sent by squad play. Pre-cut-in (SQUADSTATE_PENDING) and
++        // squad-off both fall through to vanilla behaviour unchanged.
++        if(squadactive()) { squadfire(); return; }
++        if(attackspawn) respawn();
+     }
+ 
+     VARP(jumpspawn, 0, 1, 1);
+@@ -413,6 +476,15 @@
+     bool canjump()
+     {
+         if(!connected || intermission) return false;
++        // SwiftGibs Task 1 (ADR-0002 input ownership): jump always bails a session that
++        // exists. A wave already visually active (SQUADSTATE_ACTIVE) counts as a real
++        // bail = fail per the PRD ("bailing mid-wave counts as not clearing it"); a
++        // session still in its pre-cut-in beat (SQUADSTATE_PENDING) was never shown to
++        // the player, so it closes as a neutral abort instead - the outcome can't be
++        // blamed on a jump thrown before the void ever appeared. Either way this falls
++        // through to the exact vanilla respawn() call below - one keypress bails and
++        // requests spawn, identical muscle memory to vanilla jumpspawn.
++        if(squadsessionopen()) squadexit(squadactive() ? SQUADEND_BAIL : SQUADEND_ABORT);
+         if(jumpspawn) respawn();
+         return player1->state!=CS_DEAD;
+     }
+@@ -594,6 +666,14 @@
+                     respawncountfired[i] = true;
+                 }
+             }
++            // SwiftGibs Reverse Firing Squad (Task 1): arm/re-arm the session for this
++            // death. Runs unconditionally here too (not gated on !restore), matching the
++            // Task 7/8 precedent right above - edit-mode-toggle-off and un-spectate both
++            // re-enter this branch with restore=true, and the player is genuinely
++            // becoming dead-and-waiting again. squadenter() itself closes out any still-
++            // open previous session first, so its outcome is always recorded exactly
++            // once regardless of how many times this branch re-runs.
++            squadenter();
+         }
+         else
+         {
+@@ -749,6 +829,9 @@
+         else
+         {
+             intermission = true;
++            // SwiftGibs Reverse Firing Squad (Task 1): intermission is one of ADR-0002's
++            // external-abort triggers.
++            if(squadsessionopen()) squadexit(SQUADEND_ABORT);
+             player1->attacking = false;
+             if(cmode) cmode->gameover();
+             conoutf(CON_GAMEINFO, "\f2intermission:");
+@@ -840,6 +923,10 @@
+ 
+     void startgame()
+     {
++        // SwiftGibs Reverse Firing Squad (Task 1): map/mode change is one of ADR-0002's
++        // external-abort triggers - close out any still-open session before anything else
++        // in this function resets per-match state.
++        if(squadsessionopen()) squadexit(SQUADEND_ABORT);
+         clearmovables();
+         clearmonsters();
+ 
+@@ -1782,13 +1869,93 @@
+             respawnreadyfired = true;
+             if(respawnreadysound) playsoundname("swiftgibs/respawnready");
+         }
+-        if(autorespawn && lastmillis - lastautorespawn >= 250)
++        // SwiftGibs Reverse Firing Squad (Task 1, amendment 1): hold the actual
++        // auto-respawn invocation for as long as a squad session exists (pending OR
++        // active - the whole death-to-window-end span), so the session reliably gets a
++        // chance to run even in FFA/team insta where the estimate above fires in ~300ms,
++        // well before the squad's own (much longer) window. The countdown/go tones above
++        // are untouched - they double as the squad's own timer audio in ctf-family per
++        // the amendment, and still mark real vanilla eligibility either way.
++        if(autorespawn && !squadsessionopen() && lastmillis - lastautorespawn >= 250)
+         {
+             lastautorespawn = lastmillis;
+             respawn();
+         }
+     }
+ 
++    // === SwiftGibs Reverse Firing Squad (Task 1): squadenter()/squadexit()/
++    // squadupdate()/squadfire() bodies, placed here (not next to the VARPs/struct/
++    // forward-declarations above) because squadenter() needs reloaddemoing()/
++    // hitmarkerdemoing()/streakfxdemoing() (all defined above this point) - same
++    // reason checkautorespawn() itself lives down here. ===
++    void squadenter()
++    {
++        // Close out any still-open previous session first (neutral external abort) so
++        // its outcome is always recorded exactly once even if this fires again without
++        // an explicit squadexit() in between - e.g. edit-mode-toggle-off and un-spectate
++        // both re-enter deathstate()'s d==player1 branch with restore=true (Task 7/8's
++        // own precedent for that same re-entrancy).
++        if(squadsessionopen()) squadexit(SQUADEND_ABORT);
++
++        if(!squad) return;                        // feature toggle off
++        if(!m_mp(gamemode)) return;                // excludes m_dmsp/m_classicsp (M_LOCAL)
++        if(intermission) return;
++        if(player1->state != CS_DEAD) return;      // defence in depth; always true here
++        if(reloaddemoing() || hitmarkerdemoing() || streakfxdemoing()) return;
++
++        int cmodewaitms = cmode ? cmode->respawnwait(player1)*1000 : 0;   // ADR-0002: raw per-mode wait, NOT the RESPAWNREADYFLOOR/spawnwait-padded estimate above
++        squadsess.state = SQUADSTATE_PENDING;
++        squadsess.start = lastmillis + SQUADENTRYBEAT;
++        squadsess.end = lastmillis + max(cmodewaitms, squadwindow);
++        squadsess.kills = 0;
++        squadsess.cleared = false;
++        squadsess.lastfire = -1000000;
++    }
++
++    void squadexit(int reason)
++    {
++        if(squadsess.state == SQUADSTATE_NONE) return;
++        // amendment 3: no ladder/progression to update - just record whether the wave
++        // was fully cleared (kills reached SQUADSIZE) and why the session ended, for
++        // Task 4's end-of-session result line. A clear recorded here survives regardless
++        // of `reason` - even an external abort right after the last kill still reads as
++        // cleared, not as a dangling failure.
++        squadsess.cleared = squadsess.kills >= SQUADSIZE;
++        squadsess.lastreason = reason;
++        squadsess.state = SQUADSTATE_NONE;
++    }
++
++    void squadupdate()
++    {
++        // Unconditional per-frame poll (called from updateworld() above, every frame
++        // regardless of connection/player state). This patch is confined to
++        // fpsgame/fps.cpp (Task 1 scope), so hooking client.cpp's network handlers or
++        // engine/octaedit.cpp's toggleedit() directly for the external-abort triggers is
++        // not an option - polling player1->state instead covers every one of ADR-0002's
++        // triggers exactly: a server-forced spawn, edit-mode entry (-> CS_EDITING) and
++        // spectator entry (-> CS_SPECTATOR) all move state away from CS_DEAD, so a single
++        // `state != CS_DEAD` check catches all three uniformly.
++        if(squadsess.state == SQUADSTATE_NONE) return;
++        if(!connected || intermission || !m_mp(gamemode) || player1->state != CS_DEAD)
++        {
++            squadexit(SQUADEND_ABORT);
++            return;
++        }
++        if(squadsess.state == SQUADSTATE_PENDING && lastmillis >= squadsess.start) squadsess.state = SQUADSTATE_ACTIVE;
++        if(lastmillis >= squadsess.end) squadexit(SQUADEND_TIMEOUT);
++    }
++
++    void squadfire()
++    {
++        // Stub for Task 1: proves input ownership only (doattack() calls here instead of
++        // respawn() while the window is visually active). Real hitscan against the
++        // pooled dummy fpsents and kill accounting arrive in Task 3 (ADR-0003); this only
++        // exercises the squadfirerate cooldown so the VARP is meaningfully wired from day
++        // one rather than sitting inert.
++        if(lastmillis - squadsess.lastfire < squadfirerate) return;
++        squadsess.lastfire = lastmillis;
++    }
++
+     // === SwiftGibs reload metronome (audio tick/ding over the rifle reload) ===
+     VARP(reloadmetronome, 0, 0, 2);      // 0=off, 1=flat, 2=rising
+     VARP(reloadmetrovol, 0, 200, 255);   // playsound volume (0..255; 255=full)
