@@ -428,7 +428,7 @@
 +        if(t >= 2500) { flagpopupmillis = 0; return; }
 +        int a = t < 1700 ? 255 : max(0, 255 - (t-1700)*255/800);
 +        float scale = t < 120 ? 3.4f - t*0.008f : 2.44f;   // punch in, settle
-+        const char *l1 = "YOU HAVE THE FLAG";
++        const char *l1 = "FLAG TAKEN";
 +        const char *l2 = flagpopupmode==2 ? "HOLD IT!" : "RUN IT HOME";
 +        int cx = 1800*w/h/2, cy = 1800/3;
 +        int tw, th; text_bounds(l1, tw, th);
