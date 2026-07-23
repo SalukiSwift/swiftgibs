@@ -1,6 +1,66 @@
 --- a/engine/console.cpp
 +++ b/engine/console.cpp
-@@ -496,6 +496,22 @@
+@@ -138,6 +138,37 @@
+     return y+conoff;
+ }
+ 
++// SwiftGibs: minimal scrollbar for the mini-console while browsing chat history
++// (x,y,w,h) describe the mini-console's on-screen box in the same coord space as drawconlines.
++void drawminiconindicator(int x, int y, int w, int h, int filter)
++{
++    if(w <= 0 || h <= 0) return;
++    filter &= CON_FLAGS;
++    int total = 0;
++    loopv(conlines) if(conlines[i].type&filter) total++;
++    if(total <= 0) return;
++    int visible = clamp(h/max(FONTH, 1), 1, total);
++    float barw = FONTH/6.0f, bx = x + w - barw;
++    hudnotextureshader->set();
++    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++    gle::colorf(1, 1, 1, 0.25f);   // track
++    gle::defvertex(2);
++    gle::begin(GL_QUADS);
++    gle::attribf(bx, y);        gle::attribf(bx+barw, y);
++    gle::attribf(bx+barw, y+h); gle::attribf(bx, y+h);
++    gle::end();
++    float thumbh = h*clamp(visible/float(total), 0.08f, 1.0f);
++    float p = clamp(miniconskip/float(total), 0.0f, 1.0f);
++    float ty = y + (h - thumbh)*(1.0f - p);
++    gle::colorf(1, 1, 1, 0.6f);   // thumb
++    gle::defvertex(2);
++    gle::begin(GL_QUADS);
++    gle::attribf(bx, ty);            gle::attribf(bx+barw, ty);
++    gle::attribf(bx+barw, ty+thumbh); gle::attribf(bx, ty+thumbh);
++    gle::end();
++    hudshader->set();
++}
++
+ int renderconsole(int w, int h, int abovehud)                   // render buffer taking into account time & scrolling
+ {
+     int conpad = fullconsole ? 0 : FONTH/4,
+@@ -150,7 +181,12 @@
+     
+     int y = drawconlines(conskip, fullconsole ? 0 : confade, conwidth, conheight, conpad+conoff, fullconsole ? fullconfilter : confilter);
+     if(!fullconsole && (miniconsize && miniconwidth))
+-        drawconlines(miniconskip, miniconfade, (miniconwidth*(w - 2*(conpad + conoff)))/100, min(FONTH*miniconsize, abovehud - y), conpad+conoff, miniconfilter, abovehud, -1);
++    {
++        int miniw = (miniconwidth*(w - 2*(conpad + conoff)))/100, minih = min(FONTH*miniconsize, abovehud - y);
++        drawconlines(miniconskip, miniconfade, miniw, minih, conpad+conoff, miniconfilter, abovehud, -1);
++        if(miniconskip > 0 && commandmillis >= 0)
++            drawminiconindicator(conpad+conoff, abovehud - minih, miniw, minih, miniconfilter);
++    }
+     return fullconsole ? conheight + 2*(conpad + conoff) : y;
+ }
+ 
+@@ -254,6 +290,7 @@
+ void inputcommand(char *init, char *action = NULL, char *prompt = NULL, char *flags = NULL) // turns input to the command line on or off
+ {
+     commandmillis = init ? totalmillis : -1;
++    if(!init) miniconskip = 0;   // SwiftGibs: snap chat scrollback to present when the input line closes
+     textinput(commandmillis >= 0, TI_CONSOLE);
+     keyrepeat(commandmillis >= 0, KR_CONSOLE);
+     copystring(commandbuf, init ? init : "");
+@@ -496,6 +533,22 @@
                  if(histpos + 1 < history.length()) history[++histpos]->restore();
                  break;
  
