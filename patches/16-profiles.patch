@@ -16,7 +16,7 @@
                  if(player1->ragdoll) moveragdoll(player1);
                  else if(lastmillis-player1->lastpain<2000)
                  {
-@@ -369,6 +371,25 @@
+@@ -369,6 +371,33 @@
      }
      COMMAND(respawn, "");
  
@@ -38,11 +38,19 @@
 +    int respawnreadyat = -1;      // lastmillis timestamp; (re)armed on every player1 death, see deathstate()
 +    bool respawnreadyfired = false;
 +    int lastautorespawn = 0;      // throttle: retry respawn() at most every ~250ms, never every frame
++    // SwiftGibs Task 8: 3-2-1 countdown tones ahead of the "go" pip above, at T-3s/T-2s/T-1s
++    // before respawnreadyat. Each slot only gets scheduled (in deathstate() below) if the
++    // full per-death wait is long enough to fit it before respawnreadyat - a short wait (ffa/
++    // dm/insta, RESPAWNREADYFLOOR only) drops every slot and falls back to exactly the single
++    // "go" pip, today's behaviour. Governed by the same respawnreadysound toggle, no new VARP.
++    static const int RESPAWNCOUNTOFFSETS[3] = { 3000, 2000, 1000 };
++    int respawncountat[3] = { -1, -1, -1 };      // lastmillis timestamps; -1 = not scheduled this death
++    bool respawncountfired[3] = { false, false, false };
 +
      // inputs
  
      VARP(attackspawn, 0, 1, 1);
-@@ -535,6 +556,16 @@
+@@ -535,6 +564,36 @@
              //d->pitch = 0;
              d->roll = 0;
              playsound(S_DIE1+rnd(2));
@@ -54,12 +62,32 @@
 +            // changes. spawnwait is folded in too since respawn() also gates on it
 +            // (stock manual-tune cvar, default 0). RESPAWNREADYFLOOR is a floor, not an
 +            // addition, mirroring the server's own DEATHMILLIS settle window.
-+            respawnreadyat = lastmillis + max(RESPAWNREADYFLOOR, max(spawnwait, cmode ? cmode->respawnwait(d)*1000 : 0));
++            int respawnwaitms = max(RESPAWNREADYFLOOR, max(spawnwait, cmode ? cmode->respawnwait(d)*1000 : 0));
++            respawnreadyat = lastmillis + respawnwaitms;
 +            respawnreadyfired = false;
++            // SwiftGibs Task 8: (re)arm the 3-2-1 countdown-tone slots for this same death.
++            // Only schedule a slot whose T-Ns offset actually lands after this moment (wait
++            // strictly greater than the offset) - otherwise leave it unscheduled (-1) and
++            // pre-fired (true) so it can never fire late/in the past. FFA/dm/insta (wait ==
++            // RESPAWNREADYFLOOR, 300ms) drops all three slots -> just the go tone, unchanged
++            // from Task 7. ctf/capture/collect (wait == 5000ms) schedules all three.
++            loopi(3)
++            {
++                if(respawnwaitms > RESPAWNCOUNTOFFSETS[i])
++                {
++                    respawncountat[i] = respawnreadyat - RESPAWNCOUNTOFFSETS[i];
++                    respawncountfired[i] = false;
++                }
++                else
++                {
++                    respawncountat[i] = -1;
++                    respawncountfired[i] = true;
++                }
++            }
          }
          else
          {
-@@ -581,6 +612,59 @@
+@@ -581,6 +640,59 @@
      ICOMMAND(numplayers, "", (), intret(players.length()));
      ICOMMAND(getplayername, "i", (int *i), result(players.inrange(*i) ? players[*i]->name : ""));
  
@@ -119,7 +147,7 @@
      void killed(fpsent *d, fpsent *actor)
      {
          if(d->state==CS_EDITING)
-@@ -1639,6 +1723,35 @@
+@@ -1639,6 +1751,44 @@
          reloadoverlaypass = false;
      }
  
@@ -140,6 +168,15 @@
 +        if(!connected || intermission || !m_mp(gamemode)) return;
 +        if(player1->state != CS_DEAD) return;
 +        if(reloaddemoing() || hitmarkerdemoing() || streakfxdemoing()) return;
++        // SwiftGibs Task 8: three low countdown tones (T-3s/T-2s/T-1s), each latched so it
++        // can fire at most once per death; unscheduled slots (-1, see deathstate()) never
++        // match the >= 0 guard. Checked before the "go" tone below so a slow frame can't
++        // reorder them relative to each other (loop runs in T-3/T-2/T-1 order every time).
++        loopi(3) if(respawncountat[i] >= 0 && !respawncountfired[i] && lastmillis >= respawncountat[i])
++        {
++            respawncountfired[i] = true;
++            if(respawnreadysound) playsoundname("swiftgibs/respawncount");
++        }
 +        if(respawnreadyat >= 0 && !respawnreadyfired && lastmillis >= respawnreadyat)
 +        {
 +            respawnreadyfired = true;
