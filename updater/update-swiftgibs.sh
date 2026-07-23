@@ -55,7 +55,13 @@ TMPD=$(mktemp -d "${TMPDIR:-/tmp}/swiftgibs-update.XXXXXX") || {
   echo "Could not create a temp directory."
   exit 1
 }
-cleanup() { rm -rf "$TMPD"; }
+# Also best-effort clean up the self-copy of this script we exec'd into
+# (see the --run dance above) - $0 is that copy's path in this re-exec'd
+# process. Must not affect the script's exit code either way.
+cleanup() {
+  rm -rf "$TMPD"
+  rm -f "$0" 2>/dev/null || true
+}
 trap cleanup EXIT INT TERM
 
 TARBALL="$TMPD/SwiftGibs-linux-x86_64.tar.gz"

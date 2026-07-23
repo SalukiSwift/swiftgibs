@@ -101,10 +101,18 @@ echo "Updating game files..."
 # failure here never leaves you with no working app. mv is used when possible
 # (near-instant rename); cp -a is the fallback if the temp dir and this
 # folder are on different volumes.
+#
+# The backup rename itself is checked for success (returns 2 if it fails).
+# If we can't even get the existing app safely out of the way - e.g. it's
+# running off a read-only volume like a still-mounted DMG - we must NOT touch
+# SwiftGibs.app at all: no rm -rf, no overwrite attempt. Only once the .bak
+# provably exists do we move on to the (destructive) install step.
 install_new_app() {
   if [ -d SwiftGibs.app ]; then
     rm -rf SwiftGibs.app.bak
-    mv SwiftGibs.app SwiftGibs.app.bak
+    if ! mv SwiftGibs.app SwiftGibs.app.bak; then
+      return 2
+    fi
   fi
   if mv "$EXTRACT/SwiftGibs.app" SwiftGibs.app 2>/dev/null; then
     return 0
@@ -113,8 +121,21 @@ install_new_app() {
   cp -a "$EXTRACT/SwiftGibs.app" SwiftGibs.app
 }
 
-if install_new_app; then
+install_status=0
+install_new_app || install_status=$?
+
+if [ "$install_status" -eq 0 ]; then
   rm -rf SwiftGibs.app.bak
+elif [ "$install_status" -eq 2 ]; then
+  echo ""
+  echo "Update failed: couldn't back up your existing SwiftGibs.app before"
+  echo "installing the update, so nothing was changed - SwiftGibs.app is exactly"
+  echo "as it was before you ran this."
+  echo "This usually means SwiftGibs.app is on a read-only location right now"
+  echo "(for example, running it straight off a mounted disk image). Copy"
+  echo "SwiftGibs.app (and this updater) to a normal writable folder, such as"
+  echo "/Applications, and run the updater again from there."
+  exit 1
 else
   echo ""
   echo "Update failed while installing the new app."
