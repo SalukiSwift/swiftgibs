@@ -202,7 +202,21 @@
          clearmovables();
          clearmonsters();
  
-@@ -1782,13 +1923,189 @@
+@@ -1642,7 +1783,12 @@
+     }
+     void drawexpandedmap(int w, int h)
+     {
+-        if(!expandedmap) return;
++        // SwiftGibs Reverse Firing Squad (Task 4, deferred from T2 - design spec scope
++        // pin): the squad void doesn't render the world, so the expanded map would
++        // mislead while it's up. Early-out the RENDER only - expandedmap itself is left
++        // untouched, so a map that was toggled on before death reappears automatically
++        // once the squad session ends (no unbind/close needed).
++        if(!expandedmap || squadactive()) return;
+         fpsent *d = hudplayer();
+         float S = 1560.0f, cx = w*900.0f/h, cy = 900.0f;
+         float x0 = cx - S*0.5f, y0 = cy - S*0.5f;
+@@ -1782,13 +1928,189 @@
              respawnreadyfired = true;
              if(respawnreadysound) playsoundname("swiftgibs/respawnready");
          }
@@ -393,7 +407,89 @@
      // === SwiftGibs reload metronome (audio tick/ding over the rifle reload) ===
      VARP(reloadmetronome, 0, 0, 2);      // 0=off, 1=flat, 2=rising
      VARP(reloadmetrovol, 0, 200, 255);   // playsound volume (0..255; 255=full)
-@@ -1950,7 +2267,13 @@
+@@ -1874,6 +2196,73 @@
+         pophudmatrix();
+     }
+ 
++    // === SwiftGibs Reverse Firing Squad (Task 4, ADR-0001 HUD scope pin): kill
++    // counter + time bar + final-3-2-1, reusing patch 05's countdown drawing
++    // conventions (drawreloadcountdown() above) - same hudmatrix scale h/1800 / cx =
++    // w*900/h house style, reloadbar()/reloadbeatcolor()/beatpunch()/cuefamily() reused
++    // verbatim rather than reinvented. Draws only while squadactive() - never during
++    // SQUADSTATE_PENDING (the world is still rendering the ordinary death view; see
++    // fs-task-1-report.md) or once the session has closed. Called from gameplayhud()
++    // below, inside the same pushed hudmatrix scope drawreloadcountdown()/
++    // drawexpandedmap() already use - that scope is only ever entered when
++    // !mainmenu && !hidehud (engine/rendergl.cpp's gl_drawhud), so hidehud/cleanshots
++    // hide the squad HUD for free, no separate check needed here.
++    void drawsquadhud(int w, int h)
++    {
++        if(!squadactive()) return;
++        float cx = w * 900.0f / h, cy = 900.0f;
++        cuefamily(0, 0, 100);   // neutral - the squad HUD has no cue-colour surface of its own (design spec: "no new cue-colour surface in v1")
++
++        // --- kill counter: kills/SQUADSIZE, top-centre ---
++        defformatstring(kstr, "%d/%d", squadsess.kills, SQUADSIZE);
++        int ktw, kth; text_bounds(kstr, ktw, kth);
++        { float kr = 1.0f, kg = 1.0f, kb = 1.0f, ka = 0.92f; cueapply(kr, kg, kb, ka); draw_text(kstr, int(cx - ktw/2.0f), 60, int(kr*255.0f), int(kg*255.0f), int(kb*255.0f), int(ka*255.0f)); }
++
++        // --- time bar: fraction of the visible window (start..end) remaining, directly below the counter ---
++        int span = max(squadsess.end - squadsess.start, 1);
++        float frac = clamp((squadsess.end - lastmillis) / float(span), 0.0f, 1.0f);
++        const float barhalfw = 180.0f, barhalfh = 6.0f;
++        float bary = 60.0f + kth + 22.0f;
++        hudnotextureshader->set();
++        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++        reloadbar(cx, bary, barhalfw, barhalfh, 1.0f, 1.0f, 1.0f, 0.22f);   // track
++        if(frac > 0.0f) reloadbar(cx - barhalfw + barhalfw*frac, bary, barhalfw*frac, barhalfh, 0.35f, 0.85f, 1.0f, 0.85f);   // fill, left-anchored (drains as the window closes)
++        hudshader->set();
++
++        // --- final 3-2-1: last 3s of the window, suppressed once a clear is already
++        // locked in (squadsess.clearedat >= 0, the SQUADCLEARGRACE beat from Task 3) -
++        // the task brief's own judgment call: keep the counter calm at SQUADSIZE/
++        // SQUADSIZE rather than flashing a countdown the player has already beaten.
++        if(squadsess.clearedat < 0)
++        {
++            int remain = squadsess.end - lastmillis;
++            if(remain > 0 && remain <= 3000)
++            {
++                int winms = 3000 - remain;   // 0..2999ms elapsed within the final-3s window
++                const int beat = 1000;
++                int idx = min(winms / beat, 2);
++                int number = 3 - idx;
++                float t = (winms - idx*beat) / (float)beat;
++
++                float cr, cg, cb; reloadbeatcolor(idx, cr, cg, cb);
++                defformatstring(numstr, "%d", number);
++                int tw, th; text_bounds(numstr, tw, th);
++                if(th > 0)
++                {
++                    float scl = 0.9f + 0.30f * beatpunch(t);
++                    const float TARGET_H = 130.0f;
++                    float s = (TARGET_H / (float)th) * scl;
++                    pushhudmatrix();
++                    hudmatrix.translate(cx, cy + 165.0f, 0);
++                    hudmatrix.scale(s, s, 1);
++                    flushhudmatrix();
++                    { float dr = cr, dg = cg, db = cb, da = 0.90f; cueapply(dr, dg, db, da); draw_text(numstr, -tw/2, -th/2, int(dr*255.0f), int(dg*255.0f), int(db*255.0f), int(da*255.0f)); }
++                    pophudmatrix();
++                }
++            }
++        }
++    }
++
+     void gameplayhud(int w, int h)
+     {
+         pushhudmatrix();
+@@ -1911,6 +2300,7 @@
+         drawflagpopup(w, h);
+         if(!hitmarkerdemoing()) drawhitmarker(w, h);
+         if(!streakfxdemoing()) drawstreakfx(w, h);
++        drawsquadhud(w, h);   // SwiftGibs Reverse Firing Squad (Task 4)
+ 
+         pophudmatrix();
+ 
+@@ -1950,7 +2340,13 @@
      int selectcrosshair(vec &color)
      {
          fpsent *d = hudplayer();
