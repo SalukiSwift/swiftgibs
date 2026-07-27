@@ -249,7 +249,7 @@
          fpsent *d = hudplayer();
          float S = 1560.0f, cx = w*900.0f/h, cy = 900.0f;
          float x0 = cx - S*0.5f, y0 = cy - S*0.5f;
-@@ -1782,13 +1961,236 @@
+@@ -1782,13 +1961,266 @@
              respawnreadyfired = true;
              if(respawnreadysound) playsoundname("swiftgibs/respawnready");
          }
@@ -310,6 +310,22 @@
 +        squadtargetx = float(rnd(2*xr + 1) - xr);
 +        int zrange = max(squadtargetzmax - squadtargetzmin, 0);
 +        squadtargetz = float(squadtargetzmin + rnd(zrange + 1));
++
++        // SwiftGibs Reverse Firing Squad (playtest 2 bug fix, amendment 6): April - "when
++        // the firing squad comes up the leaderboard is over top of it. the firing squad
++        // should be on top of it." Root cause: deathstate() calls showscores(true) (its
++        // own vanilla auto-show, gated on the deathscore VARP) BEFORE calling squadenter()
++        // - by the time we reach here a session genuinely exists, so hide what that call
++        // just showed. This still happens synchronously within the same death event,
++        // before any frame ever renders, so it is not a visible flicker - it simply
++        // prevents the scoreboard g3d gui (drawn in the gui pass, which runs after the
++        // squad-view world pass) from ever appearing over the arena. showscores() itself
++        // (fpsgame/scoreboard.cpp) also refuses any FUTURE show attempt for as long as
++        // squadsessionopen() stays true, so a later deliberate scoreboard key press during
++        // the session stays blocked too (design spec's own judgment call: squad has
++        // priority, stay hidden - no toggle for it). squadexit() below is the mirror
++        // image: the instant the session ends, by any path, it restores vanilla behaviour.
++        showscores(false);
 +    }
 +
 +    void squadexit(int reason)
@@ -323,6 +339,20 @@
 +        squadsess.cleared = squadsess.kills >= SQUADSIZE;
 +        squadsess.lastreason = reason;
 +        squadsess.state = SQUADSTATE_NONE;
++        // SwiftGibs Reverse Firing Squad (playtest 2 bug fix, amendment 6): the session no
++        // longer owns the screen - resume vanilla dead-player scoreboard behaviour for
++        // whatever remains of this death, exactly as if squadenter() had never suppressed
++        // it above. Guarded on player1->state==CS_DEAD: several of this function's callers
++        // (squadupdate()'s abort poll, above) fire AFTER the player has already left
++        // CS_DEAD - respawn confirmed, entered edit mode, entered spectator - and each of
++        // those transitions already calls showscores(false) itself at the point it
++        // happens, so re-showing the scoreboard here would be a regression, not a restore.
++        // deathscore is re-checked too (it may have been toggled off mid-death), so this
++        // always matches exactly what a fresh vanilla death would show right now. Runs
++        // unconditionally for every SQUADEND_* reason (cleared, timeout, bail, abort) -
++        // there is no path out of an open session that should leave the scoreboard stuck
++        // hidden.
++        if(deathscore && player1->state == CS_DEAD) showscores(true);
 +        // amendment 4 (design spec: "hitting the target = session cleared ('target
 +        // down'); window end without a hit = 'missed'"): a clear always prints "target
 +        // down", however the session actually closed (the SQUADCLEARGRACE exit in
@@ -487,7 +517,7 @@
      // === SwiftGibs reload metronome (audio tick/ding over the rifle reload) ===
      VARP(reloadmetronome, 0, 0, 2);      // 0=off, 1=flat, 2=rising
      VARP(reloadmetrovol, 0, 200, 255);   // playsound volume (0..255; 255=full)
-@@ -1874,6 +2276,70 @@
+@@ -1874,6 +2306,70 @@
          pophudmatrix();
      }
  
@@ -558,7 +588,7 @@
      void gameplayhud(int w, int h)
      {
          pushhudmatrix();
-@@ -1911,6 +2377,7 @@
+@@ -1911,6 +2407,7 @@
          drawflagpopup(w, h);
          if(!hitmarkerdemoing()) drawhitmarker(w, h);
          if(!streakfxdemoing()) drawstreakfx(w, h);
@@ -566,7 +596,7 @@
  
          pophudmatrix();
  
-@@ -1950,7 +2417,13 @@
+@@ -1950,7 +2447,13 @@
      int selectcrosshair(vec &color)
      {
          fpsent *d = hudplayer();
@@ -581,6 +611,34 @@
  
          if(d->state!=CS_ALIVE) return 0;
  
+--- a/fpsgame/scoreboard.cpp
++++ b/fpsgame/scoreboard.cpp
+@@ -513,8 +513,25 @@
+ 
+     VARFN(scoreboard, showscoreboard, 0, 0, 1, scoreboard.show(showscoreboard!=0));
+ 
++    // SwiftGibs Reverse Firing Squad (playtest 2 bug fix, amendment 6): session state
++    // lives in fpsgame/fps.cpp (namespace game, external linkage - same cross-file pattern
++    // this file's own showscores() already uses in the other direction, forward-declared
++    // for fps.cpp in fpsgame/game.h). Declared extern locally here rather than in a shared
++    // header since scoreboard.cpp is the only file outside fps.cpp that needs it.
++    extern bool squadsessionopen();
++
+     void showscores(bool on)
+     {
++        // Amendment 6 (April, playtest 2): "the firing squad comes up [and] the
++        // leaderboard is over top of it... the firing squad should be on top of it." A
++        // squad session in progress owns the screen - refuse to show the scoreboard over
++        // the arena, no matter who is asking. This covers both deathstate()'s own
++        // auto-show (squadenter() additionally hides it the instant the session opens,
++        // fpsgame/fps.cpp) and a deliberate scoreboard key press during the session
++        // (design spec's own judgment call: squad has priority, stay hidden - no toggle).
++        // squadexit() re-enables showing the instant the session actually ends, by any
++        // path, so this can never leave the scoreboard stuck hidden.
++        if(on && squadsessionopen()) return;
+         showscoreboard = on ? 1 : 0;
+         scoreboard.show(on);
+     }
 --- a/fpsgame/render.cpp
 +++ b/fpsgame/render.cpp
 @@ -512,6 +512,54 @@
