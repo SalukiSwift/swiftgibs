@@ -60,7 +60,7 @@
          if(!maptime) { maptime = lastmillis; maprealtime = totalmillis; return; }
          if(!curtime) { gets2c(); if(player1->clientnum>=0) c2sinfo(); return; }
  
-@@ -398,6 +441,145 @@
+@@ -398,6 +441,159 @@
      int respawncountat[3] = { -1, -1, -1 };      // lastmillis timestamps; -1 = not scheduled this death
      bool respawncountfired[3] = { false, false, false };
  
@@ -156,6 +156,20 @@
 +    // across the arena (true) - see squadcurrentx()/squadcurrentdir() below.
 +    float squadtargetxcap = 0;
 +    bool squadtargetmoving = false;
++    // iter5 (post-playtest fix): every moving session's triangle wave used to start on
++    // the same rising edge (t=0 always heading toward +right first) - a predictable tell
++    // that undercut amendment 8's own variance request. Drawn once per session in
++    // squadenter() below via the engine's rnd(), same idiom as squadtargetmoving itself.
++    // squadcurrentx()/squadcurrentdir() below multiply their unsigned triangle-wave
++    // result by this sign - since the wave is odd/symmetric about 0, negating it is
++    // exactly equivalent to shifting its starting phase by half a period (f(t+P/2) ==
++    // -f(t) for this particular wave shape), so this is simultaneously "randomise the
++    // starting direction" AND a valid instance of "randomise the phase offset", while
++    // staying an exact per-session CONSTANT (like squadfacingyaw/squadtargetxcap) - never
++    // stored/integrated per-frame state - and keeping curx(t=0) exactly 0 regardless of
++    // sign, so a leftward-starting session is still exactly as instantly findable at
++    // dead centre as a rightward one always was.
++    float squadtargetdirsign = 1.0f;
 +
 +    // amendment 8 (playtest 3 follow-up, supersedes amendment 4's ranges and fixes the
 +    // iter1 review's Important): April - "i also think there should be a higher variance
@@ -206,7 +220,7 @@
      // inputs
  
      VARP(attackspawn, 0, 1, 1);
-@@ -405,7 +587,35 @@
+@@ -405,7 +601,35 @@
      void doattack(bool on)
      {
          if(!connected || intermission) return;
@@ -243,7 +257,7 @@
      }
  
      VARP(jumpspawn, 0, 1, 1);
-@@ -413,6 +623,15 @@
+@@ -413,6 +637,15 @@
      bool canjump()
      {
          if(!connected || intermission) return false;
@@ -259,7 +273,7 @@
          if(jumpspawn) respawn();
          return player1->state!=CS_DEAD;
      }
-@@ -594,6 +813,14 @@
+@@ -594,6 +827,14 @@
                      respawncountfired[i] = true;
                  }
              }
@@ -274,7 +288,7 @@
          }
          else
          {
-@@ -749,6 +976,9 @@
+@@ -749,6 +990,9 @@
          else
          {
              intermission = true;
@@ -284,7 +298,7 @@
              player1->attacking = false;
              if(cmode) cmode->gameover();
              conoutf(CON_GAMEINFO, "\f2intermission:");
-@@ -840,6 +1070,10 @@
+@@ -840,6 +1084,10 @@
  
      void startgame()
      {
@@ -295,7 +309,7 @@
          clearmovables();
          clearmonsters();
  
-@@ -1642,7 +1876,12 @@
+@@ -1642,7 +1890,12 @@
      }
      void drawexpandedmap(int w, int h)
      {
@@ -309,7 +323,7 @@
          fpsent *d = hudplayer();
          float S = 1560.0f, cx = w*900.0f/h, cy = 900.0f;
          float x0 = cx - S*0.5f, y0 = cy - S*0.5f;
-@@ -1782,13 +2021,463 @@
+@@ -1782,13 +2035,472 @@
              respawnreadyfired = true;
              if(respawnreadysound) playsoundname("swiftgibs/respawnready");
          }
@@ -397,6 +411,12 @@
 +        // squadcurrentx()/squadcurrentdir() below for the sweep itself and
 +        // fpsgame/render.cpp squadrender() for the animation drive.
 +        squadtargetmoving = rnd(100) < clamp(squadrunchance, 0, 100);
++        // iter5: randomise which way the sweep breaks first (see squadtargetdirsign's own
++        // comment above) - independent 50/50 coin flip, same rnd() idiom as every other
++        // per-session draw in this function. Harmless (and cheap) to draw even for a
++        // static session; squadcurrentx()/squadcurrentdir() only ever consult it when
++        // squadtargetmoving is true.
++        squadtargetdirsign = rnd(2) ? 1.0f : -1.0f;
 +
 +        // SwiftGibs Reverse Firing Squad (playtest 2 bug fix, amendment 6): April - "when
 +        // the firing squad comes up the leaderboard is over top of it. the firing squad
@@ -559,9 +579,11 @@
 +        float t = max(lastmillis - squadsess.start, 0) / 1000.0f;
 +        float m = fmodf(SQUADRUNSPEED*t, 4*amp);
 +        if(m < 0) m += 4*amp;
-+        if(m <= amp) return m;
-+        if(m <= 3*amp) return 2*amp - m;
-+        return m - 4*amp;
++        float x;
++        if(m <= amp) x = m;
++        else if(m <= 3*amp) x = 2*amp - m;
++        else x = m - 4*amp;
++        return squadtargetdirsign*x;   // iter5: per-session starting direction/phase - see squadtargetdirsign's own comment
 +    }
 +
 +    // amendment 8: direction of travel at the current instant (+1 toward +right/+x,
@@ -577,7 +599,8 @@
 +        float t = max(lastmillis - squadsess.start, 0) / 1000.0f;
 +        float m = fmodf(SQUADRUNSPEED*t, 4*amp);
 +        if(m < 0) m += 4*amp;
-+        return (m <= amp || m > 3*amp) ? 1.0f : -1.0f;
++        float dir = (m <= amp || m > 3*amp) ? 1.0f : -1.0f;
++        return squadtargetdirsign*dir;   // iter5: per-session starting direction/phase - see squadtargetdirsign's own comment; keeps this in lockstep with squadcurrentx() above so render/hitscan can never disagree
 +    }
 +
 +    // fpsgame/weapon.cpp's muzzleflash/muzzlelight VARPs (stock settings that gate the
@@ -774,7 +797,7 @@
      // === SwiftGibs reload metronome (audio tick/ding over the rifle reload) ===
      VARP(reloadmetronome, 0, 0, 2);      // 0=off, 1=flat, 2=rising
      VARP(reloadmetrovol, 0, 200, 255);   // playsound volume (0..255; 255=full)
-@@ -1874,6 +2563,70 @@
+@@ -1874,6 +2586,70 @@
          pophudmatrix();
      }
  
@@ -845,7 +868,7 @@
      void gameplayhud(int w, int h)
      {
          pushhudmatrix();
-@@ -1911,6 +2664,7 @@
+@@ -1911,6 +2687,7 @@
          drawflagpopup(w, h);
          if(!hitmarkerdemoing()) drawhitmarker(w, h);
          if(!streakfxdemoing()) drawstreakfx(w, h);
@@ -853,7 +876,7 @@
  
          pophudmatrix();
  
-@@ -1950,9 +2704,36 @@
+@@ -1950,9 +2727,36 @@
      int selectcrosshair(vec &color)
      {
          fpsent *d = hudplayer();
