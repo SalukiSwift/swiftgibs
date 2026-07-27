@@ -17,7 +17,7 @@
  namespace game
  {
      bool intermission = false;
-@@ -238,9 +248,25 @@
+@@ -238,9 +248,28 @@
  
      void updatereloadmetronome();
      void checkautorespawn();   // SwiftGibs Task 7: defined below, after the cue-demo helpers it checks
@@ -27,8 +27,11 @@
 +    // too; squadexit()/squadupdate()/squadfire() are grouped alongside it for cohesion.
 +    // See docs/prd/reverse-firing-squad.md, docs/adr/0002 (this task's core ADR) and
 +    // docs/superpowers/specs/2026-07-23-reverse-firing-squad-design.md amendment 1
-+    // (autorespawn interaction), amendment 2 (this is patch 17, not 16) and amendment 3
-+    // (fixed squad size 3 - no ladder/progression).
++    // (autorespawn interaction), amendment 2 (this is patch 17, not 16), amendment 3
++    // (fixed squad size 3, superseded), amendment 4 (playtest 1 redesign: single
++    // randomised target, grey arena, no kill counter) and amendment 5 (playtest 1 bug:
++    // the ray must be built from the same live camera1 angles that drive the squad
++    // view, not the frozen player1->yaw/pitch - see squadfire() below).
 +    void squadenter();
 +    void squadexit(int reason);
 +    void squadupdate();
@@ -43,7 +46,7 @@
          if(!maptime) { maptime = lastmillis; maprealtime = totalmillis; return; }
          if(!curtime) { gets2c(); if(player1->clientnum>=0) c2sinfo(); return; }
  
-@@ -398,6 +424,90 @@
+@@ -398,6 +427,120 @@
      int respawncountat[3] = { -1, -1, -1 };      // lastmillis timestamps; -1 = not scheduled this death
      bool respawncountfired[3] = { false, false, false };
  
@@ -54,7 +57,9 @@
 +    // must hold for the WHOLE session - including the pre-cut-in beat below - not just
 +    // once the window is visually open; amendment 2: this is patch 17, not 16; amendment
 +    // 3: fixed squad size 3 - the PRD's wave ladder, rung state and promote/demote are
-+    // OUT of scope, superseded by April 2026-07-23).
++    // OUT of scope, superseded by April 2026-07-23; amendment 4 (2026-07-24 playtest 1):
++    // squad size is now 1, randomised in position each session - amendment 3's "3" is
++    // itself superseded, see SQUADSIZE below; amendment 5: the aim bug fix, squadfire()).
 +    //
 +    // squadenter()/squadexit()/squadupdate()/squadfire() bodies live further down this
 +    // file (after reloaddemoing()/hitmarkerdemoing()/streakfxdemoing(), which squadenter()
@@ -74,8 +79,11 @@
 +    // for the message itself - see squadexit() below.
 +    enum { SQUADEND_TIMEOUT = 0, SQUADEND_BAIL, SQUADEND_ABORT, SQUADEND_CLEARED };
 +    static const int SQUADENTRYBEAT = 400;   // PRD: brief beat to register the death as normal
-+    static const int SQUADSIZE = 3;          // amendment 3: fixed squad size, no ladder/progression
-+    static const int SQUADCLEARGRACE = 400;  // Task 3: beat between the 3rd kill and squadexit(SQUADEND_CLEARED) - long enough for the final gibeffect/particles to actually render before the void disappears
++    static const int SQUADSIZE = 1;          // amendment 4 (playtest 1 redesign): single target per
++                                              // session (was 3 under amendment 3); pool machinery kept
++                                              // generic on SQUADSIZE rather than hardcoded, in case a
++                                              // future revision changes it again
++    static const int SQUADCLEARGRACE = 400;  // Task 3: beat between the killing blow and squadexit(SQUADEND_CLEARED) - long enough for the final gibeffect/particles to actually render before the void disappears
 +
 +    struct squadsession
 +    {
@@ -88,7 +96,7 @@
 +                         // to NONE, until the next squadenter() overwrites it
 +        int lastreason;  // SQUADEND_* passed to the most recent squadexit(), same persistence
 +        int lastfire;    // lastmillis of the last squadfire() call, for the cooldown
-+        int clearedat;   // Task 3: lastmillis of the killing 3rd blow, -1 if not yet cleared -
++        int clearedat;   // Task 3: lastmillis of the killing blow, -1 if not yet cleared -
 +                         // drives the SQUADCLEARGRACE close in squadupdate()
 +    };
 +    squadsession squadsess = { SQUADSTATE_NONE, 0, 0, 0, false, -1, -1000000, -1 };
@@ -96,24 +104,49 @@
 +    bool squadactive() { return squadsess.state == SQUADSTATE_ACTIVE; }        // window visually open (past the cut-in) - gates doattack()'s fire-vs-respawn branch
 +    bool squadsessionopen() { return squadsess.state != SQUADSTATE_NONE; }     // a session exists at all (pending OR active) - gates the checkautorespawn() hold (amendment 1: the hold covers the pre-cut-in beat too)
 +
-+    // === SwiftGibs Reverse Firing Squad (Task 2, ADR-0003): the dummy pool - lazily-
-+    // allocated, session-lifetime fpsents (memory-resident once created, per the PRD's
-+    // zero-hitch requirement), fixed size SQUADSIZE (amendment 3: always exactly 3, no
-+    // ladder). fpsgame/render.cpp's squadrender() (Task 2, engine-visible via
++    // === SwiftGibs Reverse Firing Squad (Task 2, ADR-0003; amendment 4 playtest 1
++    // redesign): the target pool - lazily-allocated, session-lifetime fpsents
++    // (memory-resident once created, per the PRD's zero-hitch requirement), fixed size
++    // SQUADSIZE (amendment 4: a single randomised target per session, was 3 under
++    // amendment 3). fpsgame/render.cpp's squadrender() (Task 2, engine-visible via
 +    // shared/igame.h) reads this pool through the three accessors below rather than a
 +    // new shared header, since it's fpsgame-internal-only cross-file state (same module,
-+    // no engine visibility needed). Each dead flag resets in squadenter() below, so every
-+    // new session starts with a fresh line of 3; Task 3's hitscan will be the only thing
-+    // that ever sets one true. ===
-+    fpsent *squadpoolents[SQUADSIZE] = { NULL, NULL, NULL };
-+    bool squaddead[SQUADSIZE] = { false, false, false };
++    // no engine visibility needed). The dead flag resets in squadenter() below, so every
++    // new session starts with the target alive again; Task 3's hitscan is the only thing
++    // that ever sets it true. Kept as an array of SQUADSIZE (not a bare fpsent*) so the
++    // pool machinery stays generic if SQUADSIZE ever changes again. ===
++    fpsent *squadpoolents[SQUADSIZE] = { NULL };
++    bool squaddead[SQUADSIZE] = { false };
 +    // ADR-0003 placement: the arena's own "forward" reference direction - the yaw the
-+    // player was looking at the instant the void cut in (snapshotted in squadupdate()'s
-+    // PENDING->ACTIVE transition below), NOT re-sampled every frame. The dummy line is
-+    // placed relative to this fixed direction so it stays put in arena space while the
-+    // player's live yaw/pitch (camera1, driven by ordinary mouse look) freely looks
-+    // around it - see fpsgame/render.cpp squadrender().
++    // live camera (camera1, the same object that drives engine/rendergl.cpp's squadview
++    // render camera - see squadupdate() below and squadfire()'s own note on why this
++    // must be camera1, not player1) was facing the instant the void cut in, snapshotted
++    // once at that transition, NOT re-sampled every frame. The target is placed relative
++    // to this fixed direction so it stays put in arena space while the player's live
++    // view (camera1, driven by ordinary mouse look) freely looks around it - see
++    // fpsgame/render.cpp squadrender().
 +    float squadfacingyaw = 0;
++    // amendment 4 (playtest 1 redesign): the single target's randomised offset from the
++    // arena origin, resolved once per session in squadenter() below from the
++    // squadtarget*range/min/max VARs - horizontal (right vector), vertical (world z) and
++    // distance (forward vector). Read by fpsgame/render.cpp squadrender() alongside
++    // squadfacingyaw, same extern pattern.
++    float squadtargetdist = 0, squadtargetx = 0, squadtargetz = 0;
++
++    // amendment 4: placement ranges, VAR (not VARP - "constants first... not VARPs
++    // unless trivially free") so they're playtest-tunable without joining the profile
++    // surface. Chosen so the target is always inside a comfortable FOV of the cut-in
++    // facing ("findable without spinning"): default fov 100 -> ~50deg horizontal / ~34deg
++    // vertical half-FOV at 16:9 (fovy = 2*atan2(tan(50deg), aspect)). Worst case (min
++    // distance 28, max |x| 18, max z 10) is a ~33deg horizontal-only offset and a ~36deg
++    // diagonal offset - both still inside the viewport (a rectangular screen's diagonal
++    // FOV exceeds either axis's half-FOV alone), so the target stays reachable without
++    // spinning even in the most extreme random draw.
++    VAR(squadtargetdistmin, 1, 28, 1000);    // nearest the target can spawn, engine units
++    VAR(squadtargetdistmax, 1, 60, 1000);    // farthest the target can spawn, engine units
++    VAR(squadtargetxrange, 0, 18, 1000);     // horizontal offset magnitude - actual offset is +/- this, randomised
++    VAR(squadtargetzmin, -1000, -6, 1000);   // vertical offset range, lower bound (down)
++    VAR(squadtargetzmax, -1000, 10, 1000);   // vertical offset range, upper bound (up)
 +
 +    int squadpoolsize() { return SQUADSIZE; }
 +
@@ -134,7 +167,7 @@
      // inputs
  
      VARP(attackspawn, 0, 1, 1);
-@@ -405,7 +515,14 @@
+@@ -405,7 +548,14 @@
      void doattack(bool on)
      {
          if(!connected || intermission) return;
@@ -150,7 +183,7 @@
      }
  
      VARP(jumpspawn, 0, 1, 1);
-@@ -413,6 +530,15 @@
+@@ -413,6 +563,15 @@
      bool canjump()
      {
          if(!connected || intermission) return false;
@@ -166,7 +199,7 @@
          if(jumpspawn) respawn();
          return player1->state!=CS_DEAD;
      }
-@@ -594,6 +720,14 @@
+@@ -594,6 +753,14 @@
                      respawncountfired[i] = true;
                  }
              }
@@ -181,7 +214,7 @@
          }
          else
          {
-@@ -749,6 +883,9 @@
+@@ -749,6 +916,9 @@
          else
          {
              intermission = true;
@@ -191,7 +224,7 @@
              player1->attacking = false;
              if(cmode) cmode->gameover();
              conoutf(CON_GAMEINFO, "\f2intermission:");
-@@ -840,6 +977,10 @@
+@@ -840,6 +1010,10 @@
  
      void startgame()
      {
@@ -202,7 +235,7 @@
          clearmovables();
          clearmonsters();
  
-@@ -1642,7 +1783,12 @@
+@@ -1642,7 +1816,12 @@
      }
      void drawexpandedmap(int w, int h)
      {
@@ -216,7 +249,7 @@
          fpsent *d = hudplayer();
          float S = 1560.0f, cx = w*900.0f/h, cy = 900.0f;
          float x0 = cx - S*0.5f, y0 = cy - S*0.5f;
-@@ -1782,13 +1928,189 @@
+@@ -1782,13 +1961,236 @@
              respawnreadyfired = true;
              if(respawnreadysound) playsoundname("swiftgibs/respawnready");
          }
@@ -263,30 +296,43 @@
 +        squadsess.cleared = false;
 +        squadsess.lastfire = -1000000;
 +        squadsess.clearedat = -1;   // SwiftGibs Task 3: no clear pending yet this session
-+        loopi(SQUADSIZE) squaddead[i] = false;   // SwiftGibs Task 2 (ADR-0003): fresh line of 3 every session
++        loopi(SQUADSIZE) squaddead[i] = false;   // SwiftGibs Task 2 (ADR-0003): the target is alive again this session
++
++        // amendment 4 (playtest 1 redesign): randomise the single target's position for
++        // this session - independent draws per axis via the engine's own rnd() (same
++        // idiom as e.g. weapon.cpp's gib scatter, `vec to(rnd(100)-50, ...)`), so
++        // consecutive deaths rarely repeat a position. rnd(n) is a macro (`% n`,
++        // shared/tools.h) - UB on n==0, so every call below is sized max(range,0)+1
++        // (always >=1) rather than branching around a possible zero range.
++        int distrange = max(squadtargetdistmax - squadtargetdistmin, 0);
++        squadtargetdist = float(squadtargetdistmin + rnd(distrange + 1));
++        int xr = max(squadtargetxrange, 0);
++        squadtargetx = float(rnd(2*xr + 1) - xr);
++        int zrange = max(squadtargetzmax - squadtargetzmin, 0);
++        squadtargetz = float(squadtargetzmin + rnd(zrange + 1));
 +    }
 +
 +    void squadexit(int reason)
 +    {
 +        if(squadsess.state == SQUADSTATE_NONE) return;
-+        // amendment 3: no ladder/progression to update - just record whether the wave
-+        // was fully cleared (kills reached SQUADSIZE) and why the session ended, for
-+        // Task 4's end-of-session result line. A clear recorded here survives regardless
-+        // of `reason` - even an external abort right after the last kill still reads as
-+        // cleared, not as a dangling failure.
++        // amendment 4 (playtest 1 redesign): no ladder/progression to update - just
++        // record whether the target went down (kills >= SQUADSIZE, now 1) and why the
++        // session ended, for the end-of-session result line below. A clear recorded here
++        // survives regardless of `reason` - even an external abort right after the kill
++        // still reads as cleared, not as a dangling failure.
 +        squadsess.cleared = squadsess.kills >= SQUADSIZE;
 +        squadsess.lastreason = reason;
 +        squadsess.state = SQUADSTATE_NONE;
-+        // SwiftGibs Task 3 (design spec: "all-3-dead ends the session with a cleared
-+        // result line; window end = failed result line"): a full clear always prints the
-+        // cleared line, however the session actually closed (the SQUADCLEARGRACE exit in
++        // amendment 4 (design spec: "hitting the target = session cleared ('target
++        // down'); window end without a hit = 'missed'"): a clear always prints "target
++        // down", however the session actually closed (the SQUADCLEARGRACE exit in
 +        // squadupdate() below, or a natural window-end SQUADEND_TIMEOUT landing in the
-+        // very same frame as the 3rd kill - `cleared` is the source of truth here, not
-+        // `reason`). An incomplete wave only prints on a natural SQUADEND_TIMEOUT
-+        // ("window end without clear"); a deliberate SQUADEND_BAIL (jump) or an external
-+        // SQUADEND_ABORT (map change/disconnect/etc.) stay silent - no result to report.
-+        if(squadsess.cleared) conoutf(CON_GAMEINFO, "squad cleared: %d/%d", squadsess.kills, SQUADSIZE);
-+        else if(reason == SQUADEND_TIMEOUT) conoutf(CON_GAMEINFO, "squad survived: you got %d/%d", squadsess.kills, SQUADSIZE);
++        // very same frame as the kill - `cleared` is the source of truth here, not
++        // `reason`). A miss only prints on a natural SQUADEND_TIMEOUT ("window end
++        // without a hit"); a deliberate SQUADEND_BAIL (jump) or an external SQUADEND_ABORT
++        // (map change/disconnect/etc.) stay silent - no result to report.
++        if(squadsess.cleared) conoutf(CON_GAMEINFO, "target down");
++        else if(reason == SQUADEND_TIMEOUT) conoutf(CON_GAMEINFO, "missed");
 +    }
 +
 +    void squadupdate()
@@ -308,10 +354,25 @@
 +        if(squadsess.state == SQUADSTATE_PENDING && lastmillis >= squadsess.start)
 +        {
 +            squadsess.state = SQUADSTATE_ACTIVE;
-+            squadfacingyaw = player1->yaw;   // ADR-0003: snapshot once, right as the void appears
++            // amendment 5 (playtest 1 bug fix): snapshot camera1->yaw, NOT player1->yaw.
++            // Root cause (proved in the mirror harness, see fs-iter1-report.md): while
++            // player1->state==CS_DEAD, engine/rendergl.cpp's recomputecamera() detects
++            // game::detachcamera() (true whenever the hud player is CS_DEAD) and swaps
++            // camera1 to a separate tempcamera object, copied ONCE from player1 at the
++            // instant of death. From then on mousemove() mutates camera1->yaw/pitch
++            // directly every frame (live mouselook), but its player-sync line
++            // (`if(camera1!=player && !detachedcamera) player->yaw = camera1->yaw...`) is
++            // skipped because detachedcamera is now true - so player1->yaw/pitch are
++            // frozen at the exact moment-of-death value for the rest of the death, and
++            // camera1->yaw/pitch are the only thing that actually tracks the mouse. This
++            // is also exactly what engine/rendergl.cpp's squadview::start() reads
++            // (`camera.yaw = oldcamera->yaw` where `oldcamera = camera1`), so snapshotting
++            // camera1->yaw here keeps the target's placement basis and the rendered
++            // camera provably the same live source - not two paths that happen to agree.
++            squadfacingyaw = camera1->yaw;
 +        }
-+        // SwiftGibs Task 3: all-3-dead grace beat. squadfire() stamps clearedat on the
-+        // killing 3rd blow rather than closing the session synchronously, so the final
++        // SwiftGibs Task 3: target-down grace beat. squadfire() stamps clearedat on the
++        // killing blow rather than closing the session synchronously, so the final
 +        // gibeffect/particles get at least one squad-view render pass before the void
 +        // disappears (brief: "if instant exit would cut the final gib, a short grace
 +        // beat is acceptable" - SQUADCLEARGRACE, 400ms, same order as SQUADENTRYBEAT).
@@ -334,7 +395,7 @@
 +    // 100; game.h's m_insta spawnstate(): 1hp spawn health -> a real kill's effective
 +    // "damage" is max(-health,0) = 99) so the gib looks identical to a real frag rather
 +    // than an arbitrary number. SQUADRAYLEN matches engine/rendergl.cpp squadview::'s own
-+    // farplane (1024) - comfortably past any dummy at squaddummydistance.
++    // farplane (1024) - comfortably past any target within squadtargetdistmax.
 +    static const int SQUADGIBDAMAGE = 99;
 +    static const float SQUADRAYLEN = 1024.0f;
 +
@@ -344,18 +405,37 @@
 +        if(lastmillis - squadsess.lastfire < squadfirerate) return;
 +        squadsess.lastfire = lastmillis;
 +
-+        // ADR-0003: ray "from the squad camera through the live view direction". The
-+        // squad camera (engine/rendergl.cpp's squadview::, Task 2) only exists as a
-+        // transient camera1 swap *inside* gl_drawframe(), already reverted by the time
-+        // this game-logic-tick function runs, so the ray is rebuilt independently here
-+        // from the same "arena origin at eye height" squadview::start() itself uses
-+        // (squadeyeheight, extern'd above - Task 2's own tunable, kept in sync rather
-+        // than duplicating the constant) and the player's LIVE yaw/pitch (player1->yaw/
-+        // pitch - the same live values squadview::start() copies from camera1==player1;
-+        // NOT squadfacingyaw, which is the frozen direction the dummy line itself faces).
++        // amendment 5 (playtest 1 bug fix): ray "from the squad camera through the live
++        // view direction", built from camera1->yaw/pitch, NOT player1->yaw/pitch.
++        //
++        // T3's original implementation used player1->yaw/pitch on the (wrong) assumption
++        // that they were "the same live values squadview::start() copies from
++        // camera1==player1" while dead. They are not equal while dead: engine/rendergl.cpp's
++        // recomputecamera() calls game::detachcamera() (true whenever the hud player is
++        // CS_DEAD), which detaches camera1 onto a separate tempcamera object the very
++        // first frame of death - copied once from player1 at that instant, then driven
++        // live by mousemove()'s `camera1->yaw += dx*cursens` every frame after, with its
++        // player1-sync line skipped (`if(camera1!=player && !detachedcamera)` - false,
++        // since detachedcamera is now true). So player1->yaw/pitch freeze at the
++        // moment-of-death value for the whole session, while camera1->yaw/pitch is the
++        // only thing that actually tracks the mouse - and squadview::start() itself reads
++        // camera1 (`oldcamera = camera1; camera.yaw = oldcamera->yaw`), not player1. Proof
++        // (mirror harness, fs-iter1-report.md): player1->yaw stayed constant across frames
++        // while simulated mouse deltas drove camera1->yaw continuously, for the entire
++        // dead period; and squadfacingyaw (squadupdate() above) was snapshotted from the
++        // same frozen player1->yaw, which is exactly why the ray always lined up with the
++        // target's own placement basis regardless of aim - both derived from the same
++        // frozen scalar. Building the ray from camera1->yaw/pitch instead makes the ray
++        // and the rendered squad-view camera provably the same live source (literally the
++        // same object squadview::start() reads oldcamera->yaw from), so a deliberate miss
++        // now misses.
++        //
++        // The ray origin itself (squadeyeheight, extern'd above - Task 2's own tunable,
++        // kept in sync rather than duplicating the constant) is unaffected by this bug -
++        // "arena origin at eye height" was never about yaw/pitch.
 +        vec from(0, 0, float(squadeyeheight));
 +        vec dir;
-+        vecfromyawpitch(player1->yaw, player1->pitch, 1, 0, dir);
++        vecfromyawpitch(camera1->yaw, camera1->pitch, 1, 0, dir);
 +        vec to = vec(dir).mul(SQUADRAYLEN).add(from);
 +
 +        // ADR-0003: "test vs ALIVE pool members with the same bbox intersect() the real
@@ -396,18 +476,18 @@
 +        lasthit = lastmillis;
 +        triggerhitmarker(SQUADGIBDAMAGE);
 +
-+        // amendment 3 / this task: all 3 dead ends the session - but not synchronously.
-+        // An instant squadexit() here would flip squadactive() false before this frame's
-+        // gibeffect/particles ever get a render pass, cutting the final kill's gib.
-+        // Just mark the moment; squadupdate() closes the session SQUADCLEARGRACE ms
-+        // later, once the gib has had a moment on screen (see squadupdate() below).
++        // amendment 4: the target down ends the session - but not synchronously. An
++        // instant squadexit() here would flip squadactive() false before this frame's
++        // gibeffect/particles ever get a render pass, cutting the kill's gib. Just mark
++        // the moment; squadupdate() closes the session SQUADCLEARGRACE ms later, once the
++        // gib has had a moment on screen (see squadupdate() below).
 +        if(squadsess.kills >= SQUADSIZE && squadsess.clearedat < 0) squadsess.clearedat = lastmillis;
 +    }
 +
      // === SwiftGibs reload metronome (audio tick/ding over the rifle reload) ===
      VARP(reloadmetronome, 0, 0, 2);      // 0=off, 1=flat, 2=rising
      VARP(reloadmetrovol, 0, 200, 255);   // playsound volume (0..255; 255=full)
-@@ -1874,6 +2196,73 @@
+@@ -1874,6 +2276,70 @@
          pophudmatrix();
      }
  
@@ -422,22 +502,19 @@
 +    // drawexpandedmap() already use - that scope is only ever entered when
 +    // !mainmenu && !hidehud (engine/rendergl.cpp's gl_drawhud), so hidehud/cleanshots
 +    // hide the squad HUD for free, no separate check needed here.
++    // amendment 4 (playtest 1 redesign): the kills/SQUADSIZE counter is REMOVED - a
++    // single target has no meaningful count to show. Time bar and final 3-2-1 stay.
 +    void drawsquadhud(int w, int h)
 +    {
 +        if(!squadactive()) return;
 +        float cx = w * 900.0f / h, cy = 900.0f;
 +        cuefamily(0, 0, 100);   // neutral - the squad HUD has no cue-colour surface of its own (design spec: "no new cue-colour surface in v1")
 +
-+        // --- kill counter: kills/SQUADSIZE, top-centre ---
-+        defformatstring(kstr, "%d/%d", squadsess.kills, SQUADSIZE);
-+        int ktw, kth; text_bounds(kstr, ktw, kth);
-+        { float kr = 1.0f, kg = 1.0f, kb = 1.0f, ka = 0.92f; cueapply(kr, kg, kb, ka); draw_text(kstr, int(cx - ktw/2.0f), 60, int(kr*255.0f), int(kg*255.0f), int(kb*255.0f), int(ka*255.0f)); }
-+
-+        // --- time bar: fraction of the visible window (start..end) remaining, directly below the counter ---
++        // --- time bar: fraction of the visible window (start..end) remaining ---
 +        int span = max(squadsess.end - squadsess.start, 1);
 +        float frac = clamp((squadsess.end - lastmillis) / float(span), 0.0f, 1.0f);
 +        const float barhalfw = 180.0f, barhalfh = 6.0f;
-+        float bary = 60.0f + kth + 22.0f;
++        float bary = 60.0f;
 +        hudnotextureshader->set();
 +        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 +        reloadbar(cx, bary, barhalfw, barhalfh, 1.0f, 1.0f, 1.0f, 0.22f);   // track
@@ -446,8 +523,8 @@
 +
 +        // --- final 3-2-1: last 3s of the window, suppressed once a clear is already
 +        // locked in (squadsess.clearedat >= 0, the SQUADCLEARGRACE beat from Task 3) -
-+        // the task brief's own judgment call: keep the counter calm at SQUADSIZE/
-+        // SQUADSIZE rather than flashing a countdown the player has already beaten.
++        // the task brief's own judgment call: stay calm once the target is already down
++        // rather than flashing a countdown the player has already beaten.
 +        if(squadsess.clearedat < 0)
 +        {
 +            int remain = squadsess.end - lastmillis;
@@ -481,7 +558,7 @@
      void gameplayhud(int w, int h)
      {
          pushhudmatrix();
-@@ -1911,6 +2300,7 @@
+@@ -1911,6 +2377,7 @@
          drawflagpopup(w, h);
          if(!hitmarkerdemoing()) drawhitmarker(w, h);
          if(!streakfxdemoing()) drawstreakfx(w, h);
@@ -489,7 +566,7 @@
  
          pophudmatrix();
  
-@@ -1950,7 +2340,13 @@
+@@ -1950,7 +2417,13 @@
      int selectcrosshair(vec &color)
      {
          fpsent *d = hudplayer();
@@ -506,28 +583,27 @@
  
 --- a/fpsgame/render.cpp
 +++ b/fpsgame/render.cpp
-@@ -512,6 +512,53 @@
+@@ -512,6 +512,54 @@
          renderplayer(previewent, *mdlinfo, team >= 0 && team <= 2 ? team : 0, 1, false);
      }
  
-+    // === SwiftGibs Reverse Firing Squad (Task 2, ADR-0001/0003): squad-view render pass.
-+    // Called from engine::gl_drawframe (via shared/igame.h) while game::squadactive() -
-+    // see engine/rendergl.cpp's squadview:: namespace, which has already swapped camera1
-+    // to the arena eye position by the time this runs. Draws the pooled dummy fpsents
-+    // (Task 2, fpsgame/fps.cpp) through the exact same renderplayer() the real match
-+    // uses (team 2 -> flat-red skin, ADR-0003), skipping any already-dead member. The
-+    // dummy pool itself (squadpoolsize()/squadpoolent()/squadpooldead()) is defined in
-+    // fps.cpp, alongside the session it belongs to - forward-declared here rather than
-+    // added to fpsgame/game.h, since render.cpp is the only other file that needs them
-+    // (Task 2 brief keeps this patch's touched files to
++    // === SwiftGibs Reverse Firing Squad (Task 2, ADR-0001/0003; amendment 4 playtest 1
++    // redesign): squad-view render pass. Called from engine::gl_drawframe (via
++    // shared/igame.h) while game::squadactive() - see engine/rendergl.cpp's squadview::
++    // namespace, which has already swapped camera1 to the arena eye position by the time
++    // this runs. Draws the pooled target fpsent(s) (Task 2, fpsgame/fps.cpp) through the
++    // exact same renderplayer() the real match uses (team 2 -> flat-red skin, ADR-0003),
++    // skipping any already-dead member. The pool itself
++    // (squadpoolsize()/squadpoolent()/squadpooldead()) is defined in fps.cpp, alongside
++    // the session it belongs to - forward-declared here rather than added to
++    // fpsgame/game.h, since render.cpp is the only other file that needs them (Task 2
++    // brief keeps this patch's touched files to
 +    // fps.cpp/render.cpp/rendergl.cpp/igame.h). ===
 +    extern int squadpoolsize();
 +    extern fpsent *squadpoolent(int idx);
 +    extern bool squadpooldead(int idx);
 +    extern float squadfacingyaw;
-+
-+    VAR(squaddummydistance, 1, 40, 1000);   // ADR-0003 placement: distance from the arena eye, engine units (Task 5 tunable)
-+    VAR(squaddummyspacing, 1, 12, 1000);    // ADR-0003 placement: spacing between adjacent dummies, engine units (Task 5 tunable)
++    extern float squadtargetdist, squadtargetx, squadtargetz;   // amendment 4: per-session randomised placement, fps.cpp's squadenter()
 +
 +    void squadrender()
 +    {
@@ -537,16 +613,18 @@
 +        {
 +            if(squadpooldead(i)) continue;   // ADR-0003: a killed member is skipped by the render
 +            fpsent *d = squadpoolent(i);
-+            float xoffset = (i - (n - 1)/2.0f) * squaddummyspacing;
 +            // ADR-0003: placed relative to the arena's fixed facing (squadfacingyaw,
 +            // snapshotted once at cut-in - fpsgame/fps.cpp), not the live camera yaw
-+            // (which the player freely mouse-looks with) - otherwise the line would
++            // (which the player freely mouse-looks with) - otherwise the target would
 +            // chase the player's view instead of standing still to be aimed at.
++            // amendment 4: horizontal/vertical/distance offsets are randomised once per
++            // session (squadtargetx/z/dist, fps.cpp's squadenter()) rather than a fixed
++            // per-index spacing - see fps.cpp for the tuned ranges and FOV rationale.
 +            vec fwd(-sinf(squadfacingyaw*RAD), cosf(squadfacingyaw*RAD), 0);
 +            vec right(cosf(squadfacingyaw*RAD), sinf(squadfacingyaw*RAD), 0);
-+            d->o = vec(camera1->o).add(vec(fwd).mul(squaddummydistance)).add(vec(right).mul(xoffset));
++            d->o = vec(camera1->o).add(vec(fwd).mul(squadtargetdist)).add(vec(right).mul(squadtargetx)).addz(squadtargetz);
 +            float yaw, pitch;
-+            vectoyawpitch(vec(camera1->o).sub(d->o), yaw, pitch);   // ADR-0003: centred line facing the camera (arena) origin
++            vectoyawpitch(vec(camera1->o).sub(d->o), yaw, pitch);   // ADR-0003: target faces the camera (arena) origin
 +            d->yaw = yaw;
 +            d->pitch = 0;
 +            d->light.color = vec(1, 1, 1);
@@ -609,7 +687,7 @@
 +
 +        clearfogdist();
 +        zerofogcolor();
-+        glClearColor(242/255.0f, 242/255.0f, 242/255.0f, 1);   // PRD off-white void, ~#f2f2f2
++        glClearColor(0x33/255.0f, 0x33/255.0f, 0x3a/255.0f, 1);   // amendment 4 (playtest 1): dark neutral grey void, ~#33333a - the PRD's off-white flashbanged players coming from dark maps
 +
 +        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 +
