@@ -1,6 +1,6 @@
 --- a/fpsgame/fps.cpp
 +++ b/fpsgame/fps.cpp
-@@ -1,6 +1,16 @@
+@@ -1,6 +1,30 @@
  #include "game.h"
  #include "texture.h"
  
@@ -14,10 +14,24 @@
 +// that could never link against the real definition).
 +extern int squadeyeheight;
 +
++// SwiftGibs Reverse Firing Squad (amendment 8, playtest 3 follow-up): fov/screenw/
++// screenh/forceaspect are likewise plain globals at file scope in engine/rendergl.cpp
++// (`fov`, `forceaspect`, both declared above rendergl.cpp's own squadview:: namespace)
++// and engine/main.cpp (`screenw`/`screenh`) - not inside any namespace, not declared in
++// any shared header fpsgame includes. squadenter() below needs all four to derive the
++// SAME horizontal-to-vertical FOV conversion engine/rendergl.cpp's squadview::start()
++// uses for the arena camera's own projection (`fovy = 2*atan2(tan(curfov/2*RAD),
++// aspect)/RAD`), so the randomised target-placement range can be scaled to whatever fov
++// the arena will actually render at, rather than a fixed constant range that only
++// happens to fit one fov (iter1 review, flagged Important).
++extern int fov;
++extern int screenw, screenh;
++extern float forceaspect;
++
  namespace game
  {
      bool intermission = false;
-@@ -238,9 +248,28 @@
+@@ -238,9 +262,28 @@
  
      void updatereloadmetronome();
      void checkautorespawn();   // SwiftGibs Task 7: defined below, after the cue-demo helpers it checks
@@ -46,7 +60,7 @@
          if(!maptime) { maptime = lastmillis; maprealtime = totalmillis; return; }
          if(!curtime) { gets2c(); if(player1->clientnum>=0) c2sinfo(); return; }
  
-@@ -398,6 +427,120 @@
+@@ -398,6 +441,145 @@
      int respawncountat[3] = { -1, -1, -1 };      // lastmillis timestamps; -1 = not scheduled this death
      bool respawncountfired[3] = { false, false, false };
  
@@ -132,21 +146,46 @@
 +    // distance (forward vector). Read by fpsgame/render.cpp squadrender() alongside
 +    // squadfacingyaw, same extern pattern.
 +    float squadtargetdist = 0, squadtargetx = 0, squadtargetz = 0;
++    // amendment 8 (playtest 3 follow-up): the FOV-scaled horizontal cap actually used
++    // this session (min(squadtargetxrange, the live per-axis frustum bound), computed
++    // once in squadenter() below) - doubles as both the static target's +/- draw range
++    // and the running target's sweep amplitude, so a running session can never sweep
++    // further than a static one could have been placed. squadtargetmoving is this
++    // session's coin-flip (squadrunchance% chance) between a stationary target (false,
++    // all prior iterations' behaviour, unchanged) and a target that runs laterally
++    // across the arena (true) - see squadcurrentx()/squadcurrentdir() below.
++    float squadtargetxcap = 0;
++    bool squadtargetmoving = false;
 +
-+    // amendment 4: placement ranges, VAR (not VARP - "constants first... not VARPs
-+    // unless trivially free") so they're playtest-tunable without joining the profile
-+    // surface. Chosen so the target is always inside a comfortable FOV of the cut-in
-+    // facing ("findable without spinning"): default fov 100 -> ~50deg horizontal / ~34deg
-+    // vertical half-FOV at 16:9 (fovy = 2*atan2(tan(50deg), aspect)). Worst case (min
-+    // distance 28, max |x| 18, max z 10) is a ~33deg horizontal-only offset and a ~36deg
-+    // diagonal offset - both still inside the viewport (a rectangular screen's diagonal
-+    // FOV exceeds either axis's half-FOV alone), so the target stays reachable without
-+    // spinning even in the most extreme random draw.
-+    VAR(squadtargetdistmin, 1, 28, 1000);    // nearest the target can spawn, engine units
-+    VAR(squadtargetdistmax, 1, 60, 1000);    // farthest the target can spawn, engine units
-+    VAR(squadtargetxrange, 0, 18, 1000);     // horizontal offset magnitude - actual offset is +/- this, randomised
-+    VAR(squadtargetzmin, -1000, -6, 1000);   // vertical offset range, lower bound (down)
-+    VAR(squadtargetzmax, -1000, 10, 1000);   // vertical offset range, upper bound (up)
++    // amendment 8 (playtest 3 follow-up, supersedes amendment 4's ranges and fixes the
++    // iter1 review's Important): April - "i also think there should be a higher variance
++    // of position and distance away from the player." Widened well beyond iter1's
++    // 28-60u / +/-18u / -6..10u (below) - roughly 2.5-3x the spread on every axis - since
++    // the values below are now only the DESIRED upper bound, not the actual placement:
++    // squadenter() clamps them per-session to a proper per-axis frustum check against
++    // the CURRENT fov VARP (|x|/dist <= tan(halfhoriz)*margin, |z|/dist <=
++    // tan(halfvert)*margin, halfvert derived from halfhoriz + aspect via the exact same
++    // formula engine/rendergl.cpp's squadview::start() uses to build the arena camera's
++    // own fovy: `fovy = 2*atan2(tan(curfov/2*RAD), aspect)/RAD`, confirming fov is the
++    // HORIZONTAL half-angle basis, not vertical). This is the fix for the iter1 review's
++    // flagged Important: these ranges used to be fixed constants tuned for one fov
++    // (April's 120) while the arena camera re-reads the live fov VARP every frame, so a
++    // lower-fov player's tail-of-range draws could land off-screen - confirmed
++    // numerically (see fs-iter4-report.md): at fov 60, the OLD iter1 code could place
++    // z=10 at dist=28, a ~19.6deg offset that exceeds fov 60's own ~18deg vertical
++    // half-FOV - genuinely off-screen. The clamp below prevents that at any configured
++    // fov (10-150) while leaving the fuller widened range available whenever the live
++    // fov/distance combination has room for it (a generous fov, or simply a farther
++    // draw - the cap scales with distance, so "near and wide" - the exact combination
++    // iter1's own worst-case analysis flagged as the tightest case - is where it clamps
++    // hardest, and "far and wide" is where the widened range shows up the most).
++    VAR(squadtargetdistmin, 1, 20, 1000);    // nearest the target can spawn, engine units
++    VAR(squadtargetdistmax, 1, 110, 1000);   // farthest the target can spawn, engine units
++    VAR(squadtargetxrange, 0, 42, 1000);     // DESIRED horizontal offset magnitude before the FOV clamp - actual offset is +/- min(this, the live per-session cap)
++    VAR(squadtargetzmin, -1000, -16, 1000);  // DESIRED vertical offset range, lower bound (down), before the FOV clamp
++    VAR(squadtargetzmax, -1000, 26, 1000);   // DESIRED vertical offset range, upper bound (up), before the FOV clamp
++    VAR(squadfovmargin, 1, 80, 100);         // percent of the raw per-axis frustum bound actually used (80 = comfortable safety margin, not grazing the edge)
++    VAR(squadrunchance, 0, 50, 100);         // percent chance a session's target runs instead of standing still (April: "roughly half")
 +
 +    int squadpoolsize() { return SQUADSIZE; }
 +
@@ -167,7 +206,7 @@
      // inputs
  
      VARP(attackspawn, 0, 1, 1);
-@@ -405,7 +548,35 @@
+@@ -405,7 +587,35 @@
      void doattack(bool on)
      {
          if(!connected || intermission) return;
@@ -204,7 +243,7 @@
      }
  
      VARP(jumpspawn, 0, 1, 1);
-@@ -413,6 +584,15 @@
+@@ -413,6 +623,15 @@
      bool canjump()
      {
          if(!connected || intermission) return false;
@@ -220,7 +259,7 @@
          if(jumpspawn) respawn();
          return player1->state!=CS_DEAD;
      }
-@@ -594,6 +774,14 @@
+@@ -594,6 +813,14 @@
                      respawncountfired[i] = true;
                  }
              }
@@ -235,7 +274,7 @@
          }
          else
          {
-@@ -749,6 +937,9 @@
+@@ -749,6 +976,9 @@
          else
          {
              intermission = true;
@@ -245,7 +284,7 @@
              player1->attacking = false;
              if(cmode) cmode->gameover();
              conoutf(CON_GAMEINFO, "\f2intermission:");
-@@ -840,6 +1031,10 @@
+@@ -840,6 +1070,10 @@
  
      void startgame()
      {
@@ -256,7 +295,7 @@
          clearmovables();
          clearmonsters();
  
-@@ -1642,7 +1837,12 @@
+@@ -1642,7 +1876,12 @@
      }
      void drawexpandedmap(int w, int h)
      {
@@ -270,7 +309,7 @@
          fpsent *d = hudplayer();
          float S = 1560.0f, cx = w*900.0f/h, cy = 900.0f;
          float x0 = cx - S*0.5f, y0 = cy - S*0.5f;
-@@ -1782,13 +1982,363 @@
+@@ -1782,13 +2021,463 @@
              respawnreadyfired = true;
              if(respawnreadysound) playsoundname("swiftgibs/respawnready");
          }
@@ -327,10 +366,37 @@
 +        // (always >=1) rather than branching around a possible zero range.
 +        int distrange = max(squadtargetdistmax - squadtargetdistmin, 0);
 +        squadtargetdist = float(squadtargetdistmin + rnd(distrange + 1));
-+        int xr = max(squadtargetxrange, 0);
++
++        // amendment 8 (playtest 3 follow-up, CRITICAL FIX): scale the horizontal/vertical
++        // spread to the ACTUAL live fov, not the fixed-constant ranges above - see the
++        // VAR block's own comment for the full derivation. Read once here (death time),
++        // same "compute once, treat as fixed for the session" idiom squadfacingyaw itself
++        // uses (squadupdate() below) - a session lasts a few seconds, nobody changes fov
++        // mid-death, and disablezoom() (called on every death, fpsgame/fps.cpp) means
++        // `fov` itself (not the zoom-blended curfov) is always the player's true
++        // unzoomed setting by the time this runs anyway.
++        float sqaspect = forceaspect ? forceaspect : (screenh > 0 ? screenw/float(screenh) : 16/9.0f);
++        float sqhalfh = fov*0.5f*RAD;                     // half horizontal FOV, radians - fov VARP is the horizontal basis (confirmed by rendergl.cpp's own fovy derivation)
++        float sqhalfv = atan2f(tanf(sqhalfh), sqaspect);  // half vertical FOV, radians - same tan(hfov/2) = aspect*tan(vfov/2) relation squadview::start() uses
++        float sqmargin = clamp(squadfovmargin, 1, 100)/100.0f;
++        float sqcapx = squadtargetdist*tanf(sqhalfh)*sqmargin;   // |x|/dist <= tan(halfhoriz)*margin
++        float sqcapz = squadtargetdist*tanf(sqhalfv)*sqmargin;   // |z|/dist <= tan(halfvert)*margin
++
++        int xr = max(0, min(squadtargetxrange, int(sqcapx)));
++        squadtargetxcap = float(xr);   // amendment 8: also the running target's sweep amplitude - squadcurrentx() below
 +        squadtargetx = float(rnd(2*xr + 1) - xr);
-+        int zrange = max(squadtargetzmax - squadtargetzmin, 0);
-+        squadtargetz = float(squadtargetzmin + rnd(zrange + 1));
++        int zlo = max(squadtargetzmin, -int(sqcapz)), zhi = min(squadtargetzmax, int(sqcapz));
++        if(zlo > zhi) zlo = zhi = 0;   // defence in depth only - not reachable at any configured fov/dist combination (fov floor 10, distance floor 1), kept for safety against a future range change
++        int zrange = max(zhi - zlo, 0);
++        squadtargetz = float(zlo + rnd(zrange + 1));
++
++        // amendment 8: April - "i wonder if you could even make the target run across
++        // the screen sometimes using the running animation and the same speed as players
++        // usually move" - roughly squadrunchance% of sessions (default 50, "roughly
++        // half") get a running target instead of a stationary one. See
++        // squadcurrentx()/squadcurrentdir() below for the sweep itself and
++        // fpsgame/render.cpp squadrender() for the animation drive.
++        squadtargetmoving = rnd(100) < clamp(squadrunchance, 0, 100);
 +
 +        // SwiftGibs Reverse Firing Squad (playtest 2 bug fix, amendment 6): April - "when
 +        // the firing squad comes up the leaderboard is over top of it. the firing squad
@@ -451,8 +517,68 @@
 +    static const float SQUADRAYLEN = 1024.0f;
 +    // amendment 7 (playtest 3, IMPACT): tunables for the replicated shot effects - see
 +    // squadfire()'s own comment below for the full derivation of each.
-+    static const float SQUADMISSDIST = 80.0f;      // sensible "the shot vanished here" distance for a miss's impact burst - past squadtargetdistmax (60 default), well short of SQUADRAYLEN/squadview's farplane (1024)
++    // amendment 8: SQUADMISSDIST bumped 80->140 to stay past the widened
++    // squadtargetdistmax (110 default, was 60) - the same "a miss never visually
++    // coincides with where the target could have stood" invariant iter3 established,
++    // just re-tuned for the new range.
++    static const float SQUADMISSDIST = 140.0f;     // sensible "the shot vanished here" distance for a miss's impact burst - past squadtargetdistmax (110 default), well short of SQUADRAYLEN/squadview's farplane (1024)
 +    static const float SQUADMUZZLEOFFSET = 3.0f;   // synthetic first-person muzzle point: units in front of the eye along the fire direction
++    // amendment 8: running-target speed, matched to a normal player's own movement
++    // rather than a guessed number - derived from engine/physics.cpp's
++    // modifyvelocity(): a player's target ground velocity for pure-forward movement
++    // (move=1, strafe=0, not floating/underwater, on a flat floor) is
++    // `maxspeed * (move && !strafe ? 1.3f : 1.0f)` (the forward-only 1.3x bonus,
++    // physics.cpp), where maxspeed is physent::maxspeed - defaulted to 100 and never
++    // overridden for a real fpsent anywhere in fpsgame/ (shared/ents.h) - so a normal
++    // player's sustained straight-line run speed is 100*1.3 = 130 engine units/second.
++    // No diagonal-move boost applies (the move/strafe direction vector is
++    // normalize()'d before the maxspeed multiply, physics.cpp), so this is exactly the
++    // simple "holding forward" case the amendment asked for, not an inflated number.
++    static const float SQUADRUNSPEED = 130.0f;
++
++    // amendment 8 (playtest 3 follow-up): the running target's live horizontal offset -
++    // a PURE function of session state + lastmillis (no stored/integrated position), so
++    // fpsgame/render.cpp's squadrender() (every rendered frame) and this file's own
++    // squadfire() (the exact instant a shot is fired) always compute the identical
++    // value from the identical formula - there is no "last known position" to go stale
++    // between a render and a shot. A static session (squadtargetmoving false) just
++    // returns the fixed per-session squadtargetx, byte-identical to every prior
++    // iteration. A moving session traces a symmetric triangle wave between
++    // -squadtargetxcap and +squadtargetxcap (the same FOV-scaled cap squadenter()
++    // computed above, so the sweep can never leave the findable cone, not just at its
++    // starting position) beginning at 0 - dead centre, exactly where the player is
++    // already looking the instant the void cuts in, moving or not, so a running session
++    // is just as immediately findable as a stationary one - and turning around at each
++    // end rather than teleporting/wrapping: a wrap would pop the target from one edge of
++    // the screen to the other, which reads as a glitch, not a drill; turning around is
++    // continuous and is how a real player would actually behave in a confined space.
++    float squadcurrentx()
++    {
++        if(!squadtargetmoving || squadtargetxcap <= 0) return squadtargetx;
++        float amp = squadtargetxcap;
++        float t = max(lastmillis - squadsess.start, 0) / 1000.0f;
++        float m = fmodf(SQUADRUNSPEED*t, 4*amp);
++        if(m < 0) m += 4*amp;
++        if(m <= amp) return m;
++        if(m <= 3*amp) return 2*amp - m;
++        return m - 4*amp;
++    }
++
++    // amendment 8: direction of travel at the current instant (+1 toward +right/+x,
++    // -1 toward -right/-x, 0 only when the session isn't moving at all) - the exact same
++    // triangle-wave phase as squadcurrentx() above (both pure functions of the same
++    // lastmillis/session state), so the two can never disagree with each other. Used to
++    // orient the model to face where it's actually going - see fpsgame/render.cpp
++    // squadrender()'s own comment on the yaw math.
++    float squadcurrentdir()
++    {
++        if(!squadtargetmoving || squadtargetxcap <= 0) return 0;
++        float amp = squadtargetxcap;
++        float t = max(lastmillis - squadsess.start, 0) / 1000.0f;
++        float m = fmodf(SQUADRUNSPEED*t, 4*amp);
++        if(m < 0) m += 4*amp;
++        return (m <= amp || m > 3*amp) ? 1.0f : -1.0f;
++    }
 +
 +    // fpsgame/weapon.cpp's muzzleflash/muzzlelight VARPs (stock settings that gate the
 +    // real GUN_RIFLE's own muzzle flash/light) - extern'd the same way this file already
@@ -517,9 +643,22 @@
 +        extern bool intersect(dynent *d, const vec &from, const vec &to, float &dist);
 +        int best = -1;
 +        float bestdist = 1e16f;
++        // amendment 8: sync each alive member's position to the CURRENT instant before
++        // testing it - a moving target's fpsent::o is otherwise only as fresh as
++        // render.cpp's squadrender() last left it (the last RENDERED frame, not
++        // necessarily this exact millisecond), so recompute it here using the same
++        // fwd/right/squadcurrentx() formula render.cpp uses (duplicated rather than
++        // shared across the engine/game split - same precedent as this function's own
++        // vec(0,0,squadeyeheight) origin above and iter3's hudgunorigin() fallback
++        // duplication). This is what makes the lead test true: a shot aimed where the
++        // target WAS (a stale position) misses, a shot aimed where it IS (recomputed
++        // fresh right here, same frame as the fire) hits.
++        vec sfwd(-sinf(squadfacingyaw*RAD), cosf(squadfacingyaw*RAD), 0);
++        vec sright(cosf(squadfacingyaw*RAD), sinf(squadfacingyaw*RAD), 0);
 +        loopi(SQUADSIZE)
 +        {
 +            if(squaddead[i]) continue;
++            squadpoolent(i)->o = vec(from).add(vec(sfwd).mul(squadtargetdist)).add(vec(sright).mul(squadcurrentx())).addz(squadtargetz);
 +            float dist;
 +            if(intersect(squadpoolent(i), from, to, dist) && dist < bestdist)
 +            {
@@ -635,7 +774,7 @@
      // === SwiftGibs reload metronome (audio tick/ding over the rifle reload) ===
      VARP(reloadmetronome, 0, 0, 2);      // 0=off, 1=flat, 2=rising
      VARP(reloadmetrovol, 0, 200, 255);   // playsound volume (0..255; 255=full)
-@@ -1874,6 +2424,70 @@
+@@ -1874,6 +2563,70 @@
          pophudmatrix();
      }
  
@@ -706,7 +845,7 @@
      void gameplayhud(int w, int h)
      {
          pushhudmatrix();
-@@ -1911,6 +2525,7 @@
+@@ -1911,6 +2664,7 @@
          drawflagpopup(w, h);
          if(!hitmarkerdemoing()) drawhitmarker(w, h);
          if(!streakfxdemoing()) drawstreakfx(w, h);
@@ -714,7 +853,7 @@
  
          pophudmatrix();
  
-@@ -1950,9 +2565,36 @@
+@@ -1950,9 +2704,36 @@
      int selectcrosshair(vec &color)
      {
          fpsent *d = hudplayer();
@@ -784,7 +923,7 @@
      }
 --- a/fpsgame/render.cpp
 +++ b/fpsgame/render.cpp
-@@ -512,6 +512,54 @@
+@@ -512,6 +512,81 @@
          renderplayer(previewent, *mdlinfo, team >= 0 && team <= 2 ? team : 0, 1, false);
      }
  
@@ -805,6 +944,9 @@
 +    extern bool squadpooldead(int idx);
 +    extern float squadfacingyaw;
 +    extern float squadtargetdist, squadtargetx, squadtargetz;   // amendment 4: per-session randomised placement, fps.cpp's squadenter()
++    extern bool squadtargetmoving;    // amendment 8 (playtest 3 follow-up): is this session's target running?
++    extern float squadcurrentx();     // amendment 8: live horizontal offset - fixed squadtargetx for a static session, a live sweep for a moving one. fps.cpp's squadfire() calls the exact same function before its own hit-test, so render and hit-test can never disagree about where the target currently is.
++    extern float squadcurrentdir();   // amendment 8: current direction of travel (+1/-1), 0 only if not moving
 +
 +    void squadrender()
 +    {
@@ -821,13 +963,37 @@
 +            // amendment 4: horizontal/vertical/distance offsets are randomised once per
 +            // session (squadtargetx/z/dist, fps.cpp's squadenter()) rather than a fixed
 +            // per-index spacing - see fps.cpp for the tuned ranges and FOV rationale.
++            // amendment 8: the horizontal offset is now squadcurrentx() rather than the
++            // raw squadtargetx field directly - identical value for a static session,
++            // but a live sweep for a moving one.
 +            vec fwd(-sinf(squadfacingyaw*RAD), cosf(squadfacingyaw*RAD), 0);
 +            vec right(cosf(squadfacingyaw*RAD), sinf(squadfacingyaw*RAD), 0);
-+            d->o = vec(camera1->o).add(vec(fwd).mul(squadtargetdist)).add(vec(right).mul(squadtargetx)).addz(squadtargetz);
-+            float yaw, pitch;
-+            vectoyawpitch(vec(camera1->o).sub(d->o), yaw, pitch);   // ADR-0003: target faces the camera (arena) origin
-+            d->yaw = yaw;
-+            d->pitch = 0;
++            d->o = vec(camera1->o).add(vec(fwd).mul(squadtargetdist)).add(vec(right).mul(squadcurrentx())).addz(squadtargetz);
++            if(squadtargetmoving)
++            {
++                // amendment 8: face the direction of travel, not the camera, so the run
++                // cycle (driven by d->move below, engine/rendermodel.cpp's renderclient()
++                // ANIM_FORWARD selection) reads as running forward rather than running
++                // sideways/backwards. This engine's yaw convention has
++                // right(yaw) == fwd(yaw-90) (the fwd/right vectors above are both built
++                // from squadfacingyaw the same way), so travelling toward +right is
++                // facing squadfacingyaw-90, and travelling toward -right is the opposite
++                // turn.
++                float dir = squadcurrentdir();
++                d->yaw = squadfacingyaw + (dir > 0 ? -90.0f : 90.0f);
++                d->pitch = 0;
++                d->move = 1;
++                d->strafe = 0;
++            }
++            else
++            {
++                float yaw, pitch;
++                vectoyawpitch(vec(camera1->o).sub(d->o), yaw, pitch);   // ADR-0003: target faces the camera (arena) origin
++                d->yaw = yaw;
++                d->pitch = 0;
++                d->move = 0;
++                d->strafe = 0;
++            }
 +            d->light.color = vec(1, 1, 1);
 +            d->light.dir = vec(0, -1, 2).normalize();
 +            d->light.millis = -1;                                   // ADR-0001: explicit flat-white entitylight, same pattern as renderplayerpreview above
