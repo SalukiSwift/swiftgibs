@@ -76,7 +76,14 @@ else
     | grep -iE 'signed|identifier|code_digest|flags|adhoc' | head -6 || true
 fi
 
-# 6) zip the .app for distribution (standard on macOS; -y preserves the framework symlinks)
+# 6) updater script ships as a sibling of SwiftGibs.app (not part of the bundle, so it
+#    survives being replaced when it updates the app). zip preserves the executable bit
+#    in its external file attributes (verified: `zip -rqy` round-trips 755 through
+#    `unzip` unchanged), so no post-unzip chmod is needed.
+cp "$ROOT/updater/update-swiftgibs.command" "$ROOT/dist/update-swiftgibs.command"
+chmod +x "$ROOT/dist/update-swiftgibs.command"
+
+# 7) zip the .app for distribution (standard on macOS; -y preserves the framework symlinks)
 cd "$ROOT/dist"; rm -f SwiftGibs-mac.zip
-zip -rqy SwiftGibs-mac.zip SwiftGibs.app
+zip -rqy SwiftGibs-mac.zip SwiftGibs.app update-swiftgibs.command
 echo "mac bundle: $(du -sh "$OUT" | cut -f1) | zip: $(du -sh SwiftGibs-mac.zip | cut -f1)"

@@ -24,7 +24,8 @@ cat > "$OUT/swiftgibs.sh" <<'SH'
 #!/usr/bin/env bash
 cd "$(dirname "$0")" && exec ./bin/swiftgibs -q.
 SH
-chmod +x "$OUT/swiftgibs.sh" "$OUT/bin/swiftgibs"
+cp "$ROOT/updater/update-swiftgibs.sh" "$OUT/update-swiftgibs.sh"
+chmod +x "$OUT/swiftgibs.sh" "$OUT/bin/swiftgibs" "$OUT/update-swiftgibs.sh"
 
 cd "$ROOT/dist"; rm -f SwiftGibs-linux-x86_64.tar.gz
 tar -czf SwiftGibs-linux-x86_64.tar.gz SwiftGibs-linux-x86_64
