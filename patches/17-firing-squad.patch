@@ -60,7 +60,7 @@
          if(!maptime) { maptime = lastmillis; maprealtime = totalmillis; return; }
          if(!curtime) { gets2c(); if(player1->clientnum>=0) c2sinfo(); return; }
  
-@@ -398,6 +441,159 @@
+@@ -398,6 +441,178 @@
      int respawncountat[3] = { -1, -1, -1 };      // lastmillis timestamps; -1 = not scheduled this death
      bool respawncountfired[3] = { false, false, false };
  
@@ -82,7 +82,14 @@
 +    VARP(squad, 0, 1, 1);                  // feature toggle (menu-exposed in Task 4)
 +    VARP(squadwindow, 2000, 5000, 15000);  // FFA/team window, ms (ADR-0002)
 +    VARP(squadfirerate, 150, 350, 1000);   // virtual-rifle cooldown, ms (ADR-0003; wired to
-+                                            // the Task 1 fire stub below, real hitscan is Task 3)
++                                            // the Task 1 fire stub below, real hitscan is Task 3).
++                                            // amendment 9 (playtest 4, "one shot"): the VAR stays
++                                            // defined (cfg/profile compatibility) but is now
++                                            // effectively DEAD for the squad - squadfire()'s new
++                                            // one-shot gate (squadsess.shotfired) returns before
++                                            // this cooldown could ever be exercised a second time
++                                            // in the same session; the shot COUNT is the limiter
++                                            // now, not this cadence.
 +
 +    enum { SQUADSTATE_NONE = 0, SQUADSTATE_PENDING, SQUADSTATE_ACTIVE };
 +    // SwiftGibs Task 3: SQUADEND_CLEARED is new (additive - 0/1/2 keep their Task 1
@@ -91,7 +98,7 @@
 +    // window simply running out. squadexit()'s result-line text keys off `cleared`
 +    // (kills>=SQUADSIZE), not `reason`, so this is bookkeeping/clarity, not load-bearing
 +    // for the message itself - see squadexit() below.
-+    enum { SQUADEND_TIMEOUT = 0, SQUADEND_BAIL, SQUADEND_ABORT, SQUADEND_CLEARED };
++    enum { SQUADEND_TIMEOUT = 0, SQUADEND_BAIL, SQUADEND_ABORT, SQUADEND_CLEARED, SQUADEND_MISSED };   // amendment 9: SQUADEND_MISSED is new (additive) - the one-shot grace-beat close when the shot missed, distinct from SQUADEND_TIMEOUT (window ran out with no shot ever fired) even though both print "missed" below
 +    static const int SQUADENTRYBEAT = 400;   // PRD: brief beat to register the death as normal
 +    static const int SQUADSIZE = 1;          // amendment 4 (playtest 1 redesign): single target per
 +                                              // session (was 3 under amendment 3); pool machinery kept
@@ -109,11 +116,23 @@
 +                         // Task 4's end-of-session result line; persists after state resets
 +                         // to NONE, until the next squadenter() overwrites it
 +        int lastreason;  // SQUADEND_* passed to the most recent squadexit(), same persistence
-+        int lastfire;    // lastmillis of the last squadfire() call, for the cooldown
-+        int clearedat;   // Task 3: lastmillis of the killing blow, -1 if not yet cleared -
-+                         // drives the SQUADCLEARGRACE close in squadupdate()
++        int lastfire;    // lastmillis of the last squadfire() call - the cooldown this gates is
++                         // now effectively moot for the squad (amendment 9: one shot per
++                         // session, see squadfirerate's own updated comment above); left in
++                         // place unused rather than deleted
++        int resolvedat;  // amendment 9 (was Task 3's clearedat, hit-only): lastmillis the
++                         // session's one shot resolved, EITHER outcome - -1 until fired. Drives
++                         // the SQUADCLEARGRACE close in squadupdate() (a hit and a miss now both
++                         // get the same short grace beat before the arena closes, not just a
++                         // hit) and the HIT/MISS result banner in drawsquadhud()
++        bool shotfired;  // amendment 9: has the session's one shot already been taken - gates
++                         // squadfire() itself (top of the function), so further attack input
++                         // after the shot is a silent no-op for the rest of the session
++        bool shothit;    // amendment 9: meaningless until resolvedat>=0 - true if that one shot
++                         // was a hit, false if it was a miss; read by drawsquadhud()'s result
++                         // banner and squadupdate()'s squadexit() reason choice
 +    };
-+    squadsession squadsess = { SQUADSTATE_NONE, 0, 0, 0, false, -1, -1000000, -1 };
++    squadsession squadsess = { SQUADSTATE_NONE, 0, 0, 0, false, -1, -1000000, -1, false, false };
 +
 +    bool squadactive() { return squadsess.state == SQUADSTATE_ACTIVE; }        // window visually open (past the cut-in) - gates doattack()'s fire-vs-respawn branch
 +    bool squadsessionopen() { return squadsess.state != SQUADSTATE_NONE; }     // a session exists at all (pending OR active) - gates the checkautorespawn() hold (amendment 1: the hold covers the pre-cut-in beat too)
@@ -220,7 +239,7 @@
      // inputs
  
      VARP(attackspawn, 0, 1, 1);
-@@ -405,7 +601,35 @@
+@@ -405,7 +620,35 @@
      void doattack(bool on)
      {
          if(!connected || intermission) return;
@@ -257,7 +276,7 @@
      }
  
      VARP(jumpspawn, 0, 1, 1);
-@@ -413,6 +637,15 @@
+@@ -413,6 +656,15 @@
      bool canjump()
      {
          if(!connected || intermission) return false;
@@ -273,7 +292,7 @@
          if(jumpspawn) respawn();
          return player1->state!=CS_DEAD;
      }
-@@ -594,6 +827,14 @@
+@@ -594,6 +846,14 @@
                      respawncountfired[i] = true;
                  }
              }
@@ -288,7 +307,7 @@
          }
          else
          {
-@@ -749,6 +990,9 @@
+@@ -749,6 +1009,9 @@
          else
          {
              intermission = true;
@@ -298,7 +317,7 @@
              player1->attacking = false;
              if(cmode) cmode->gameover();
              conoutf(CON_GAMEINFO, "\f2intermission:");
-@@ -840,6 +1084,10 @@
+@@ -840,6 +1103,10 @@
  
      void startgame()
      {
@@ -309,7 +328,7 @@
          clearmovables();
          clearmonsters();
  
-@@ -1642,7 +1890,12 @@
+@@ -1642,7 +1909,12 @@
      }
      void drawexpandedmap(int w, int h)
      {
@@ -323,7 +342,7 @@
          fpsent *d = hudplayer();
          float S = 1560.0f, cx = w*900.0f/h, cy = 900.0f;
          float x0 = cx - S*0.5f, y0 = cy - S*0.5f;
-@@ -1782,13 +2035,472 @@
+@@ -1782,13 +2054,529 @@
              respawnreadyfired = true;
              if(respawnreadysound) playsoundname("swiftgibs/respawnready");
          }
@@ -369,7 +388,9 @@
 +        squadsess.kills = 0;
 +        squadsess.cleared = false;
 +        squadsess.lastfire = -1000000;
-+        squadsess.clearedat = -1;   // SwiftGibs Task 3: no clear pending yet this session
++        squadsess.resolvedat = -1;    // amendment 9 (was Task 3's clearedat): the one shot hasn't resolved yet this session
++        squadsess.shotfired = false;  // amendment 9: the one shot hasn't been taken yet this session
++        squadsess.shothit = false;    // amendment 9: meaningless until resolvedat>=0, reset for hygiene
 +        loopi(SQUADSIZE) squaddead[i] = false;   // SwiftGibs Task 2 (ADR-0003): the target is alive again this session
 +
 +        // amendment 4 (playtest 1 redesign): randomise the single target's position for
@@ -469,7 +490,12 @@
 +        // without a hit"); a deliberate SQUADEND_BAIL (jump) or an external SQUADEND_ABORT
 +        // (map change/disconnect/etc.) stay silent - no result to report.
 +        if(squadsess.cleared) conoutf(CON_GAMEINFO, "target down");
-+        else if(reason == SQUADEND_TIMEOUT) conoutf(CON_GAMEINFO, "missed");
++        // amendment 9: SQUADEND_MISSED (the one-shot grace-beat close on a miss) prints the
++        // same "missed" wording as the pre-existing SQUADEND_TIMEOUT path (window ran out
++        // without ever firing) - both mean "the target is still standing", just reached two
++        // different ways now that a fired-and-missed shot also resolves the session promptly
++        // instead of being left to run out the rest of the window.
++        else if(reason == SQUADEND_TIMEOUT || reason == SQUADEND_MISSED) conoutf(CON_GAMEINFO, "missed");
 +    }
 +
 +    void squadupdate()
@@ -508,19 +534,23 @@
 +            // camera provably the same live source - not two paths that happen to agree.
 +            squadfacingyaw = camera1->yaw;
 +        }
-+        // SwiftGibs Task 3: target-down grace beat. squadfire() stamps clearedat on the
-+        // killing blow rather than closing the session synchronously, so the final
-+        // gibeffect/particles get at least one squad-view render pass before the void
-+        // disappears (brief: "if instant exit would cut the final gib, a short grace
-+        // beat is acceptable" - SQUADCLEARGRACE, 400ms, same order as SQUADENTRYBEAT).
-+        // Checked ahead of the window-end check below so a clear landing just before
-+        // squadsess.end still gets its own grace beat rather than being swallowed by the
-+        // window closing first (and even if the window DOES close first in the same
-+        // frame, squadexit()'s message logic keys off `cleared`, not `reason`, so the
-+        // printed wording is correct either way).
-+        if(squadsess.clearedat >= 0 && lastmillis - squadsess.clearedat >= SQUADCLEARGRACE)
++        // SwiftGibs Task 3, broadened by amendment 9 (playtest 4, "one shot"): shot-resolved
++        // grace beat. squadfire() stamps resolvedat the instant the session's one shot
++        // resolves - hit OR miss, not just a hit as under Task 3 - rather than closing the
++        // session synchronously, so the final gibeffect/particles (on a hit) or the new
++        // HIT/MISS result banner (either outcome, drawsquadhud() below) get at least one
++        // squad-view render pass before the void disappears (brief: "if instant exit would
++        // cut the final gib, a short grace beat is acceptable" - SQUADCLEARGRACE, 400ms, same
++        // order as SQUADENTRYBEAT; amendment 9 explicitly asks for this same beat to be
++        // reused/mirrored for the result cue). Checked ahead of the window-end check below so
++        // a shot landing just before squadsess.end still gets its own grace beat rather than
++        // being swallowed by the window closing first (and even if the window DOES close
++        // first in the same frame, squadexit()'s message logic keys off `cleared`/the reason
++        // passed here, not the natural-timeout path, so the printed wording is correct either
++        // way).
++        if(squadsess.resolvedat >= 0 && lastmillis - squadsess.resolvedat >= SQUADCLEARGRACE)
 +        {
-+            squadexit(SQUADEND_CLEARED);
++            squadexit(squadsess.shothit ? SQUADEND_CLEARED : SQUADEND_MISSED);
 +            return;
 +        }
 +        if(lastmillis >= squadsess.end) squadexit(SQUADEND_TIMEOUT);
@@ -611,6 +641,15 @@
 +
 +    void squadfire()
 +    {
++        // amendment 9 (playtest 4, "one shot"): once the session's single shot has been
++        // taken, further attack input is a silent no-op for the rest of the session - the
++        // shot COUNT is now the limiter, not squadfirerate (see that VARP's own updated
++        // comment above, and the struct's shotfired field comment). doattack() still calls
++        // squadfire() unconditionally on every attack press while squadactive() - this is
++        // the one line that makes every call after the first do nothing at all: no cooldown
++        // stamp, no raycast, no effects, no sound, nothing observable.
++        if(squadsess.shotfired) return;
++
 +        // Edge-triggered cooldown from Task 1 - unchanged, still gates every call here.
 +        // iter3 investigation (amendment 7 "i was able to take a second shot immidietly
 +        // when i missed one once"): the suspected root cause (this stamp living inside
@@ -624,6 +663,7 @@
 +        // was needed here.
 +        if(lastmillis - squadsess.lastfire < squadfirerate) return;
 +        squadsess.lastfire = lastmillis;
++        squadsess.shotfired = true;   // amendment 9: this call is now committed to being THE shot - no later call in the session's life can ever pass the guard above
 +
 +        // amendment 5 (playtest 1 bug fix): ray "from the squad camera through the live
 +        // view direction", built from camera1->yaw/pitch, NOT player1->yaw/pitch.
@@ -749,7 +789,34 @@
 +        if(muzzleflash) particle_flare(muzzle, muzzle, 150, PART_MUZZLE_FLASH3, 0xFFFFFF, 1.25f);
 +        if(muzzlelight) adddynlight(muzzle, 25, vec(0.5f, 0.375f, 0.25f), 75, 75, DL_FLASH);
 +
-+        if(best < 0) return;   // miss: cooldown stamp + the shot effects above are the only side effects (time cost only)
++        // amendment 9 follow-up (April: "the gun is silent in the minigame, it should make
++        // the firing sound") - mirror fpsgame/weapon.cpp's shoteffects() sound branch for the
++        // local player firing GUN_RIFLE exactly: the player's selectable fire sound
++        // (firesoundsel()/firesndname()/firesoundvol/firesoundpitch, this file, above - no
++        // extern needed, same namespace) when one is chosen and audible, falling back to the
++        // stock rifle sound (guns[GUN_RIFLE].sound) otherwise - the same fallback the real shot
++        // takes. That real branch is itself NON-positional for the local shooter
++        // (playsoundpitched(..., NULL) / playsound(sound, NULL)) regardless of where in the
++        // world the player is standing, so the squad's detached camera and worldless arena
++        // change nothing here - no arena-space muzzle origin is needed for this call (unlike
++        // the impact effects above, which draw a VISUAL at a specific point and do need one).
++        // Fires on every shot, hit or miss, exactly like the real rifle's own fire sound.
++        if(firesoundsel() && firesoundvol > 0) playsoundpitched(firesndname(), firesoundvol, firesoundpitch, NULL);
++        else playsound(guns[GUN_RIFLE].sound, NULL);
++
++        if(best < 0)
++        {
++            // amendment 9 (playtest 4): the session's one shot has now resolved as a MISS -
++            // squadupdate() picks this up (resolvedat>=0) and closes the session
++            // SQUADCLEARGRACE ms from now via SQUADEND_MISSED, the same short beat a hit
++            // already got under Task 3, so the new MISS result banner (drawsquadhud() below)
++            // is visible for a moment before the arena closes - not left to run out the rest
++            // of squadwindow the way a post-shot miss did before this iteration.
++            squadsess.shothit = false;
++            squadsess.resolvedat = lastmillis;
++            playsoundname("swiftgibs/tick_lo");   // result-cue audio for a miss - see the report for why this tone was chosen (no purpose-built "failure" sound exists in the registered set)
++            return;   // miss: no kill, no gib, no hit-sound/marker - the shot effects and the two lines above are the only side effects
++        }
 +
 +        // Hit: one shot, one kill - mark dead (Task 2's render already skips dead pool
 +        // members), gib at the dummy's position, hit-sound + hit-marker via the exact
@@ -790,14 +857,23 @@
 +        // instant squadexit() here would flip squadactive() false before this frame's
 +        // gibeffect/particles ever get a render pass, cutting the kill's gib. Just mark
 +        // the moment; squadupdate() closes the session SQUADCLEARGRACE ms later, once the
-+        // gib has had a moment on screen (see squadupdate() below).
-+        if(squadsess.kills >= SQUADSIZE && squadsess.clearedat < 0) squadsess.clearedat = lastmillis;
++        // gib has had a moment on screen (see squadupdate() below). amendment 9: the
++        // `&& squadsess.clearedat < 0` re-entry guard Task 3 had here is gone - it's no
++        // longer reachable to re-trigger now that the one-shot gate at the top of this
++        // function makes a second call into this branch structurally impossible within a
++        // session, so the guard was dead weight, not a correctness fix being removed.
++        if(squadsess.kills >= SQUADSIZE)
++        {
++            squadsess.shothit = true;
++            squadsess.resolvedat = lastmillis;
++            playsoundname("swiftgibs/streak");   // amendment 9 (playtest 4) result-cue audio for a hit: reuses the existing killstreak "success" ding - separate from, and in addition to, the hitsound/hitmarker feedback above (kept exactly as-is per the brief)
++        }
 +    }
 +
      // === SwiftGibs reload metronome (audio tick/ding over the rifle reload) ===
      VARP(reloadmetronome, 0, 0, 2);      // 0=off, 1=flat, 2=rising
      VARP(reloadmetrovol, 0, 200, 255);   // playsound volume (0..255; 255=full)
-@@ -1874,6 +2586,70 @@
+@@ -1874,6 +2662,111 @@
          pophudmatrix();
      }
  
@@ -812,6 +888,43 @@
 +    // drawexpandedmap() already use - that scope is only ever entered when
 +    // !mainmenu && !hidehud (engine/rendergl.cpp's gl_drawhud), so hidehud/cleanshots
 +    // hide the squad HUD for free, no separate check needed here.
++    // amendment 9 (playtest 4): one-shot result banner - "HIT"/"MISS", a punchy
++    // slam-in-then-settle word styled exactly like drawstreakfx() above (same ring-flash
++    // + scale-settle + fade shape, reusing cuefamily()/cueapply()/reloadring()/
++    // draw_text() - patch 05/12's own established cue idioms - rather than inventing a
++    // new visual language). Shown for the SQUADCLEARGRACE beat once the session's one
++    // shot has resolved (squadsess.resolvedat/shothit, squadfire() above); called from
++    // drawsquadhud() below, inside the same !hidehud/!mainmenu-gated hudmatrix scope
++    // every other squad HUD element already uses, so hidehud hides this for free too.
++    static void drawsquadresult(float cx, float cy)
++    {
++        int t = lastmillis - squadsess.resolvedat;
++        if(t < 0 || t >= SQUADCLEARGRACE) return;
++        float p = t / float(SQUADCLEARGRACE);
++        float scl = 1.9f - 0.9f * easeoutquad(min(p * 2.2f, 1.0f));   // slam in fast, settle - same shape as drawstreakfx
++        float a = p < 0.7f ? 1.0f : (1.0f - p) / 0.3f;
++
++        float r, g, b;
++        if(squadsess.shothit) { r = 0x40/255.0f; g = 1.0f; b = 0x40/255.0f; }   // established friend/success green (0x40FF40, patch 04)
++        else reloadbeatcolor(2, r, g, b);                                       // established countdown "hot" red (this file's own 3-2-1 palette)
++
++        cuefamily(0, 0, 100);
++        hudnotextureshader->set();
++        glBlendFunc(GL_SRC_ALPHA, GL_ONE);
++        reloadring(cx, cy, 30.0f + 200.0f * easeoutquad(p), 10.0f, r, g, b, 0.5f * (1.0f - p));
++        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++        hudshader->set();
++
++        const char *str = squadsess.shothit ? "HIT" : "MISS";
++        int tw, th; text_bounds(str, tw, th);
++        pushhudmatrix();
++        hudmatrix.translate(cx, cy, 0);
++        hudmatrix.scale(scl, scl, 1);
++        flushhudmatrix();
++        { float dr = r, dg = g, db = b, da = a; cueapply(dr, dg, db, da); draw_text(str, -tw/2, -th/2, int(dr*255.0f), int(dg*255.0f), int(db*255.0f), int(da*255.0f)); }
++        pophudmatrix();
++    }
++
 +    // amendment 4 (playtest 1 redesign): the kills/SQUADSIZE counter is REMOVED - a
 +    // single target has no meaningful count to show. Time bar and final 3-2-1 stay.
 +    void drawsquadhud(int w, int h)
@@ -831,11 +944,15 @@
 +        if(frac > 0.0f) reloadbar(cx - barhalfw + barhalfw*frac, bary, barhalfw*frac, barhalfh, 0.35f, 0.85f, 1.0f, 0.85f);   // fill, left-anchored (drains as the window closes)
 +        hudshader->set();
 +
-+        // --- final 3-2-1: last 3s of the window, suppressed once a clear is already
-+        // locked in (squadsess.clearedat >= 0, the SQUADCLEARGRACE beat from Task 3) -
-+        // the task brief's own judgment call: stay calm once the target is already down
-+        // rather than flashing a countdown the player has already beaten.
-+        if(squadsess.clearedat < 0)
++        // --- final 3-2-1, OR the HIT/MISS result banner once the one shot has resolved ---
++        // amendment 9 (playtest 4): once squadsess.resolvedat is set (the session's one shot
++        // has fired and resolved, hit or miss - squadfire() above), there's nothing left to
++        // count down to, so show the result banner instead, for the same SQUADCLEARGRACE
++        // beat the session now always closes on. Pre-shot (resolvedat<0) behaviour below is
++        // exactly Task 3's original 3-2-1, unchanged (field rename only: clearedat ->
++        // resolvedat).
++        if(squadsess.resolvedat >= 0) drawsquadresult(cx, cy);
++        else
 +        {
 +            int remain = squadsess.end - lastmillis;
 +            if(remain > 0 && remain <= 3000)
@@ -868,7 +985,7 @@
      void gameplayhud(int w, int h)
      {
          pushhudmatrix();
-@@ -1911,6 +2687,7 @@
+@@ -1911,6 +2804,7 @@
          drawflagpopup(w, h);
          if(!hitmarkerdemoing()) drawhitmarker(w, h);
          if(!streakfxdemoing()) drawstreakfx(w, h);
@@ -876,7 +993,7 @@
  
          pophudmatrix();
  
-@@ -1950,9 +2727,36 @@
+@@ -1950,9 +2844,36 @@
      int selectcrosshair(vec &color)
      {
          fpsent *d = hudplayer();
@@ -946,7 +1063,13 @@
      }
 --- a/fpsgame/render.cpp
 +++ b/fpsgame/render.cpp
-@@ -512,6 +512,81 @@
+@@ -1,4 +1,5 @@
+ #include "game.h"
++#include "texture.h"   // SwiftGibs Reverse Firing Squad (iter6): notextureshader for the room's flat-shaded gle:: quads - same include this file's own now-removed hitboxwire feature (patch 12, commit 6118527) used for the identical purpose
+ 
+ struct spawninfo { const extentity *e; float weight; };
+ extern float gatherspawninfos(dynent *d, int tag, vector<spawninfo> &spawninfos);
+@@ -512,6 +513,153 @@
          renderplayer(previewent, *mdlinfo, team >= 0 && team <= 2 ? team : 0, 1, false);
      }
  
@@ -971,8 +1094,80 @@
 +    extern float squadcurrentx();     // amendment 8: live horizontal offset - fixed squadtargetx for a static session, a live sweep for a moving one. fps.cpp's squadfire() calls the exact same function before its own hit-test, so render and hit-test can never disagree about where the target currently is.
 +    extern float squadcurrentdir();   // amendment 8: current direction of travel (+1/-1), 0 only if not moving
 +
++    // === SwiftGibs Reverse Firing Squad (iter6, amendment 9 playtest 4): a simple
++    // firing-range room replaces the grey void - floor, four walls, ceiling, drawn as
++    // flat-shaded immediate geometry (opaque quads via gle:: + notextureshader) the same
++    // way this codebase already draws simple 3D world-space geometry elsewhere -
++    // engine/octaedit.cpp's edit-mode selection-box cursors use this exact
++    // notextureshader+gle:: idiom for wireframe boxes in a real 3D pass (not HUD), and
++    // this same squad render pass itself briefly carried a shipped example
++    // (fpsgame/render.cpp's hitboxwire, patch 12 commit 6118527, later removed for an
++    // unrelated feature reason - the flat/hitbox player-model project dropped the
++    // octagon style) that drew world-space gle:: quads/lines with notextureshader
++    // interleaved with renderplayer() calls with no batch corruption - confirming it's
++    // safe to draw this way in this exact pass. There is still no octree world here
++    // (ADR-0001) - this is pure overlay geometry, nothing is loaded.
++    //
++    // Sized off the CONFIGURED maximum spread (squadtargetdistmax/xrange/zmin/zmax,
++    // externed below - the same VARs squadenter() clamps the per-session actual
++    // placement against, fpsgame/fps.cpp) plus squadroommargin, not the smaller
++    // per-session clamped values, so the room is always big enough for the session's
++    // actual (<=nominal) placement at ANY fov - the fov clamp in squadenter() only ever
++    // shrinks the per-session spread relative to these nominal maxes, never grows it -
++    // and the room doesn't need hand-resizing if those VARs are retuned later.
++    // Rebuilt fresh every frame from squadfacingyaw's own fwd/right basis (the exact
++    // same vectors squadrender() below uses to place the target) so "forward" always
++    // means "toward the target," matching what the player was looking at when the void
++    // cut in - not a fixed world direction, since squadfacingyaw differs every session.
++    extern int squadtargetdistmax, squadtargetxrange, squadtargetzmin, squadtargetzmax;
++    VAR(squadroommargin, 0, 40, 1000);   // engine units of clearance beyond the configured max spread on every side (Task 2/5-style tunable)
++
++    static void squadroomface(const vec &p1, const vec &p2, const vec &p3, const vec &p4, float shade)
++    {
++        gle::colorf(shade, shade, shade, 1.0f);
++        gle::defvertex(3);
++        gle::begin(GL_QUADS, 4);
++        gle::attrib(p1); gle::attrib(p2); gle::attrib(p3); gle::attrib(p4);
++        gle::end();
++    }
++
++    void squaddrawroom()
++    {
++        vec fwd(-sinf(squadfacingyaw*RAD), cosf(squadfacingyaw*RAD), 0);
++        vec right(cosf(squadfacingyaw*RAD), sinf(squadfacingyaw*RAD), 0);
++        vec eye = camera1->o;   // arena origin - squadview::start() has already placed camera1 at vec(0,0,squadeyeheight)
++
++        float margin = float(squadroommargin);   // VAR's own min(0,...) clamp already guarantees this is never negative
++        float front = float(squadtargetdistmax) + margin;   // beyond the farthest the target can ever spawn
++        float back = -margin;                                // behind the player, enclosing the void at their back
++        float side = float(squadtargetxrange) + margin;       // +/- from the facing centreline
++        float floorz = eye.z + float(min(0, squadtargetzmin)) - margin;
++        float ceilz  = eye.z + float(max(0, squadtargetzmax)) + margin;
++
++        vec nearleft  = vec(eye).add(vec(fwd).mul(back)).add(vec(right).mul(-side));
++        vec nearright = vec(eye).add(vec(fwd).mul(back)).add(vec(right).mul(side));
++        vec farleft   = vec(eye).add(vec(fwd).mul(front)).add(vec(right).mul(-side));
++        vec farright  = vec(eye).add(vec(fwd).mul(front)).add(vec(right).mul(side));
++        nearleft.z = nearright.z = farleft.z = farright.z = floorz;
++        vec nearleftc = nearleft, nearrightc = nearright, farleftc = farleft, farrightc = farright;
++        nearleftc.z = nearrightc.z = farleftc.z = farrightc.z = ceilz;
++
++        notextureshader->set();
++        glDisable(GL_CULL_FACE);   // seen only from inside the box - skip winding-order bookkeeping for 6 opaque quads, restored below before any model renders
++
++        squadroomface(nearleft, nearright, farright, farleft, 0.15f);        // floor - darkest, reads as "furthest from the light"
++        squadroomface(nearleftc, farleftc, farrightc, nearrightc, 0.30f);    // ceiling - lightest, distinct from the floor at a glance
++        squadroomface(nearleft, farleft, farleftc, nearleftc, 0.22f);        // left wall
++        squadroomface(farright, nearright, nearrightc, farrightc, 0.22f);    // right wall
++        squadroomface(farleft, farright, farrightc, farleftc, 0.24f);        // far wall, beyond the target
++        squadroomface(nearright, nearleft, nearleftc, nearrightc, 0.24f);    // near wall, behind the player
++
++        glEnable(GL_CULL_FACE);   // restore for the dummy models below (squadview::start() enabled it for this whole pass)
++    }
++
 +    void squadrender()
 +    {
++        squaddrawroom();   // amendment 9 (playtest 4): the room, drawn once before the dummies below
 +        int n = squadpoolsize();
 +        startmodelbatches();
 +        loopi(n)
