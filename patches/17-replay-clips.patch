@@ -1,0 +1,135 @@
+--- a/engine/client.cpp
++++ b/engine/client.cpp
+@@ -204,8 +204,89 @@
+     if(disc) disconnect();
+ }
+ 
++// === SwiftGibs instant replay: ring buffer ============================================
++// A fixed-size byte ring of {ms, chan, len, payload} records (clipheader matches the on-disk
++// .dmo record layout used by Task 2's writer), allocated ONCE and reallocated only when
++// clips/cliplength/clipmemcap change (clipsync(), the shared VARFP body below - never per
++// frame or per packet). cliprecord() is a bounded memcpy: one length check, at most one wrap,
++// two memcpy calls. It is called from localservertoclient() below (the single inbound choke
++// point for both remote and local/offline servers) and from the game-side N_POS synthesiser
++// (fpsgame/client.cpp sendpositions()) for the player's own position, which the server never
++// echoes back to the client that sent it.
++struct clipheader { int ms, chan, len; };
++#define CLIPHDRSIZE (int)sizeof(clipheader)
++#define CLIPMINSIZE (64*1024)          // floor so a tiny clipmemcap still stores something
++
++static uchar *clipbuf = NULL;
++static int clipbufsize = 0;            // allocated bytes (0 when the feature is off)
++static int clipwritepos = 0;           // next write offset
++static bool clipfull = false;          // ring has wrapped at least once (oldest data starts at clipwritepos)
++
++bool clipactive() { return clipbuf != NULL; }
++
++// Writes one record, wrapping to the start of the buffer rather than tearing a record across
++// the physical end (a partial record would be unreadable). A record that could never fit even
++// in an empty ring (len bigger than the whole allocation) is dropped, not truncated.
++void cliprecord(int chan, const void *data, int len)
++{
++    if(!clipbuf) return;
++    int total = CLIPHDRSIZE + len;
++    if(total > clipbufsize) return;                // can never fit whole - drop it, ring untouched
++    if(clipwritepos + total > clipbufsize)          // would tear across the end - wrap first
++    {
++        clipwritepos = 0;
++        clipfull = true;
++    }
++    clipheader h = { totalmillis, chan, len };
++    memcpy(&clipbuf[clipwritepos], &h, CLIPHDRSIZE);
++    if(len) memcpy(&clipbuf[clipwritepos + CLIPHDRSIZE], data, len);
++    clipwritepos += total;
++    if(clipwritepos >= clipbufsize) { clipwritepos = 0; clipfull = true; }
++}
++
++static void clipfree()
++{
++    DELETEA(clipbuf);
++    clipbufsize = clipwritepos = 0;
++    clipfull = false;
++}
++
++void clipsync();   // fwd decl: VARFP bodies below call this; defined after the vars it reads
++
++// Sizing: ~600 B/s of N_POS traffic per player (measured; see docs/superpowers/specs and the
++// Task 1 report), times a generous 32-player headroom (double the design doc's 16-player
++// worst case), times 60% margin for the 12-byte record header (small payloads make the header
++// a large fraction of each record). Hard-clamped by clipmemcap so a pathological server or a
++// long cliplength cannot balloon memory - this is the only ceiling that matters in practice.
++#define CLIP_BYTES_PER_PLAYER_SEC 600
++#define CLIP_EST_PLAYERS 32
++
++VARFP(clips, 0, 1, 1, clipsync());
++VARFP(cliplength, 1, 1, 10, clipsync());
++VARFP(clipmemcap, 1, 16, 128, clipsync());
++
++void clipsync()
++{
++    if(!clips) { clipfree(); return; }
++    long long wanted = (long long)CLIP_BYTES_PER_PLAYER_SEC * CLIP_EST_PLAYERS * 60 * cliplength;
++    wanted = wanted * 8 / 5;
++    long long cap = (long long)clipmemcap * 1024 * 1024;
++    long long size = min(wanted, cap);
++    if(size < CLIPMINSIZE) size = CLIPMINSIZE;
++    if(clipbuf && (int)size == clipbufsize) return;   // no change needed
++    clipfree();
++    clipbuf = new uchar[(size_t)size];
++    clipbufsize = (int)size;
++}
++// === end SwiftGibs instant replay ring buffer ==========================================
++
+ void localservertoclient(int chan, ENetPacket *packet)   // processes any updates from the server
+ {
++    // SwiftGibs instant replay: single choke point for BOTH remote (ENET_EVENT_TYPE_RECEIVE
++    // below) and local/offline server packets (engine/server.cpp's ST_LOCAL branch of
++    // sendpacket()) - chan in hand, payload still raw/un-parsed. cliprecord() no-ops in one
++    // branch when the ring is off (clipbuf NULL).
++    cliprecord(chan, packet->data, (int)packet->dataLength);
+     packetbuf p(packet);
+     game::parsepacketclient(chan, p);
+ }
+--- a/fpsgame/client.cpp
++++ b/fpsgame/client.cpp
+@@ -1243,18 +1243,29 @@
+ 
+     void sendpositions()
+     {
++        bool rc = clipactive();   // SwiftGibs: gate the replay-clip capture, off = zero extra work
+         loopv(players)
+         {
+             fpsent *d = players[i];
+             if((d == player1 || d->ai) && (d->state == CS_ALIVE || d->state == CS_EDITING))
+             {
+                 packetbuf q(100);
++                int qs = q.len;
+                 sendposition(d, q);
++                // SwiftGibs: the server never echoes our own N_POS back - synthesise it here by
++                // reusing the exact bytes sendposition() just packed (byte-identical to what
++                // the server sends other clients for us on this same channel), at the same
++                // cadence as the real broadcast (c2sinfo(), throttled to no faster than 33ms).
++                if(rc && d == player1) cliprecord(0, &q.buf[qs], q.len - qs);
+                 for(int j = i+1; j < players.length(); j++)
+                 {
+                     fpsent *d = players[j];
+                     if((d == player1 || d->ai) && (d->state == CS_ALIVE || d->state == CS_EDITING))
++                    {
++                        int qs2 = q.len;
+                         sendposition(d, q);
++                        if(rc && d == player1) cliprecord(0, &q.buf[qs2], q.len - qs2);
++                    }
+                 }
+                 sendclientpacket(q.finalize(), 0);
+                 break;
+--- a/shared/iengine.h
++++ b/shared/iengine.h
+@@ -489,6 +489,8 @@
+ extern void neterr(const char *s, bool disc = true);
+ extern void gets2c();
+ extern void notifywelcome();
++extern void cliprecord(int chan, const void *data, int len);   // SwiftGibs instant replay
++extern bool clipactive();                                      // SwiftGibs instant replay
+ 
+ // crypto
+ extern void genprivkey(const char *seed, vector<char> &privstr, vector<char> &pubstr);
