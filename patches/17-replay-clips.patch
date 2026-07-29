@@ -1,6 +1,6 @@
 --- a/engine/client.cpp
 +++ b/engine/client.cpp
-@@ -204,8 +204,157 @@
+@@ -204,8 +204,255 @@
      if(disc) disconnect();
  }
  
@@ -29,30 +29,46 @@
 +
 +bool clipactive() { return clipbuf != NULL; }
 +
++static void clipsinkappend(int slot, int chan, const void *data, int len);   // fwd decl - defined in the
++                                                                              // recording-sinks block below
++
 +// Writes one record, wrapping to the start of the buffer rather than tearing a record across
 +// the physical end (a partial record would be unreadable). A record that could never fit even
-+// in an empty ring (len bigger than the whole allocation) is dropped, not truncated.
++// in an empty ring (len bigger than the whole allocation) is dropped, not truncated. Also fans
++// the SAME record out to any active recording sink (Task 3b) - independent of whether the ring
++// itself is on, since "off is genuinely off" is a per-mode guarantee (clips 0 must not also
++// silently disable a running manual/always-on recording). This is the single point every
++// capture site (the raw packet tap below, own-position synthesis, keyframe synthesis) already
++// calls, so "capture happens once and feeds whichever sinks are active" falls out for free.
 +void cliprecord(int chan, const void *data, int len)
 +{
-+    if(!clipbuf) return;
-+    int total = CLIPHDRSIZE + len;
-+    if(total > clipbufsize) return;                // can never fit whole - drop it, ring untouched
-+    if(clipwritepos + total > clipbufsize)          // would tear across the end - wrap first
++    if(clipbuf)
 +    {
-+        clipwraplimit = clipwritepos;               // Task 2: everything from here to clipbufsize is now dead
-+        clipwritepos = 0;
-+        clipfull = true;
++        int total = CLIPHDRSIZE + len;
++        if(total <= clipbufsize)                        // fits in the ring at all - drop it whole otherwise
++        {
++            if(clipwritepos + total > clipbufsize)      // would tear across the end - wrap first
++            {
++                clipwraplimit = clipwritepos;           // Task 2: everything from here to clipbufsize is now dead
++                clipwritepos = 0;
++                clipfull = true;
++            }
++            clipheader h = { totalmillis, chan, len };
++            memcpy(&clipbuf[clipwritepos], &h, CLIPHDRSIZE);
++            if(len) memcpy(&clipbuf[clipwritepos + CLIPHDRSIZE], data, len);
++            clipwritepos += total;
++            if(clipwritepos >= clipbufsize)             // landed exactly on the end - no dead zone this lap
++            {
++                clipwritepos = 0;
++                clipfull = true;
++                clipwraplimit = clipbufsize;
++            }
++        }
 +    }
-+    clipheader h = { totalmillis, chan, len };
-+    memcpy(&clipbuf[clipwritepos], &h, CLIPHDRSIZE);
-+    if(len) memcpy(&clipbuf[clipwritepos + CLIPHDRSIZE], data, len);
-+    clipwritepos += total;
-+    if(clipwritepos >= clipbufsize)                 // landed exactly on the end - no dead zone this lap
-+    {
-+        clipwritepos = 0;
-+        clipfull = true;
-+        clipwraplimit = clipbufsize;
-+    }
++    // Task 3b fan-out: each call is a no-op pointer check per inactive slot (CLIPSINKCOUNT is a
++    // fixed, small constant - 2 today), and a bounded memcpy pair per ACTIVE slot - no different
++    // in kind from the ring write above, still no IO/alloc/gzip anywhere in this function.
++    loopi(CLIPSINKCOUNT) clipsinkappend(i, chan, data, len);
 +}
 +
 +static void clipfree()
@@ -99,7 +115,7 @@
 +// (clipentry itself is declared in shared/iengine.h, alongside cliprecord/clipactive, so
 +// fpsgame/client.cpp's writer can name the type without a second, divergent definition.)
 +
-+// Appends every well-formed record found in [from, to) to out, oldest first. A record only
++// Appends every well-formed record found in src[from, to) to out, oldest first. A record only
 +// counts if its whole header AND its declared payload fit inside [from, to) - this is what
 +// makes the scan self-terminating at a dead-zone boundary rather than needing to special-case
 +// it: the tail bytes an early wrap leaves behind (clipwraplimit..clipbufsize) are never
@@ -108,13 +124,16 @@
 +// entirely - the fit check below is what stops that being read as a length to trust). Passing
 +// clipwraplimit as this scan's own "to" for the old-lap half (see clipindex()) means the dead
 +// zone is never even entered; the fit check is a second, redundant line of defence.
-+static void clipscan(int from, int to, vector<clipentry> &out)
++// Takes an explicit source pointer (Task 3b: reused for a recording sink's own flat append
++// buffer, which has no wraparound to reason about at all - a plain [0, len) scan - so this one
++// walker serves both the ring and every sink rather than duplicating it).
++static void clipscan(const uchar *src, int from, int to, vector<clipentry> &out)
 +{
 +    int pos = from;
 +    while(pos + CLIPHDRSIZE <= to)
 +    {
 +        clipheader h;
-+        memcpy(&h, &clipbuf[pos], CLIPHDRSIZE);
++        memcpy(&h, &src[pos], CLIPHDRSIZE);
 +        if(h.len < 0 || pos + CLIPHDRSIZE + h.len > to) break;   // dead zone / malformed - stop here
 +        clipentry &e = out.add();
 +        e.ms = h.ms; e.chan = h.chan; e.len = h.len; e.offset = pos + CLIPHDRSIZE;
@@ -130,8 +149,8 @@
 +bool clipindex(vector<clipentry> &out)
 +{
 +    if(!clipbuf) return false;
-+    if(clipfull) { clipscan(clipwritepos, clipwraplimit, out); clipscan(0, clipwritepos, out); }
-+    else clipscan(0, clipwritepos, out);
++    if(clipfull) { clipscan(clipbuf, clipwritepos, clipwraplimit, out); clipscan(clipbuf, 0, clipwritepos, out); }
++    else clipscan(clipbuf, 0, clipwritepos, out);
 +    return out.length() > 0;
 +}
 +
@@ -141,6 +160,85 @@
 +// command with no engine tick (and so no cliprecord() call) able to run in between.
 +const uchar *clipdata() { return clipbuf; }
 +// === end SwiftGibs instant replay ring reader ===========================================
++
++// === SwiftGibs instant replay: recording sinks (Task 3b) ================================
++// Two more consumers of the exact same capture points the ring already uses (the raw packet
++// tap below, plus the game-side own-position/keyframe synthesis in fpsgame/client.cpp): a
++// manual start/stop recording and an always-on match recording. Each is a small FLAT append
++// buffer, not a ring - fpsgame/client.cpp drains and resets it on a periodic (~1s) tick
++// (checkcliprecordflush()), so it only ever needs to hold about one flush interval's worth of
++// bytes, never the whole recording. CLIPSINKBUFCAP is sized well above clipsync()'s own
++// theoretical worst case (32 players * 600 B/s * 1.6 header margin ~= 30.7 KB/s, see clipsync()
++// above) so a delayed flush never has to drop a record in ordinary play; a genuinely
++// pathological burst still degrades gracefully (the record is dropped, exactly like an
++// oversized ring record - see cliprecord() above) rather than growing the buffer or blocking.
++// Allocated only while that specific mode is actually running - inactive, both are NULL, no
++// memory held, the same "off is genuinely off" guarantee the ring already gives, per-mode.
++#define CLIPSINKBUFCAP (96*1024)
++
++struct clipsink { uchar *buf; int len; };
++static clipsink clipsinkbufs[CLIPSINKCOUNT] = { {NULL, 0}, {NULL, 0} };
++
++bool clipsinkactive(int slot) { return clipsinkbufs[slot].buf != NULL; }
++bool clipanysinkactive() { return clipsinkbufs[CLIPSINK_MANUAL].buf != NULL || clipsinkbufs[CLIPSINK_AUTO].buf != NULL; }
++
++void clipsinkstart(int slot)
++{
++    clipsink &s = clipsinkbufs[slot];
++    if(s.buf) return;              // already running - callers check first anyway, stays idempotent
++    s.buf = new uchar[CLIPSINKBUFCAP];
++    s.len = 0;
++}
++
++void clipsinkstop(int slot)
++{
++    clipsink &s = clipsinkbufs[slot];
++    DELETEA(s.buf);
++    s.len = 0;
++}
++
++// Appends one record to ONE sink's buffer. Called for every slot (active or not) from
++// cliprecord() above - the single fan-out point every capture site already calls - and is a
++// no-op pointer check when that slot isn't running, no different in kind from cliprecord()'s
++// own ring-off fast path.
++static void clipsinkappend(int slot, int chan, const void *data, int len)
++{
++    clipsink &s = clipsinkbufs[slot];
++    if(!s.buf) return;
++    int total = CLIPHDRSIZE + len;
++    if(s.len + total > CLIPSINKBUFCAP) return;   // flush overdue under a pathological burst - drop, don't grow/block
++    clipheader h = { totalmillis, chan, len };
++    memcpy(&s.buf[s.len], &h, CLIPHDRSIZE);
++    if(len) memcpy(&s.buf[s.len + CLIPHDRSIZE], data, len);
++    s.len += total;
++}
++
++// Public single-target write, bypassing the fan-out above. Used only for a fresh recording's
++// own synthesised opening keyframe (fpsgame/client.cpp startcliprecorder()) - that keyframe
++// belongs to the ONE sink that just started, not to the ring, and not to any OTHER sink that
++// also happens to be active at that moment (cliprecord()'s fan-out would otherwise leak a
++// redundant, playback-breaking N_WELCOME/N_MAPCHANGE bundle into an unrelated in-progress
++// recording).
++void clipsinkput(int slot, int chan, const void *data, int len) { clipsinkappend(slot, chan, data, len); }
++
++// Read side for the periodic flush (fpsgame/client.cpp checkcliprecordflush()): parses every
++// well-formed record currently buffered, oldest first. A flat append buffer, so this is a
++// plain [0, len) scan with no wraparound to reason about, unlike the ring - clipscan() (above)
++// is reused verbatim via its generalised source-buffer parameter rather than duplicated.
++bool clipsinkindex(int slot, vector<clipentry> &out)
++{
++    clipsink &s = clipsinkbufs[slot];
++    if(!s.buf || !s.len) return false;
++    clipscan(s.buf, 0, s.len, out);
++    return out.length() > 0;
++}
++const uchar *clipsinkdata(int slot) { return clipsinkbufs[slot].buf; }
++
++// Clears the buffer back to empty. Called only after the caller (the periodic flush) has
++// actually written out every entry clipsinkindex() just handed back - a failed/short write can
++// simply re-flush next tick instead of silently losing buffered records.
++void clipsinkreset(int slot) { clipsinkbufs[slot].len = 0; }
++// === end SwiftGibs instant replay recording sinks ========================================
 +
  void localservertoclient(int chan, ENetPacket *packet)   // processes any updates from the server
  {
@@ -160,7 +258,22 @@
  }
 --- a/fpsgame/client.cpp
 +++ b/fpsgame/client.cpp
-@@ -1243,18 +1243,34 @@
+@@ -1165,6 +1165,14 @@
+             nextmode = gamemode = INT_MAX;
+             clientmap[0] = '\0';
+         }
++        // SwiftGibs instant replay (Task 3b): interruption safety - a disconnect (remote or
++        // local/offline) and a `quit` (which routes through here too: engine/main.cpp's quit()
++        // calls disconnect()/localdisconnect() before it ever calls cleanup()/exit()) must both
++        // finalise and save any in-progress manual/always-on recording rather than lose it.
++        // Placed at the END of this function, well away from patches/18-fps-stats.patch's own
++        // hook at the very TOP (right after stopfollowing()) so that patch's context match is
++        // undisturbed.
++        cliprecordfinalizeall("disconnect");
+     }
+ 
+     VARP(teamcolorchat, 0, 1, 1);
+@@ -1243,18 +1251,38 @@
  
      void sendpositions()
      {
@@ -169,7 +282,11 @@
 +        // suppression), = zero extra work. player1 is always CS_SPECTATOR during playback so
 +        // this branch would already skip in practice, but the explicit check documents intent
 +        // and costs one extra bool read.
-+        bool rc = clipactive() && !demoplayback;
++        // Task 3b: also active while a manual or always-on recording is running, even with the
++        // ring itself off (clips 0) - a recording needs the local player's own movement exactly
++        // as much as the ring does, and "off is genuinely off" is a per-mode guarantee, not an
++        // all-or-nothing one. clipanysinkactive() is one more cheap OR'd bool read.
++        bool rc = (clipactive() || clipanysinkactive()) && !demoplayback;
          loopv(players)
          {
              fpsent *d = players[i];
@@ -195,7 +312,7 @@
                  }
                  sendclientpacket(q.finalize(), 0);
                  break;
-@@ -1298,12 +1314,287 @@
+@@ -1298,12 +1326,548 @@
          sendclientpacket(p.finalize(), 1);
      }
  
@@ -406,6 +523,14 @@
 +    {
 +        if(!clipactive()) { conoutf("saveclip: replay clips are off (clips 1 to enable)"); return; }
 +        if(!connected) { conoutf("saveclip: not connected"); return; }
++        // Belt-and-braces (Task 3b coordinator review, folded in alongside the killstreak-trigger
++        // fix below since both are the same underlying gap): the ring itself already stops
++        // capturing NEW content during demo playback (the Task 1 review's demoplaying()
++        // suppression), but without this check saveclip() would still snapshot whatever OLD
++        // (pre-playback) content is still sitting in the ring, under a timestamp/filename that
++        // makes it look like it captured the playback itself - confusing at best. Refuse
++        // explicitly instead, same idiom as togglerecord()'s own demoplayback check below.
++        if(demoplayback) { conoutf("saveclip: can't save while playing back a demo"); return; }
 +
 +        vector<clipentry> idx;
 +        if(!clipindex(idx)) { conoutf("saveclip: nothing recorded yet"); return; }
@@ -473,6 +598,258 @@
 +    COMMAND(saveclip, "");
 +    // === end SwiftGibs instant replay: keyframes + clip writing =============================
 +
++    // === SwiftGibs instant replay: recording modes (Task 3b) ================================
++    // Two more consumers of the same recorder core (Tasks 1-2): a manual start/stop recording
++    // and an always-on match recording, both streamed incrementally to their own gzipped .dmo
++    // via the small per-mode append buffer engine/client.cpp exposes (clipsinkstart/put/index/
++    // data/reset - see that file's "recording sinks" block). Unlike saveclip() above, which
++    // snapshots the whole ring in one synchronous write, these two write INCREMENTALLY: records
++    // land in the sink's small buffer via cliprecord()'s fan-out (engine/client.cpp) as they're
++    // captured, and checkcliprecordflush() below (called once per c2sinfo() tick, throttled to
++    // roughly once a second) is the ONLY place that ever touches the actual file - opening,
++    // writing, and gzip compression all happen there, never on the per-packet path. Every
++    // capture site's own per-packet cost is unchanged by this (still a bounded memcpy into a
++    // flat buffer, see engine/client.cpp cliprecord()/clipsinkappend()); the flush itself is
++    // real file IO plus gzip work, but it runs at most once a second, never once per packet.
++    //
++    // Filenames distinguish recordings from clips: a clip (saveclip() above) is
++    // "<timestamp>_<map>_<mode>.dmo"; a recording is "<timestamp>_<map>_<mode>_rec-<label>.dmo"
++    // (label = "manual" or "auto") - the retention pruner below matches ONLY that literal
++    // suffix, so it can never mistake a clip (or any unrelated file) for a recording it wrote.
++
++    VARP(cliprecordauto, 0, 0, 1);          // always-on match recording; OFF by default
++    VARP(cliprecordkeep, 0, 20, 200);       // "keep newest N recordings" retention; 0 = never prune
++
++    struct cliprecorder
++    {
++        stream *f;           // open gzip file handle while recording; NULL otherwise
++        string relpath;       // for console messages
++        int basems;           // ms of the first record ever written (rebase origin); -1 = not yet set
++        int lastms;           // ms of the most recently written record (for duration reporting)
++        bool wrotekeyframe;   // true once this stream's one allowed opening keyframe has been written
++    };
++    static cliprecorder manualrec = { NULL, "", -1, 0, false };
++    static cliprecorder autorec   = { NULL, "", -1, 0, false };
++    static bool cliprecordarmed = false;   // set by cliprecordarmmatchstart() (fpsgame/fps.cpp startgame()
++                                            // hook); consumed on the very next c2sinfo() tick, once the
++                                            // whole welcome bundle for a fresh match (incl. the item list,
++                                            // which arrives in the SAME inbound packet but is only parsed
++                                            // AFTER startgame() returns) has fully settled - starting the
++                                            // sink synchronously inside startgame() itself would synthesise
++                                            // an opening keyframe with a stale/empty item list.
++
++    bool cliprecordmanualactive() { return manualrec.f != NULL; }
++    bool cliprecordautoactive() { return autorec.f != NULL; }
++
++    // Opens <clipdir>/<timestamp>_<map>_<mode>_rec-<label>.dmo (same gzipped stock demo format
++    // saveclip() writes: 24-byte header, then {ms,chan,len} stamps + payload), starts the
++    // engine-side sink buffer for `slot`, and seeds it with ONE synthesised opening keyframe
++    // (writeclipwelcome() - the exact same welcome-equivalent builder the ring's periodic
++    // keyframes use) via clipsinkput() - a targeted, single-sink write, not the general
++    // cliprecord() fan-out, so this keyframe cannot leak into the ring or into any OTHER
++    // currently-active sink. Every real packet from this point on reaches the sink through the
++    // ordinary capture path (cliprecord()'s fan-out), same as the ring.
++    static void startcliprecorder(cliprecorder &r, int slot, const char *label)
++    {
++        if(r.f) return;   // already running - callers check first anyway, stays idempotent
++
++        string mapname, mode, sstime;
++        clipsanitize(mapname, sizeof(mapname), clientmap, "map");
++        clipsanitize(mode, sizeof(mode), server::modename(gamemode), "mode");
++        time_t t = time(NULL);
++        size_t tlen = strftime(sstime, sizeof(sstime), "%Y-%m-%d_%H.%M.%S", localtime(&t));
++        sstime[min(tlen, sizeof(sstime)-1)] = '\0';
++        defformatstring(relpath, "%s%s%s_%s_%s_rec-%s.dmo", clipdir, clipdir[0] ? "/" : "", sstime, mapname, mode, label);
++
++        stream *f = opengzfile(path(relpath, true), "wb");
++        if(!f) { conoutf("record: could not write %s", relpath); return; }
++
++        demoheader hdr;
++        memcpy(hdr.magic, DEMO_MAGIC, sizeof(hdr.magic));
++        hdr.version = DEMO_VERSION;
++        hdr.protocol = PROTOCOL_VERSION;
++        lilswap(&hdr.version, 2);
++        f->write(&hdr, sizeof(demoheader));
++
++        r.f = f;
++        copystring(r.relpath, relpath);
++        r.basems = -1;
++        r.lastms = 0;
++        r.wrotekeyframe = false;
++
++        clipsinkstart(slot);
++        packetbuf p(MAXTRANS);
++        writeclipwelcome(p);
++        clipsinkput(slot, CLIPCHAN_KEYFRAME, p.buf, p.len);
++
++        conoutf("recording started (%s): %s", label, relpath);
++    }
++
++    // A map-change finalise (cliprecordfinalizeall("map change"), called from the TOP of
++    // fpsgame/fps.cpp startgame()) races the raw packet tap: localservertoclient()
++    // (engine/client.cpp) captures a packet's bytes into whichever sinks are active BEFORE
++    // parsing even begins, and startgame() itself only runs LATER, mid-parse, as a
++    // consequence of parsing that SAME packet's N_MAPCHANGE. So the very packet that triggers
++    // this finalise - the NEW match's own N_MAPCHANGE - has, by the time finishcliprecorder()
++    // runs, already been appended to the OLD (about-to-close) sink. Detected by content (a
++    // reliable-channel record whose payload starts with the raw N_MAPCHANGE opcode byte -
++    // putint()'s small-int encoding is exactly one byte for values under 128, and N_MAPCHANGE
++    // is one) rather than avoided architecturally, because nothing CAN run between the tap and
++    // the parse that triggers it - this mirrors the same tap-precedes-hook constraint Task 2
++    // already reasoned about for the opening side (synthesising a keyframe rather than relying
++    // on capturing a real welcome "naturally").
++    static bool isleadingmapchange(const uchar *payload, int len) { return len > 0 && payload[0] == N_MAPCHANGE; }
++
++    // Drains whatever the sink has buffered since the last flush (or since start), translating
++    // each record to the on-disk stamp exactly as saveclip() does (rebase ms, lilswap the
++    // stamp, translate the CLIPCHAN_KEYFRAME sentinel back to the real chan 1) and appending it
++    // to the already-open file. Only the FIRST keyframe this stream ever sees is honoured - any
++    // later one (e.g. a ring-triggered periodic keyframe that also reached this sink because
++    // both were active at once) is skipped, exactly like saveclip()'s own redundant-keyframe
++    // fix, for the same reason: a second N_MAPCHANGE mid-file forces a jarring reload. This is
++    // the ONLY place that does file IO or gzip work for a recording - called at most once a
++    // second in the ordinary case (checkcliprecordflush() below), never from the per-packet
++    // capture path. `attrimtrailingmapchange` is only ever passed true from finishcliprecorder()
++    // (a finalise, never an ordinary periodic tick) - see isleadingmapchange() above for why:
++    // dropping a record on an ordinary tick would risk losing real mid-match content, but at
++    // finalise time the sink's very last record, if it matches, can only be the leaked packet
++    // that caused this finalise in the first place, never legitimate history.
++    static void flushcliprecorder(cliprecorder &r, int slot, bool trimtrailingmapchange = false)
++    {
++        if(!r.f) return;
++        vector<clipentry> idx;
++        if(!clipsinkindex(slot, idx)) return;   // nothing buffered since the last flush - normal, no IO
++        const uchar *data = clipsinkdata(slot);
++        int count = idx.length();
++        if(trimtrailingmapchange && count > 0)
++        {
++            clipentry &last = idx[count-1];
++            if(last.chan == 1 && isleadingmapchange(&data[last.offset], last.len)) count--;
++        }
++        for(int i = 0; i < count; i++)
++        {
++            if(idx[i].chan == CLIPCHAN_KEYFRAME)
++            {
++                if(r.wrotekeyframe) continue;
++                r.wrotekeyframe = true;
++            }
++            if(r.basems < 0) r.basems = idx[i].ms;
++            int stamp[3];
++            stamp[0] = idx[i].ms - r.basems;
++            stamp[1] = idx[i].chan == CLIPCHAN_KEYFRAME ? 1 : idx[i].chan;
++            stamp[2] = idx[i].len;
++            lilswap(stamp, 3);
++            r.f->write(stamp, sizeof(stamp));
++            if(idx[i].len) r.f->write(&data[idx[i].offset], idx[i].len);
++            r.lastms = idx[i].ms;
++        }
++        clipsinkreset(slot);   // the trimmed trailing record (if any) is simply discarded, never
++                                // written anywhere - correct: it belongs to the NEXT match, which
++                                // gets its own proper (synthesised-keyframe) opening instead, and
++                                // the sink is about to be stopped, not resumed.
++    }
++
++    // Keeps only the newest cliprecordkeep files this feature's recorders wrote (name pattern
++    // "*_rec-manual.dmo" / "*_rec-auto.dmo" - a clip from saveclip() never carries that suffix,
++    // and neither does anything a player might have dropped into the folder themselves).
++    // cliprecordkeep 0 = never prune. Conservative on purpose: matches on a literal filename
++    // SUFFIX, not a substring search, so a sanitised map/mode name could never coincidentally
++    // trigger a false match anywhere else in a filename.
++    static bool cliprecordmatch(const char *name)   // name as listfiles() returns it: no ".dmo" extension
++    {
++        static const char *suffixes[] = { "_rec-manual", "_rec-auto" };
++        size_t n = strlen(name);
++        loopi(2)
++        {
++            size_t sl = strlen(suffixes[i]);
++            if(n >= sl && !strcmp(name + (n - sl), suffixes[i])) return true;
++        }
++        return false;
++    }
++
++    static void pruneclipdir()
++    {
++        if(cliprecordkeep <= 0) return;
++        vector<char *> files;
++        listfiles(clipdir, "dmo", files);
++        vector<char *> matches;
++        loopv(files) { if(cliprecordmatch(files[i])) matches.add(files[i]); }
++        matches.sort();   // filenames are timestamp-prefixed - lexicographic order == chronological order
++        int todelete = matches.length() - cliprecordkeep;
++        for(int i = 0; i < todelete; i++)
++        {
++            defformatstring(relpath, "%s/%s.dmo", clipdir, matches[i]);
++            const char *real = findfile(path(relpath, true), "rb");
++            if(real) remove(real);
++        }
++        files.deletearrays();
++    }
++
++    // Closes+saves an in-progress recording: drains any still-buffered records first (so a
++    // finalise is never lossy relative to the last flush), then closes the file and frees the
++    // sink. `reason` is purely for the console message ("stopped", "map change",
++    // "intermission", "disconnect") - interruption safety means every one of those paths routes
++    // through here rather than leaving a file open, unflushed, or lost.
++    static void finishcliprecorder(cliprecorder &r, int slot, const char *label, const char *reason)
++    {
++        if(!r.f) return;
++        flushcliprecorder(r, slot, true);
++        delete r.f;
++        r.f = NULL;
++        clipsinkstop(slot);
++        conoutf("recording saved (%s, %s): %s (%.1fs)", label, reason, r.relpath, r.basems >= 0 ? (r.lastms - r.basems)/1000.0f : 0.0f);
++        pruneclipdir();
++    }
++
++    // Finalises WHATEVER is currently running (manual and/or auto - each no-ops independently
++    // if not active) - the single hook called from every interruption point (fpsgame/fps.cpp
++    // startgame()/timeupdate(), and gamedisconnect() below), so a map change, intermission,
++    // disconnect, or quit can never silently lose an in-progress recording.
++    void cliprecordfinalizeall(const char *reason)
++    {
++        finishcliprecorder(manualrec, CLIPSINK_MANUAL, "manual", reason);
++        finishcliprecorder(autorec, CLIPSINK_AUTO, "auto", reason);
++    }
++
++    // Manual start/stop (a named, bindable action - F9 by default, see overlay/autoexec.cfg).
++    void togglerecord()
++    {
++        if(manualrec.f) { finishcliprecorder(manualrec, CLIPSINK_MANUAL, "manual", "stopped"); return; }
++        if(!connected) { conoutf("record: not connected"); return; }
++        if(demoplayback) { conoutf("record: can't record during demo playback"); return; }
++        if(editmode) { conoutf("record: can't record in edit mode"); return; }
++        startcliprecorder(manualrec, CLIPSINK_MANUAL, "manual");
++    }
++    COMMAND(togglerecord, "");
++
++    // Always-on: only ever (re)armed from cliprecordarmmatchstart() below, once per real match
++    // start - never starts mid-match just because the VARP was flipped on, matching the design's
++    // "starts at match/map start" (simplicity over capturing a partial first match).
++    static void cliprecordmatchstart()
++    {
++        if(!cliprecordauto || !connected || editmode || m_edit || demoplayback) return;
++        startcliprecorder(autorec, CLIPSINK_AUTO, "auto");
++    }
++
++    void cliprecordarmmatchstart() { cliprecordarmed = true; }
++
++    // Called once per c2sinfo() tick (see below). Consumes the "a match just started" flag
++    // (armed synchronously from fpsgame/fps.cpp startgame(), consumed here one tick later so
++    // the whole welcome bundle - including the item list, parsed AFTER startgame() returns - is
++    // fully settled before writeclipwelcome() reads it), then throttles the actual flush to
++    // roughly once a second. Off/idle cost: a bool check plus a static-int compare - the
++    // per-second file IO/gzip work only runs when a recording is actually active.
++    void checkcliprecordflush()
++    {
++        if(cliprecordarmed) { cliprecordarmed = false; cliprecordmatchstart(); }
++        static int lastcliprecordflush = -1000000;
++        if(totalmillis - lastcliprecordflush < 1000) return;
++        lastcliprecordflush = totalmillis;
++        flushcliprecorder(manualrec, CLIPSINK_MANUAL);
++        flushcliprecorder(autorec, CLIPSINK_AUTO);
++    }
++    // === end SwiftGibs instant replay: recording modes =======================================
++
      void c2sinfo(bool force) // send update to the server
      {
          static int lastupdate = -1000;
@@ -480,10 +857,11 @@
          lastupdate = totalmillis;
          sendpositions();
 +        checkclipkeyframe();   // SwiftGibs instant replay (Task 2)
++        checkcliprecordflush();   // SwiftGibs instant replay (Task 3b): manual/always-on recording flush
          sendmessages();
          flushclient();
      }
-@@ -1803,6 +2094,16 @@
+@@ -1803,6 +2367,26 @@
                      if(killstreak > beststreak) beststreak = killstreak;
                      if(killstreak > matchbeststreak) matchbeststreak = killstreak;
                      if(killstreak % 5 == 0 && killstreak <= 20) killstreakmilestone(killstreak/5);
@@ -496,32 +874,66 @@
 +                    // through it. clipactive() mirrors saveclip()'s own "off" gate, so nothing
 +                    // is attempted - no file write, no console message - when clips itself is
 +                    // off, even with clipautostreak on.
-+                    if(clipautostreak && killstreak == clipautostreakcount && clipactive()) saveclip();
++                    // Task 3b coordinator review fix: this N_DIED case is reached during demo
++                    // PLAYBACK too (connected stays true, and the demo's own recorded N_DIED
++                    // messages genuinely re-run this same counter) - without the added
++                    // !demoplayback check, watching a killstreak clip walks the streak back up
++                    // to the same threshold and calls saveclip() again, writing a spurious clip
++                    // purely from passive viewing (the clip's whole point is that it contains
++                    // exactly the kills that built the streak, so this was not a theoretical
++                    // edge case). demoplayback is already directly visible in this file (the
++                    // same bool sendpositions()/checkclipkeyframe() already check), no new
++                    // accessor needed.
++                    if(clipautostreak && killstreak == clipautostreakcount && clipactive() && !demoplayback) saveclip();
                  }
                  // SwiftGibs: per-player streak for the scoreboard column (all players)
                  if(victim && victim != actor && (!m_teammode || !isteam(actor->team, victim->team)))
 --- a/shared/iengine.h
 +++ b/shared/iengine.h
-@@ -489,6 +489,12 @@
+@@ -489,6 +489,29 @@
  extern void neterr(const char *s, bool disc = true);
  extern void gets2c();
  extern void notifywelcome();
++// SwiftGibs instant replay (Task 3b): recording-sink slot IDs, shared between engine/client.cpp
++// (which owns the per-slot append buffers, alongside the ring above) and fpsgame/client.cpp
++// (which owns the file/gzip state and drives start/stop/flush). Placed BEFORE the existing
++// clip block below on purpose - patches/18-fps-stats.patch inserts its own content immediately
++// after clipdata() (below), so new lines land here instead, leaving that neighbourhood exactly
++// as it already was.
++#define CLIPSINK_MANUAL 0
++#define CLIPSINK_AUTO   1
++#define CLIPSINKCOUNT   2
 +extern void cliprecord(int chan, const void *data, int len);   // SwiftGibs instant replay
 +extern bool clipactive();                                      // SwiftGibs instant replay
 +extern int cliplength;                                          // SwiftGibs instant replay (VARP, minutes)
 +struct clipentry { int ms, chan, len, offset; };                // SwiftGibs instant replay (Task 2)
 +extern bool clipindex(vector<clipentry> &out);                  // SwiftGibs instant replay (Task 2)
 +extern const uchar *clipdata();                                 // SwiftGibs instant replay (Task 2)
++extern bool clipsinkactive(int slot);                           // SwiftGibs instant replay (Task 3b)
++extern bool clipanysinkactive();                                // SwiftGibs instant replay (Task 3b)
++extern void clipsinkstart(int slot);                            // SwiftGibs instant replay (Task 3b)
++extern void clipsinkstop(int slot);                             // SwiftGibs instant replay (Task 3b)
++extern void clipsinkput(int slot, int chan, const void *data, int len); // SwiftGibs instant replay (Task 3b)
++extern bool clipsinkindex(int slot, vector<clipentry> &out);    // SwiftGibs instant replay (Task 3b)
++extern const uchar *clipsinkdata(int slot);                     // SwiftGibs instant replay (Task 3b)
++extern void clipsinkreset(int slot);                            // SwiftGibs instant replay (Task 3b)
  
  // crypto
  extern void genprivkey(const char *seed, vector<char> &privstr, vector<char> &pubstr);
 --- a/fpsgame/game.h
 +++ b/fpsgame/game.h
-@@ -829,6 +829,7 @@
+@@ -829,6 +829,14 @@
      extern void getbestteams(vector<const char *> &best);
      extern void clearteaminfo();
      extern void setteaminfo(const char *team, int frags);
 +    extern void getteaminfos(vector<teaminfo> &out);   // SwiftGibs instant replay (Task 2)
++    // SwiftGibs instant replay (Task 3b): recording-mode hooks called from fpsgame/fps.cpp
++    // (startgame()/timeupdate()/gameplayhud() all live there), implemented in fpsgame/client.cpp
++    // alongside the rest of the clip machinery - same cross-file pattern as getteaminfos() above.
++    extern void cliprecordfinalizeall(const char *reason);   // finalise+save any in-progress recording(s)
++    extern void cliprecordarmmatchstart();                   // arm always-on to (maybe) start next tick
++    extern bool cliprecordmanualactive();                    // for the on-screen indicator
++    extern bool cliprecordautoactive();                      // for the on-screen indicator
      extern int statuscolor(fpsent *d, int color);
  
      // render
@@ -570,3 +982,81 @@
                  case ID_ALIAS: f->printf("%s = [%s]\n", names[i], id->getstr()); break;
              }
          }
+@@ -749,6 +756,16 @@
+         else
+         {
+             intermission = true;
++            // SwiftGibs instant replay (Task 3b): interruption safety - intermission must
++            // finalise+save any in-progress recording (manual or always-on) rather than let it
++            // keep running through the scoreboard/mapvote lull, or lose it if the player
++            // disconnects before the next map loads. Deliberately placed here, right at the top
++            // of this branch, well away from patches/18-fps-stats.patch's own hook at the very
++            // BOTTOM of this same branch (right after execident("intermission")), so that
++            // patch's context match is undisturbed. Always-on's next recording starts fresh at
++            // the next real match (see the startgame() hook above), not immediately here - there
++            // is nothing to capture during intermission itself.
++            cliprecordfinalizeall("intermission");
+             player1->attacking = false;
+             if(cmode) cmode->gameover();
+             conoutf(CON_GAMEINFO, "\f2intermission:");
+@@ -840,6 +857,24 @@
+ 
+     void startgame()
+     {
++        // SwiftGibs instant replay (Task 3b): startgame() runs on EVERY real match/map start
++        // (the client only ever reaches it while connected to a game - see changemapserv(),
++        // fpsgame/client.cpp - never from the main menu), so it is the single natural hook for
++        // both halves of "one file per match": finalise+save whatever recording was running for
++        // the PREVIOUS match (interruption safety: a real map change must not lose an
++        // in-progress recording), then arm always-on to (maybe) start a fresh one for the NEW
++        // match. Deliberately at the very TOP, before any of this function's own state resets,
++        // and deliberately NOT at the bottom (patches/18-fps-stats.patch already hooks the very
++        // end of this function, right after execident("mapstart") - keeping clear of that exact
++        // spot avoids disturbing its context match). Placement within the function doesn't
++        // affect correctness either way: cliprecordarmmatchstart() only sets a flag, consumed on
++        // the NEXT c2sinfo() tick (fpsgame/client.cpp checkcliprecordflush()) once clientmap,
++        // gamemode and the item list have all fully settled - not synchronously here, where the
++        // item list in particular (parsed later in the same inbound packet, after startgame()
++        // returns) would still be stale/empty.
++        cliprecordfinalizeall("map change");
++        cliprecordarmmatchstart();
++
+         clearmovables();
+         clearmonsters();
+ 
+@@ -1874,6 +1909,27 @@
+         pophudmatrix();
+     }
+ 
++    // === SwiftGibs instant replay: on-screen recording indicator (Task 3b) ===================
++    // Subtle top-left pulse + label while a manual and/or always-on recording is running, so it
++    // is never a surprise that one is active - reuses the exact draw_text/hudmatrix idiom every
++    // other SwiftGibs HUD cue above already uses (drawkillstreak/drawflagpopup), no new cue
++    // style. Respects hidehud "for free": gameplayhud() (below) is itself only ever called from
++    // inside `if(!hidehud && !mainmenu)` (engine/rendergl.cpp), the same as every other row
++    // drawn here.
++    void drawrecordingindicator(int w, int h)
++    {
++        bool m = cliprecordmanualactive(), a = cliprecordautoactive();
++        if(!m && !a) return;
++        const char *str = (m && a) ? "REC (manual + auto)" : "REC";
++        int pulse = 140 + int(90.0f * fabsf(sinf(lastmillis / 450.0f)));
++        pushhudmatrix();
++        hudmatrix.translate(30, 30, 0);
++        flushhudmatrix();
++        draw_text(str, 0, 0, 255, 70, 70, pulse);
++        pophudmatrix();
++    }
++    // === end SwiftGibs instant replay: on-screen recording indicator =========================
++
+     void gameplayhud(int w, int h)
+     {
+         pushhudmatrix();
+@@ -1909,6 +1965,7 @@
+         drawexpandedmap(w, h);
+         drawkillstreak(w, h);
+         drawflagpopup(w, h);
++        drawrecordingindicator(w, h);
+         if(!hitmarkerdemoing()) drawhitmarker(w, h);
+         if(!streakfxdemoing()) drawstreakfx(w, h);
+ 
