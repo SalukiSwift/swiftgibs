@@ -1,6 +1,6 @@
 --- a/engine/client.cpp
 +++ b/engine/client.cpp
-@@ -204,8 +204,151 @@
+@@ -204,8 +204,157 @@
      if(disc) disconnect();
  }
  
@@ -147,18 +147,29 @@
 +    // SwiftGibs instant replay: single choke point for BOTH remote (ENET_EVENT_TYPE_RECEIVE
 +    // below) and local/offline server packets (engine/server.cpp's ST_LOCAL branch of
 +    // sendpacket()) - chan in hand, payload still raw/un-parsed. cliprecord() no-ops in one
-+    // branch when the ring is off (clipbuf NULL).
-+    cliprecord(chan, packet->data, (int)packet->dataLength);
++    // branch when the ring is off (clipbuf NULL). Also suppressed during demo PLAYBACK (Task 3,
++    // addressing the Task 1 review note): a played-back .dmo is replayed to the client through
++    // this exact same local-server path (the design doc's "playback is free" finding) - without
++    // this guard, watching a demo, including a clip this feature just saved, would silently
++    // re-record itself into the ring on every rewatch. game::demoplaying() is a cheap bool
++    // read (shared/igame.h), no different in kind from the clipbuf null check inside
++    // cliprecord() itself.
++    if(!game::demoplaying()) cliprecord(chan, packet->data, (int)packet->dataLength);
      packetbuf p(packet);
      game::parsepacketclient(chan, p);
  }
 --- a/fpsgame/client.cpp
 +++ b/fpsgame/client.cpp
-@@ -1243,18 +1243,29 @@
+@@ -1243,18 +1243,34 @@
  
      void sendpositions()
      {
-+        bool rc = clipactive();   // SwiftGibs: gate the replay-clip capture, off = zero extra work
++        // SwiftGibs: gate the replay-clip capture - off, or during demo PLAYBACK (Task 3; see
++        // localservertoclient() in engine/client.cpp for the raw-packet half of this same
++        // suppression), = zero extra work. player1 is always CS_SPECTATOR during playback so
++        // this branch would already skip in practice, but the explicit check documents intent
++        // and costs one extra bool read.
++        bool rc = clipactive() && !demoplayback;
          loopv(players)
          {
              fpsent *d = players[i];
@@ -184,7 +195,7 @@
                  }
                  sendclientpacket(q.finalize(), 0);
                  break;
-@@ -1298,12 +1309,263 @@
+@@ -1298,12 +1314,287 @@
          sendclientpacket(p.finalize(), 1);
      }
  
@@ -202,6 +213,28 @@
 +
 +    VARP(clipkeyframe, 1, 5, 30);   // seconds between synthesised keyframes
 +    SVARP(clipdir, "clips");       // folder saveclip writes into, relative to the game dir
++
++    // === SwiftGibs instant replay: auto-clip on killstreak (Task 3) ======================
++    // clipautostreak is OFF by default (design doc: manual hotkey is the primary path; auto
++    // is opt-in). clipautostreakcount is the streak length (within the current life) that
++    // triggers it. The actual trigger lives at the N_DIED case below, hooked onto the
++    // EXISTING per-life killstreak counter from patch 12 (fpsgame/fps.cpp's killstreak,
++    // reset on death/match start) rather than a second, parallel kill count of our own.
++    VARP(clipautostreak, 0, 0, 1);        // auto-save a clip on reaching a kill streak; OFF by default
++    VARP(clipautostreakcount, 2, 5, 50);  // streak length that triggers the auto-clip
++
++    // Exposed via shared/igame.h so the raw packet tap in engine/client.cpp's
++    // localservertoclient() can suppress capture while playing back a .dmo (Task 3, addressing
++    // the Task 1 review note): playback is driven by the local embedded server replaying the
++    // file's packets through the exact same local-server-to-client path a live match uses (the
++    // design doc's "playback is free" finding), so without this, watching a demo - including a
++    // clip this feature just saved - would silently re-record itself into the ring on every
++    // rewatch, blurring "the last real minute of play" with "whatever was just on screen".
++    // demoplayback itself (declared above, this file) is client-tracked state already
++    // maintained for the N_DEMOPLAYBACK case; this is a plain one-line accessor, not new
++    // bookkeeping.
++    bool demoplaying() { return demoplayback; }
++    // === end SwiftGibs instant replay: auto-clip on killstreak / demo-playback suppression ===
 +
 +    // The per-player half of a keyframe's N_RESUME block, written in exactly the field order
 +    // parsestate(d, p, true) reads back (this file's own N_RESUME case above): state, frags,
@@ -328,9 +361,11 @@
 +    // Called every c2sinfo() tick (see below); cheap when off or throttled: one pointer-null
 +    // check, one bool read, one integer comparison. The actual synthesis (which walks every
 +    // player and every map entity) only runs once every clipkeyframe seconds, never per frame.
++    // demoplayback (Task 3): also skip while playing back a .dmo - see demoplaying() above for
++    // why capture is suppressed during playback.
 +    void checkclipkeyframe()
 +    {
-+        if(!clipactive() || !connected) return;
++        if(!clipactive() || !connected || demoplayback) return;
 +        static int lastclipkeyframe = -1000000;
 +        if(totalmillis-lastclipkeyframe < clipkeyframe*1000) return;
 +        lastclipkeyframe = totalmillis;
@@ -448,6 +483,23 @@
          sendmessages();
          flushclient();
      }
+@@ -1803,6 +2094,16 @@
+                     if(killstreak > beststreak) beststreak = killstreak;
+                     if(killstreak > matchbeststreak) matchbeststreak = killstreak;
+                     if(killstreak % 5 == 0 && killstreak <= 20) killstreakmilestone(killstreak/5);
++                    // SwiftGibs instant replay (Task 3): auto-clip on reaching a killstreak.
++                    // Hooks the EXISTING per-life counter above rather than counting kills a
++                    // second time. `==` (not `>=`) fires exactly once per life: killstreak only
++                    // ever increases within a life (reset to 0 in deathstate()/startgame(),
++                    // fpsgame/fps.cpp) and this whole block runs once per real kill event, so
++                    // the streak can never skip past the configured count without passing
++                    // through it. clipactive() mirrors saveclip()'s own "off" gate, so nothing
++                    // is attempted - no file write, no console message - when clips itself is
++                    // off, even with clipautostreak on.
++                    if(clipautostreak && killstreak == clipautostreakcount && clipactive()) saveclip();
+                 }
+                 // SwiftGibs: per-player streak for the scoreboard column (all players)
+                 if(victim && victim != actor && (!m_teammode || !isteam(actor->team, victim->team)))
 --- a/shared/iengine.h
 +++ b/shared/iengine.h
 @@ -489,6 +489,12 @@
@@ -490,3 +542,31 @@
      static inline bool playersort(const fpsent *a, const fpsent *b)
      {
          if(a->state==CS_SPECTATOR)
+--- a/shared/igame.h
++++ b/shared/igame.h
+@@ -101,7 +101,8 @@
+     extern void serverinfoendcolumn(g3d_gui *g, int i);
+     extern bool serverinfoentry(g3d_gui *g, int i, const char *name, int port, const char *desc, const char *map, int ping, const vector<int> &attr, int np);
+     extern bool needminimap();
+-} 
++    extern bool demoplaying();   // SwiftGibs instant replay (Task 3): true while playing back a .dmo
++}
+  
+ namespace server
+ {
+--- a/fpsgame/fps.cpp
++++ b/fpsgame/fps.cpp
+@@ -672,6 +672,13 @@
+             {
+                 case ID_VAR:   f->printf("%s %d\n", names[i], *id->storage.i); break;
+                 case ID_FVAR:  f->printf("%s %s\n", names[i], floatstr(*id->storage.f)); break;
++                // SwiftGibs instant replay (Task 3): fixes a gap found while adding clipdir (a
++                // string SVARP) to sgProfileVars - no prior profile var was ever an SVAR, so
++                // this case was simply never needed until now. Format matches the engine's own
++                // writecfg() (engine/command.cpp) for ID_SVAR exactly (name, then
++                // escapestring()'d value), so a saved profile persists a string var with the
++                // same quoting/escaping config.cfg itself already relies on.
++                case ID_SVAR:  f->printf("%s %s\n", names[i], escapestring(*id->storage.s)); break;
+                 case ID_ALIAS: f->printf("%s = [%s]\n", names[i], id->getstr()); break;
+             }
+         }
