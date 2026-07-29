@@ -20,9 +20,9 @@
      extern void bounced(physent *d, const vec &surface);
 --- a/shared/iengine.h
 +++ b/shared/iengine.h
-@@ -492,6 +492,14 @@
- extern void cliprecord(int chan, const void *data, int len);   // SwiftGibs instant replay
- extern bool clipactive();                                      // SwiftGibs instant replay
+@@ -513,6 +513,14 @@
+ extern const uchar *clipsinkdata(int slot);                     // SwiftGibs instant replay (Task 3b)
+ extern void clipsinkreset(int slot);                            // SwiftGibs instant replay (Task 3b)
  
 +// SwiftGibs fps stats: engine-side settings read once at match end for the benchmark log row
 +// (fpsgame/fps.cpp fpsstatsmatchend) - never read from the per-frame path.
@@ -37,7 +37,7 @@
  extern bool calcpubkey(const char *privstr, vector<char> &pubstr);
 --- a/fpsgame/fps.cpp
 +++ b/fpsgame/fps.cpp
-@@ -543,6 +543,203 @@
+@@ -543,6 +543,236 @@
          delete o;
      });
  
@@ -105,7 +105,7 @@
 +    struct fpsresult   // one finished match, kept for the in-game "recent results" view (session-scoped)
 +    {
 +        string date, time, map, mode;
-+        int players, scrw, scrh, fpscap, vsyncon, bilinearon, clipson;
++        int players, scrw, scrh, fpscap, vsyncon, bilinearon, clipson, recordingon;
 +        int avgfps, low1fps, low01fps, obsminfps, obsmaxfps, frames, durms, stutters, stutterthresh;
 +    };
 +    vector<fpsresult> fpsresultlog;   // bounded by fpsstatskeep; oldest at index 0, newest at the end
@@ -173,17 +173,41 @@
 +        return acc > 0 ? (1000*acc)/max(timesum, 1) : 0;
 +    }
 +
++    // A server-supplied string must not carry a raw comma or colour code into a CSV field -
++    // either would break column alignment (a colour code's raw '\f' byte is also just noise in
++    // a text file with no renderer to interpret it). Map name (clientmap, set from the server's
++    // own N_MAPCHANGE payload) is the only field in fpsresult that is genuinely server-controlled
++    // text; mode is server::modename(gamemode) (fpsgame/game.h), which only ever returns one of
++    // a small set of strings compiled into THIS client (a fixed lookup table, fpsgame/server.cpp)
++    // - never bytes copied from the network - so it needs no sanitising and is left as-is.
++    // Same spirit as clipsanitize() (patches/17-replay-clips.patch, fpsgame/client.cpp), which
++    // solves the analogous problem for filenames - but that one is deliberately stricter
++    // (alnum/-/_ only, no spaces) because a filename has a smaller safe charset than a CSV cell.
++    // Here only the two things that actually corrupt a CSV row are stripped, so a map name stays
++    // otherwise readable in the log.
++    static void fpsstatscsvsafe(char *dst, size_t dstsize, const char *src)
++    {
++        size_t n = 0;
++        for(const char *s = src; *s && n+1 < dstsize; s++)
++        {
++            if(*s == '\f') { if(*(s+1)) s++; continue; }   // drop the colour code and its one argument byte
++            if(*s == ',') continue;                         // would be misread as a column separator
++            dst[n++] = *s;
++        }
++        dst[n] = '\0';
++    }
++
 +    static void fpsstatswritelog(const fpsresult &r)
 +    {
 +        const char *fname = "fpsstats.csv";
 +        bool existed = fileexists(findfile(fname, "r"), "r");   // findfile("r") resolves the homedir path if it exists there
 +        stream *o = openfile(fname, "a");                       // openfile resolves+creates the homedir path itself
 +        if(!o) return;
-+        if(!existed) o->printf("date,time,map,mode,players,resolution,maxfps_setting,vsync,avg_fps,low1pct_fps,low01pct_fps,min_fps,max_fps,frames,duration_ms,stutter_count,stutter_threshold_x10,replay_clips_on,bilinear_on\n");
-+        o->printf("%s,%s,%s,%s,%d,%dx%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
++        if(!existed) o->printf("date,time,map,mode,players,resolution,maxfps_setting,vsync,avg_fps,low1pct_fps,low01pct_fps,min_fps,max_fps,frames,duration_ms,stutter_count,stutter_threshold_x10,replay_clips_on,replay_recording_on,bilinear_on\n");
++        o->printf("%s,%s,%s,%s,%d,%dx%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
 +                   r.date, r.time, r.map, r.mode, r.players, r.scrw, r.scrh, r.fpscap, r.vsyncon,
 +                   r.avgfps, r.low1fps, r.low01fps, r.obsminfps, r.obsmaxfps, r.frames, r.durms,
-+                   r.stutters, r.stutterthresh, r.clipson, r.bilinearon);
++                   r.stutters, r.stutterthresh, r.clipson, r.recordingon, r.bilinearon);
 +        delete o;
 +    }
 +
@@ -197,11 +221,20 @@
 +        time_t fpsstatsnow = time(NULL); struct tm *fpsstatslt = localtime(&fpsstatsnow);
 +        formatstring(r.date, "%04d-%02d-%02d", fpsstatslt->tm_year+1900, fpsstatslt->tm_mon+1, fpsstatslt->tm_mday);
 +        formatstring(r.time, "%02d:%02d:%02d", fpsstatslt->tm_hour, fpsstatslt->tm_min, fpsstatslt->tm_sec);
-+        copystring(r.map, getclientmap());
++        fpsstatscsvsafe(r.map, sizeof(r.map), getclientmap());   // server-supplied - see fpsstatscsvsafe() above
 +        copystring(r.mode, server::modename(gamemode));
 +        r.players = players.length();
 +        r.scrw = screenw; r.scrh = screenh;
 +        r.fpscap = maxfps; r.vsyncon = vsync; r.bilinearon = bilinear; r.clipson = clips;
++        // "was a recording sink active at any point during this match", not "is one running right
++        // now" - a manual F9 toggle or an always-on recording can already be finalised by the
++        // time intermission gets here (cliprecordfinalizeall(), called just above this branch in
++        // timeupdate() - see that call site), so cliprecordmanualactive()/cliprecordautoactive()
++        // would both read false here even on a match that recorded the whole way through.
++        // cliprecordwasactivematch() (fpsgame/client.cpp, patches/17) is the latched accessor for
++        // exactly that: true if either sink was ever opened since fpsstatsmatchstart()'s per-match
++        // reset. See that function's own comment for the full reasoning.
++        r.recordingon = cliprecordwasactivematch() ? 1 : 0;
 +        r.avgfps = fpsstatstotalms > 0 ? (1000*fpsstatsframes)/fpsstatstotalms : 0;
 +        r.low1fps = fpsstatsworstlow(max(1, (fpsstatsframes+99)/100));
 +        r.low01fps = fpsstatsworstlow(max(1, (fpsstatsframes+999)/1000));
@@ -241,7 +274,7 @@
      VARP(deathscore, 0, 1, 1);
  
      void deathstate(fpsent *d, bool restore)
-@@ -764,6 +961,8 @@
+@@ -781,6 +1011,8 @@
              disablezoom();
  
              execident("intermission");
@@ -250,7 +283,7 @@
          }
      }
  
-@@ -899,6 +1098,8 @@
+@@ -934,6 +1166,8 @@
          lasthit = 0;
  
          execident("mapstart");

@@ -312,7 +312,7 @@
                  }
                  sendclientpacket(q.finalize(), 0);
                  break;
-@@ -1298,12 +1326,548 @@
+@@ -1298,12 +1326,564 @@
          sendclientpacket(p.finalize(), 1);
      }
  
@@ -467,11 +467,13 @@
 +        // N_RESUME + identity for every player we know about, including ourselves - mirrors
 +        // welcomepacket()'s own `if(!ci || clients.length()>1)` gate, which is always true
 +        // here since a keyframe always plays the ci==NULL ("recording, not one live join") role.
++        // players[] already contains player1 (added once in initclient(), fps.cpp, and never
++        // removed - it's the local entity, not a remote client that can disconnect), so it is
++        // NOT also emitted separately here: stock welcomepacket() (ci==NULL branch) never
++        // double-emits a client either, since it has only the one clients[] loop to begin with.
 +        putint(p, N_RESUME);
-+        putclipresume(player1, p);
 +        loopv(players) if(players[i]) putclipresume(players[i], p);
 +        putint(p, -1);
-+        putclipinit(player1, p);
 +        loopv(players) if(players[i]) putclipinit(players[i], p);
 +    }
 +
@@ -638,8 +640,21 @@
 +                                            // sink synchronously inside startgame() itself would synthesise
 +                                            // an opening keyframe with a stale/empty item list.
 +
++    // SwiftGibs fps stats (patches/18-fps-stats.patch) benchmark row: whether a recording sink
++    // (manual OR always-on) was actually opened at any point during the CURRENT match, as
++    // opposed to merely "is one running right now at match end" - a manual F9 toggle that
++    // started and stopped mid-match, or an always-on recording that was already finalised at
++    // intermission before fpsstatsmatchend() runs, would otherwise read as "off". Latched true
++    // in startcliprecorder() below (the single choke point both recording modes start through),
++    // cleared in cliprecordarmmatchstart() (called once per real match start, fpsgame/fps.cpp
++    // startgame() - the same per-match cadence patches/18's own fpsstatsmatchstart() uses to
++    // discard/reset a previous match's sampling), and read by fpsstatsmatchend() via
++    // cliprecordwasactivematch() below - never on the per-frame path.
++    static bool cliprecordseenthismatch = false;
++
 +    bool cliprecordmanualactive() { return manualrec.f != NULL; }
 +    bool cliprecordautoactive() { return autorec.f != NULL; }
++    bool cliprecordwasactivematch() { return cliprecordseenthismatch; }   // SwiftGibs fps stats accessor
 +
 +    // Opens <clipdir>/<timestamp>_<map>_<mode>_rec-<label>.dmo (same gzipped stock demo format
 +    // saveclip() writes: 24-byte header, then {ms,chan,len} stamps + payload), starts the
@@ -676,6 +691,7 @@
 +        r.basems = -1;
 +        r.lastms = 0;
 +        r.wrotekeyframe = false;
++        cliprecordseenthismatch = true;   // SwiftGibs fps stats: a sink actually opened this match
 +
 +        clipsinkstart(slot);
 +        packetbuf p(MAXTRANS);
@@ -831,7 +847,7 @@
 +        startcliprecorder(autorec, CLIPSINK_AUTO, "auto");
 +    }
 +
-+    void cliprecordarmmatchstart() { cliprecordarmed = true; }
++    void cliprecordarmmatchstart() { cliprecordarmed = true; cliprecordseenthismatch = false; }
 +
 +    // Called once per c2sinfo() tick (see below). Consumes the "a match just started" flag
 +    // (armed synchronously from fpsgame/fps.cpp startgame(), consumed here one tick later so
@@ -861,7 +877,7 @@
          sendmessages();
          flushclient();
      }
-@@ -1803,6 +2367,26 @@
+@@ -1803,6 +2383,26 @@
                      if(killstreak > beststreak) beststreak = killstreak;
                      if(killstreak > matchbeststreak) matchbeststreak = killstreak;
                      if(killstreak % 5 == 0 && killstreak <= 20) killstreakmilestone(killstreak/5);
@@ -922,7 +938,7 @@
  extern void genprivkey(const char *seed, vector<char> &privstr, vector<char> &pubstr);
 --- a/fpsgame/game.h
 +++ b/fpsgame/game.h
-@@ -829,6 +829,14 @@
+@@ -829,6 +829,17 @@
      extern void getbestteams(vector<const char *> &best);
      extern void clearteaminfo();
      extern void setteaminfo(const char *team, int frags);
@@ -934,6 +950,9 @@
 +    extern void cliprecordarmmatchstart();                   // arm always-on to (maybe) start next tick
 +    extern bool cliprecordmanualactive();                    // for the on-screen indicator
 +    extern bool cliprecordautoactive();                      // for the on-screen indicator
++    extern bool cliprecordwasactivematch();                   // SwiftGibs fps stats (patches/18): was a
++                                                                // recording sink active at any point this
++                                                                // match - read once at match end, never per-frame
      extern int statuscolor(fpsent *d, int color);
  
      // render
