@@ -1,0 +1,274 @@
+--- a/engine/main.cpp
++++ b/engine/main.cpp
+@@ -1401,6 +1401,7 @@
+         serverslice(false, 0);
+ 
+         if(frames) updatefpshistory(elapsedtime);
++        if(frames) game::fpsstatsframe(elapsedtime);   // SwiftGibs per-match fps stats: same frame time, no second clock
+         frames++;
+ 
+         // miscellaneous general game effects
+--- a/shared/igame.h
++++ b/shared/igame.h
+@@ -50,6 +50,7 @@
+     extern void loadconfigs();
+ 
+     extern void updateworld();
++    extern void fpsstatsframe(int elapsed);  // SwiftGibs per-match fps stats: called once per frame with the frame time the engine already computed
+     extern void initclient();
+     extern void physicstrigger(physent *d, bool local, int floorlevel, int waterlevel, int material = 0);
+     extern void bounced(physent *d, const vec &surface);
+--- a/shared/iengine.h
++++ b/shared/iengine.h
+@@ -492,6 +492,14 @@
+ extern void cliprecord(int chan, const void *data, int len);   // SwiftGibs instant replay
+ extern bool clipactive();                                      // SwiftGibs instant replay
+ 
++// SwiftGibs fps stats: engine-side settings read once at match end for the benchmark log row
++// (fpsgame/fps.cpp fpsstatsmatchend) - never read from the per-frame path.
++extern int screenw, screenh;
++extern int maxfps;
++extern int vsync;
++extern int bilinear;
++extern int clips;                                               // SwiftGibs instant replay on/off
++
+ // crypto
+ extern void genprivkey(const char *seed, vector<char> &privstr, vector<char> &pubstr);
+ extern bool calcpubkey(const char *privstr, vector<char> &pubstr);
+--- a/fpsgame/fps.cpp
++++ b/fpsgame/fps.cpp
+@@ -543,6 +543,203 @@
+         delete o;
+     });
+ 
++    // === SwiftGibs per-match fps stats (benchmarking) =================================
++    // Design: docs/superpowers/specs/2026-07-29-fps-stats-design.md (untracked locally).
++    //
++    // Sampling window: fpsstatsmatchstart() runs at the end of startgame() (every real match
++    // start - the client only ever reaches startgame() while connected to a game, never from
++    // the main menu); fpsstatsmatchend() runs where timeupdate() sets intermission=true. A
++    // disconnect mid-match (gamedisconnect(), fpsgame/client.cpp) calls fpsstatsreset() instead
++    // of fpsstatsmatchend() - a match that never reached intermission is DISCARDED, not logged,
++    // so a disconnect never produces a half-match row. Demo playback replays the exact recorded
++    // network stream, including any N_MAPCHANGE that would otherwise call startgame() - guarded
++    // out explicitly (both at match-start and every sampled frame) so watching a demo never
++    // fabricates a "match". The ~1s post-load grace period is a plain lastmillis comparison
++    // inside the per-frame gate, covering asset-streaming skew right after a map loads.
++    //
++    // Frame-time histogram: fixed-size, one bucket per integer millisecond from 0 to
++    // FPSSTATS_MAXMS-1, plus one overflow bucket for anything >=FPSSTATS_MAXMS ms. 1ms
++    // resolution is a deliberate choice, not a default: elapsedtime (the frame time the engine
++    // already computes in the main loop) is itself an integer millisecond count, so a finer
++    // bucket would be false precision, and a coarser one would blur exactly the range this
++    // feature needs to resolve (200fps=5ms vs 500fps=2ms are 3 buckets apart, and a 20fps hitch
++    // at 50ms sits comfortably inside the range). FPSSTATS_BUCKETS * 4 bytes ~= 2KB, a fixed
++    // static array with no allocation, ever. Frames at or past FPSSTATS_MAXMS (500ms, i.e. <=2
++    // fps - a genuine stall, not ordinary play) all collapse into the last bucket; percentile
++    // maths below times them at exactly FPSSTATS_MAXMS, a floor - if the real stall ran longer
++    // the reported low is a slight OVERESTIMATE in that rare case. Documented, not corrected.
++    //
++    // "1% low" / "0.1% low": the average fps of the worst 1% / 0.1% of FRAMES by frame time -
++    // the standard modern stutter metric. This is NOT the 1st percentile of a list of per-frame
++    // instantaneous fps values (a noisier, non-equivalent statistic some tools report instead).
++    // Computed by walking the histogram from the slowest bucket down, accumulating frame count
++    // and total time until the required frame count is covered, then fps = frames/time over just
++    // that worst slice (average fps done the honest way: total frames over total time of the
++    // slice, never an average of per-frame fps values).
++    //
++    // Stutter count: a frame is a stutter if it takes longer than fpsstatsstutter/10 times the
++    // running median frame time - what a player actually feels as a hitch, scaled to whatever
++    // pace the match is currently at (a firefight at 80fps and a quiet corridor at 500fps both
++    // get their own baseline). The "running" median is a genuine median (not an average or an
++    // EMA), refreshed every FPSSTATS_MEDIANWIN frames from a small fixed ring buffer via the
++    // engine's own insertionsort() on a stack copy - no allocation, and the amortized cost is a
++    // 16-element sort roughly every 16 frames, not a sort per frame.
++    #define FPSSTATS_MAXMS 500                     // 1ms buckets, 0..(FPSSTATS_MAXMS-1) individually
++    #define FPSSTATS_BUCKETS (FPSSTATS_MAXMS + 1)   // + one overflow bucket for >=FPSSTATS_MAXMS ms
++    #define FPSSTATS_MEDIANWIN 16                   // stutter baseline: median of the last 16 sampled frames
++
++    VARP(fpsstats, 0, 1, 1);                  // feature on/off (default on - it's nearly free and the point is data)
++    VARP(fpsstatslog, 0, 1, 1);               // append a row to fpsstats.csv at match end
++    VARP(fpsstatskeep, 1, 10, 50);            // recent match results kept for the in-game view (this session)
++    VARP(fpsstatsstutter, 11, 20, 100);       // stutter threshold, tenths of the running median (20 = 2.0x)
++
++    static bool fpsstatsactive = false;
++    static int fpsstatsstartmillis = 0;
++    static uint fpsstatshist[FPSSTATS_BUCKETS];
++    static int fpsstatsframes = 0;
++    static int fpsstatstotalms = 0;           // exact running sum - the average uses this, never the histogram
++    static int fpsstatsworstidx = -1, fpsstatsbestidx = -1;   // slowest / fastest bucket touched this match
++    static int fpsstatsmedianring[FPSSTATS_MEDIANWIN];
++    static int fpsstatsmedianpos = 0;
++    static int fpsstatsrunningmedian = 0;     // 0 = not established yet (fewer than one full window sampled)
++    static int fpsstatsstuttercount = 0;
++
++    struct fpsresult   // one finished match, kept for the in-game "recent results" view (session-scoped)
++    {
++        string date, time, map, mode;
++        int players, scrw, scrh, fpscap, vsyncon, bilinearon, clipson;
++        int avgfps, low1fps, low01fps, obsminfps, obsmaxfps, frames, durms, stutters, stutterthresh;
++    };
++    vector<fpsresult> fpsresultlog;   // bounded by fpsstatskeep; oldest at index 0, newest at the end
++
++    void fpsstatsreset()
++    {
++        fpsstatsactive = false;
++        fpsstatsstartmillis = 0;
++        memset(fpsstatshist, 0, sizeof(fpsstatshist));
++        fpsstatsframes = 0;
++        fpsstatstotalms = 0;
++        fpsstatsworstidx = fpsstatsbestidx = -1;
++        memset(fpsstatsmedianring, 0, sizeof(fpsstatsmedianring));
++        fpsstatsmedianpos = 0;
++        fpsstatsrunningmedian = 0;
++        fpsstatsstuttercount = 0;
++    }
++
++    void fpsstatsmatchstart()   // called at the end of startgame() - every real match, never the menu
++    {
++        fpsstatsreset();
++        if(!fpsstats || demoplayback) return;   // off, or a replayed demo synthesising a fake "match"
++        fpsstatsactive = true;
++        fpsstatsstartmillis = lastmillis;
++    }
++
++    void fpsstatsframe(int elapsed)   // called once per frame from the engine main loop (main.cpp)
++    {
++        if(!fpsstatsactive) return;
++        if(!fpsstats || demoplayback) { fpsstatsactive = false; return; }   // toggled off, or demo started mid-match
++        if(lastmillis - fpsstatsstartmillis < 1000) return;   // ~1s post-load grace: asset streaming skews the numbers
++
++        fpsstatsframes++;
++        fpsstatstotalms += elapsed;
++
++        int idx = elapsed < 0 ? 0 : (elapsed > FPSSTATS_MAXMS ? FPSSTATS_MAXMS : elapsed);
++        fpsstatshist[idx]++;
++        if(fpsstatsworstidx < idx) fpsstatsworstidx = idx;
++        if(fpsstatsbestidx < 0 || idx < fpsstatsbestidx) fpsstatsbestidx = idx;
++
++        fpsstatsmedianring[fpsstatsmedianpos++] = elapsed;
++        if(fpsstatsmedianpos >= FPSSTATS_MEDIANWIN)
++        {
++            fpsstatsmedianpos = 0;
++            int tmp[FPSSTATS_MEDIANWIN];
++            memcpy(tmp, fpsstatsmedianring, sizeof(tmp));
++            insertionsort(tmp, FPSSTATS_MEDIANWIN);
++            fpsstatsrunningmedian = tmp[FPSSTATS_MEDIANWIN/2];
++        }
++        if(fpsstatsrunningmedian > 0 && elapsed*10 > fpsstatsrunningmedian*fpsstatsstutter) fpsstatsstuttercount++;
++    }
++
++    // Walk the histogram from the slowest bucket down until at least `neededframes` frames are
++    // covered, then average fps over just that worst slice (frames / time, not average-of-fps).
++    static int fpsstatsworstlow(int neededframes)
++    {
++        int acc = 0, timesum = 0;
++        for(int idx = FPSSTATS_MAXMS; idx >= 0 && acc < neededframes; idx--)
++        {
++            int c = fpsstatshist[idx];
++            if(!c) continue;
++            acc += c;
++            timesum += idx*c;
++        }
++        return acc > 0 ? (1000*acc)/max(timesum, 1) : 0;
++    }
++
++    static void fpsstatswritelog(const fpsresult &r)
++    {
++        const char *fname = "fpsstats.csv";
++        bool existed = fileexists(findfile(fname, "r"), "r");   // findfile("r") resolves the homedir path if it exists there
++        stream *o = openfile(fname, "a");                       // openfile resolves+creates the homedir path itself
++        if(!o) return;
++        if(!existed) o->printf("date,time,map,mode,players,resolution,maxfps_setting,vsync,avg_fps,low1pct_fps,low01pct_fps,min_fps,max_fps,frames,duration_ms,stutter_count,stutter_threshold_x10,replay_clips_on,bilinear_on\n");
++        o->printf("%s,%s,%s,%s,%d,%dx%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
++                   r.date, r.time, r.map, r.mode, r.players, r.scrw, r.scrh, r.fpscap, r.vsyncon,
++                   r.avgfps, r.low1fps, r.low01fps, r.obsminfps, r.obsmaxfps, r.frames, r.durms,
++                   r.stutters, r.stutterthresh, r.clipson, r.bilinearon);
++        delete o;
++    }
++
++    void fpsstatsmatchend()   // called from timeupdate() where intermission is set
++    {
++        bool wasactive = fpsstatsactive;
++        fpsstatsactive = false;
++        if(!wasactive || !fpsstats || fpsstatsframes < 1) { fpsstatsreset(); return; }   // nothing sampled - discard quietly
++
++        fpsresult r;
++        time_t fpsstatsnow = time(NULL); struct tm *fpsstatslt = localtime(&fpsstatsnow);
++        formatstring(r.date, "%04d-%02d-%02d", fpsstatslt->tm_year+1900, fpsstatslt->tm_mon+1, fpsstatslt->tm_mday);
++        formatstring(r.time, "%02d:%02d:%02d", fpsstatslt->tm_hour, fpsstatslt->tm_min, fpsstatslt->tm_sec);
++        copystring(r.map, getclientmap());
++        copystring(r.mode, server::modename(gamemode));
++        r.players = players.length();
++        r.scrw = screenw; r.scrh = screenh;
++        r.fpscap = maxfps; r.vsyncon = vsync; r.bilinearon = bilinear; r.clipson = clips;
++        r.avgfps = fpsstatstotalms > 0 ? (1000*fpsstatsframes)/fpsstatstotalms : 0;
++        r.low1fps = fpsstatsworstlow(max(1, (fpsstatsframes+99)/100));
++        r.low01fps = fpsstatsworstlow(max(1, (fpsstatsframes+999)/1000));
++        r.obsminfps = fpsstatsworstidx >= 0 ? 1000/max(1, fpsstatsworstidx) : 0;
++        r.obsmaxfps = fpsstatsbestidx >= 0 ? 1000/max(1, fpsstatsbestidx) : 0;
++        r.frames = fpsstatsframes;
++        r.durms = fpsstatstotalms;
++        r.stutters = fpsstatsstuttercount;
++        r.stutterthresh = fpsstatsstutter;
++
++        conoutf(CON_GAMEINFO, "\f2fps: avg %d  1%% low %d  0.1%% low %d  (%d frames, %d.%01ds)",
++                r.avgfps, r.low1fps, r.low01fps, r.frames, r.durms/1000, (r.durms%1000)/100);
++        conoutf(CON_GAMEINFO, "\f2fps: min %d  max %d  stutters %d (frame > %d.%01dx median)",
++                r.obsminfps, r.obsmaxfps, r.stutters, r.stutterthresh/10, r.stutterthresh%10);
++
++        fpsresultlog.add(r);
++        while(fpsresultlog.length() > max(1, fpsstatskeep)) fpsresultlog.remove(0);
++
++        if(fpsstatslog) fpsstatswritelog(r);
++
++        fpsstatsreset();
++    }
++
++    ICOMMAND(fpsstatscount, "", (), intret(fpsresultlog.length()));
++    ICOMMAND(fpsstatsline, "i", (int *i),
++    {
++        int n = fpsresultlog.length();
++        if(*i < 0 || *i >= n) { result(""); return; }
++        fpsresult &r = fpsresultlog[n-1-*i];   // 0 = most recent
++        defformatstring(line, "%s %s  %s/%s  %dp  avg %d  1%%low %d  .1%%low %d  min %d  max %d  stut %d  %dx%d  clips:%s",
++                         r.date, r.time, r.mode, r.map, r.players, r.avgfps, r.low1fps, r.low01fps,
++                         r.obsminfps, r.obsmaxfps, r.stutters, r.scrw, r.scrh, r.clipson ? "on" : "off");
++        result(line);
++    });
++    // === end SwiftGibs per-match fps stats =============================================
++
+     VARP(deathscore, 0, 1, 1);
+ 
+     void deathstate(fpsent *d, bool restore)
+@@ -764,6 +961,8 @@
+             disablezoom();
+ 
+             execident("intermission");
++
++            fpsstatsmatchend();   // SwiftGibs: console summary + log row + recent-results entry
+         }
+     }
+ 
+@@ -899,6 +1098,8 @@
+         lasthit = 0;
+ 
+         execident("mapstart");
++
++        fpsstatsmatchstart();   // SwiftGibs: begin sampling (discards/resets any prior unfinished match)
+     }
+ 
+     void loadingmap(const char *name)
+--- a/fpsgame/client.cpp
++++ b/fpsgame/client.cpp
+@@ -1142,6 +1142,10 @@
+     void gamedisconnect(bool cleanup)
+     {
+         if(remote) stopfollowing();
++        // SwiftGibs fps stats: a match that disconnects before intermission is discarded, not
++        // logged - never call fpsstatsmatchend() here, only reset.
++        extern void fpsstatsreset();
++        fpsstatsreset();
+         chatlog.deletearrays();
+         ignores.setsize(0);
+         connected = remote = false;
