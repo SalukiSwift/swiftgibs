@@ -1,6 +1,6 @@
 --- a/engine/client.cpp
 +++ b/engine/client.cpp
-@@ -204,8 +204,89 @@
+@@ -204,8 +204,151 @@
      if(disc) disconnect();
  }
  
@@ -21,6 +21,11 @@
 +static int clipbufsize = 0;            // allocated bytes (0 when the feature is off)
 +static int clipwritepos = 0;           // next write offset
 +static bool clipfull = false;          // ring has wrapped at least once (oldest data starts at clipwritepos)
++static int clipwraplimit = 0;          // Task 2: dead-zone boundary from the most recent early wrap (see
++                                        // cliprecord() below) - bytes [clipwraplimit, clipbufsize) are stale,
++                                        // never-reharvested tail from an older lap and must never be parsed as
++                                        // a record. Written only on the (already rare) wrap branches, so this
++                                        // adds nothing to the steady-state per-record cost.
 +
 +bool clipactive() { return clipbuf != NULL; }
 +
@@ -34,6 +39,7 @@
 +    if(total > clipbufsize) return;                // can never fit whole - drop it, ring untouched
 +    if(clipwritepos + total > clipbufsize)          // would tear across the end - wrap first
 +    {
++        clipwraplimit = clipwritepos;               // Task 2: everything from here to clipbufsize is now dead
 +        clipwritepos = 0;
 +        clipfull = true;
 +    }
@@ -41,13 +47,18 @@
 +    memcpy(&clipbuf[clipwritepos], &h, CLIPHDRSIZE);
 +    if(len) memcpy(&clipbuf[clipwritepos + CLIPHDRSIZE], data, len);
 +    clipwritepos += total;
-+    if(clipwritepos >= clipbufsize) { clipwritepos = 0; clipfull = true; }
++    if(clipwritepos >= clipbufsize)                 // landed exactly on the end - no dead zone this lap
++    {
++        clipwritepos = 0;
++        clipfull = true;
++        clipwraplimit = clipbufsize;
++    }
 +}
 +
 +static void clipfree()
 +{
 +    DELETEA(clipbuf);
-+    clipbufsize = clipwritepos = 0;
++    clipbufsize = clipwritepos = clipwraplimit = 0;
 +    clipfull = false;
 +}
 +
@@ -77,8 +88,59 @@
 +    clipfree();
 +    clipbuf = new uchar[(size_t)size];
 +    clipbufsize = (int)size;
++    clipwraplimit = (int)size;
 +}
 +// === end SwiftGibs instant replay ring buffer ==========================================
++
++// === SwiftGibs instant replay: ring reader (Task 2) ====================================
++// Read side only, used by saveclip's writer (fpsgame/client.cpp) - never on the hot path
++// above. Exposes a clean interface (an ordered record index + a read-only data pointer)
++// rather than the raw ring statics, so a caller never has to re-derive the wrap math itself.
++// (clipentry itself is declared in shared/iengine.h, alongside cliprecord/clipactive, so
++// fpsgame/client.cpp's writer can name the type without a second, divergent definition.)
++
++// Appends every well-formed record found in [from, to) to out, oldest first. A record only
++// counts if its whole header AND its declared payload fit inside [from, to) - this is what
++// makes the scan self-terminating at a dead-zone boundary rather than needing to special-case
++// it: the tail bytes an early wrap leaves behind (clipwraplimit..clipbufsize) are never
++// zeroed, so after the ring's first lap they hold a stale header from an older lap that would
++// otherwise be misread as a real record (and its stale len could run past clipbufsize
++// entirely - the fit check below is what stops that being read as a length to trust). Passing
++// clipwraplimit as this scan's own "to" for the old-lap half (see clipindex()) means the dead
++// zone is never even entered; the fit check is a second, redundant line of defence.
++static void clipscan(int from, int to, vector<clipentry> &out)
++{
++    int pos = from;
++    while(pos + CLIPHDRSIZE <= to)
++    {
++        clipheader h;
++        memcpy(&h, &clipbuf[pos], CLIPHDRSIZE);
++        if(h.len < 0 || pos + CLIPHDRSIZE + h.len > to) break;   // dead zone / malformed - stop here
++        clipentry &e = out.add();
++        e.ms = h.ms; e.chan = h.chan; e.len = h.len; e.offset = pos + CLIPHDRSIZE;
++        pos += CLIPHDRSIZE + h.len;
++    }
++}
++
++// Builds an oldest -> newest index of every record currently in the ring. When the ring has
++// wrapped, the true oldest data starts at clipwritepos and runs to clipwraplimit (the boundary
++// recorded by the most recent wrap in cliprecord(), never the dead zone beyond it); the newest
++// data is always [0, clipwritepos). Returns false (out left untouched) if the feature is off
++// or nothing has been captured yet.
++bool clipindex(vector<clipentry> &out)
++{
++    if(!clipbuf) return false;
++    if(clipfull) { clipscan(clipwritepos, clipwraplimit, out); clipscan(0, clipwritepos, out); }
++    else clipscan(0, clipwritepos, out);
++    return out.length() > 0;
++}
++
++// Read-only view of the ring's backing bytes; clipentry::offset (from clipindex() above)
++// indexes into this. NULL when the feature is off. Valid only until the next cliprecord()
++// call - fine for saveclip, which indexes and writes the whole file as one synchronous
++// command with no engine tick (and so no cliprecord() call) able to run in between.
++const uchar *clipdata() { return clipbuf; }
++// === end SwiftGibs instant replay ring reader ===========================================
 +
  void localservertoclient(int chan, ENetPacket *packet)   // processes any updates from the server
  {
@@ -122,14 +184,309 @@
                  }
                  sendclientpacket(q.finalize(), 0);
                  break;
+@@ -1298,12 +1309,263 @@
+         sendclientpacket(p.finalize(), 1);
+     }
+ 
++    // === SwiftGibs instant replay: keyframes + clip writing (Task 2) ====================
++    // A "keyframe" is a welcome-equivalent preamble - closely mirroring the ci==NULL branch
++    // of the stock server's welcomepacket() (fpsgame/server.cpp), the SAME branch stock demo
++    // recording itself uses (setupdemorecord() also calls welcomepacket(p, NULL)) - built
++    // entirely from this client's own mirrored world state and inserted into the ring every
++    // clipkeyframe seconds, tagged with the CLIPCHAN_KEYFRAME sentinel so saveclip can find
++    // it later. Real wire channels are 0-2 (fpsgame/server.cpp numchannels()); channel 3 can
++    // never arrive from real traffic or from the own-position synthesiser (which always uses
++    // chan 0), so it is always unambiguous inside the ring. saveclip translates it back to
++    // the real chan 1 (reliable messages) when it writes the record to the .dmo file.
++    #define CLIPCHAN_KEYFRAME 3
++
++    VARP(clipkeyframe, 1, 5, 30);   // seconds between synthesised keyframes
++    SVARP(clipdir, "clips");       // folder saveclip writes into, relative to the game dir
++
++    // The per-player half of a keyframe's N_RESUME block, written in exactly the field order
++    // parsestate(d, p, true) reads back (this file's own N_RESUME case above): state, frags,
++    // flags, deaths, quadmillis, then lifesequence/health/maxhealth/armour/armourtype/
++    // gunselect/ammo[] - the same order the server's sendstate() uses. parsestate() discards
++    // (but still consumes) state/quadmillis/gunselect/ammo for whichever entry turns out to
++    // be the reader's own player1 - harmless, since real values here cost nothing extra and
++    // keep this one code path honest for every player, self included.
++    void putclipresume(fpsent *d, packetbuf &p)
++    {
++        putint(p, d->clientnum);
++        putint(p, d->state);
++        putint(p, d->frags);
++        putint(p, d->flags);
++        putint(p, d->deaths);
++        putint(p, d->quadmillis);
++        putint(p, d->lifesequence);
++        putint(p, d->health);
++        putint(p, d->maxhealth);
++        putint(p, d->armour);
++        putint(p, d->armourtype);
++        putint(p, d->gunselect);
++        loopi(GUN_PISTOL-GUN_SG+1) putint(p, d->ammo[GUN_SG+i]);
++    }
++
++    // Identity announce, mirroring welcomeinitclient()'s putinitclient() (fpsgame/server.cpp)
++    // field-for-field, so a fresh playback client - which clears all known players the moment
++    // demo playback starts (see N_DEMOPLAYBACK above) - can populate name/team/model, or
++    // ownernum/aitype/skill for a bot, instead of showing an anonymous clientnum.
++    void putclipinit(fpsent *d, packetbuf &p)
++    {
++        if(d->aitype != AI_NONE)
++        {
++            putint(p, N_INITAI);
++            putint(p, d->clientnum);
++            putint(p, d->ownernum);
++            putint(p, d->aitype);
++            putint(p, d->skill);
++            putint(p, d->playermodel);
++            sendstring(d->name, p);
++            sendstring(d->team, p);
++        }
++        else
++        {
++            putint(p, N_INITCLIENT);
++            putint(p, d->clientnum);
++            sendstring(d->name, p);
++            sendstring(d->team, p);
++            putint(p, d->playermodel);
++        }
++    }
++
++    // Builds one keyframe. What this can honestly reconstruct from client-mirrored state:
++    // map/mode, remaining time, the full item-spawn list (entities::ents mirrors every
++    // N_ITEMLIST/N_ITEMSPAWN/N_ITEMACC this client has ever received), current mastermode +
++    // privileged clients, pause/gamespeed state, team scores, and full resume state + identity
++    // for every player this client currently knows about, including itself.
++    //
++    // What it CANNOT honestly reconstruct, and does not fake: game-mode-specific extra init
++    // state - the server-only smode->initclient() call in the real welcomepacket() (e.g.
++    // CTF/collect flag-carry state, protect-mode zone ownership, hold-point state). A clip
++    // that starts mid-round in one of those modes may show a carried flag/zone/point in its
++    // default state until the next real event in the clip corrects it - a known, honest
++    // limitation, not a bug: there is no client-side mirror of that state to draw on.
++    void writeclipwelcome(packetbuf &p)
++    {
++        putint(p, N_WELCOME);
++
++        putint(p, N_MAPCHANGE);
++        sendstring(clientmap, p);
++        putint(p, gamemode);
++        putint(p, 0);   // notgotitems: we always supply our own item list below, never omit it
++
++        putint(p, N_TIMEUP);
++        putint(p, (!intermission && maplimit > lastmillis) ? max((maplimit-lastmillis)/1000, 1) : 0);
++
++        putint(p, N_ITEMLIST);
++        loopv(entities::ents) if(entities::ents[i]->spawned())
++        {
++            putint(p, i);
++            putint(p, entities::ents[i]->type);
++        }
++        putint(p, -1);
++
++        bool hasmaster = false;
++        if(mastermode != MM_OPEN) { putint(p, N_CURRENTMASTER); putint(p, mastermode); hasmaster = true; }
++        if(player1->privilege >= PRIV_MASTER)
++        {
++            if(!hasmaster) { putint(p, N_CURRENTMASTER); putint(p, mastermode); hasmaster = true; }
++            putint(p, player1->clientnum);
++            putint(p, player1->privilege);
++        }
++        loopv(players) if(players[i] && players[i]->privilege >= PRIV_MASTER)
++        {
++            if(!hasmaster) { putint(p, N_CURRENTMASTER); putint(p, mastermode); hasmaster = true; }
++            putint(p, players[i]->clientnum);
++            putint(p, players[i]->privilege);
++        }
++        if(hasmaster) putint(p, -1);
++
++        if(gamepaused) { putint(p, N_PAUSEGAME); putint(p, 1); putint(p, -1); }
++        if(gamespeed != 100) { putint(p, N_GAMESPEED); putint(p, gamespeed); putint(p, -1); }
++
++        if(m_teammode)
++        {
++            putint(p, N_TEAMINFO);
++            vector<teaminfo> tis;
++            getteaminfos(tis);
++            loopv(tis) if(tis[i].frags) { sendstring(tis[i].team, p); putint(p, tis[i].frags); }
++            sendstring("", p);
++        }
++
++        // N_RESUME + identity for every player we know about, including ourselves - mirrors
++        // welcomepacket()'s own `if(!ci || clients.length()>1)` gate, which is always true
++        // here since a keyframe always plays the ci==NULL ("recording, not one live join") role.
++        putint(p, N_RESUME);
++        putclipresume(player1, p);
++        loopv(players) if(players[i]) putclipresume(players[i], p);
++        putint(p, -1);
++        putclipinit(player1, p);
++        loopv(players) if(players[i]) putclipinit(players[i], p);
++    }
++
++    // Called every c2sinfo() tick (see below); cheap when off or throttled: one pointer-null
++    // check, one bool read, one integer comparison. The actual synthesis (which walks every
++    // player and every map entity) only runs once every clipkeyframe seconds, never per frame.
++    void checkclipkeyframe()
++    {
++        if(!clipactive() || !connected) return;
++        static int lastclipkeyframe = -1000000;
++        if(totalmillis-lastclipkeyframe < clipkeyframe*1000) return;
++        lastclipkeyframe = totalmillis;
++        packetbuf p(MAXTRANS);
++        writeclipwelcome(p);
++        cliprecord(CLIPCHAN_KEYFRAME, p.buf, p.len);
++    }
++
++    // Keeps only letters/digits/-/_ from a map or mode name before it goes into a filename -
++    // the same charset as validprofilename() (fpsgame/fps.cpp, patch 16's profiles feature),
++    // the established SwiftGibs sanitiser precedent - so nothing drawn from server-supplied
++    // data (the map name) or a mode name can ever put a path separator or CubeScript
++    // metacharacter into a filename. Falls back to `fallback` if nothing survives.
++    static void clipsanitize(char *dst, size_t dstsize, const char *src, const char *fallback)
++    {
++        size_t n = 0;
++        if(src) for(const char *s = src; *s && n+1 < dstsize; s++)
++            if(iscubealnum(*s) || *s=='-' || *s=='_') dst[n++] = (char)*s;
++        dst[n] = '\0';
++        if(!dst[0]) copystring(dst, fallback, dstsize);
++    }
++
++    // saveclip: writes <clipdir>/<timestamp>_<map>_<mode>.dmo, gzipped in the stock demo
++    // format (24-byte demoheader, then lilswapped {ms,chan,len} stamps + raw payload,
++    // mirroring writedemo()/setupdemorecord() in fpsgame/server.cpp field-for-field), reading
++    // the ring via engine/client.cpp's clipindex()/clipdata() (Task 2's read-side addition to
++    // the ring). Starts from the newest keyframe at or before (now - cliplength); falls back
++    // to the earliest keyframe present if none qualifies yet. Timestamps are rebased so the
++    // file starts at 0. Every failure path below refuses with a clear console message and
++    // touches no file - it never partially writes.
++    // A plain function, not an inline ICOMMAND body: the preprocessor only respects ()
++    // nesting when splitting a macro call's arguments, not {}, so a bare top-level comma in
++    // a multi-variable declaration or an array initialiser (both used below) would silently
++    // mis-split an inline ICOMMAND(...) body into "too many arguments". Registered with
++    // COMMAND() below instead, the same way respawn() and other established SwiftGibs/stock
++    // commands with real function bodies are.
++    void saveclip()
++    {
++        if(!clipactive()) { conoutf("saveclip: replay clips are off (clips 1 to enable)"); return; }
++        if(!connected) { conoutf("saveclip: not connected"); return; }
++
++        vector<clipentry> idx;
++        if(!clipindex(idx)) { conoutf("saveclip: nothing recorded yet"); return; }
++
++        int cutoff = totalmillis - cliplength*60000;
++        int starti = -1;
++        int earliesti = -1;
++        loopv(idx) if(idx[i].chan == CLIPCHAN_KEYFRAME)
++        {
++            if(earliesti < 0) earliesti = i;
++            if(idx[i].ms <= cutoff) starti = i;   // idx is oldest->newest: last match = newest <= cutoff
++        }
++        if(starti < 0) starti = earliesti;
++        if(starti < 0) { conoutf("saveclip: no keyframe recorded yet - try again in a moment"); return; }
++
++        const uchar *data = clipdata();
++        if(!data) { conoutf("saveclip: replay clips are off (clips 1 to enable)"); return; }
++
++        string mapname;
++        string mode;
++        clipsanitize(mapname, sizeof(mapname), clientmap, "map");
++        clipsanitize(mode, sizeof(mode), server::modename(gamemode), "mode");
++
++        string sstime;
++        time_t t = time(NULL);
++        size_t tlen = strftime(sstime, sizeof(sstime), "%Y-%m-%d_%H.%M.%S", localtime(&t));
++        sstime[min(tlen, sizeof(sstime)-1)] = '\0';
++
++        defformatstring(relpath, "%s%s%s_%s_%s.dmo", clipdir, clipdir[0] ? "/" : "", sstime, mapname, mode);
++
++        stream *f = opengzfile(path(relpath, true), "wb");
++        if(!f) { conoutf("saveclip: could not write %s", relpath); return; }
++
++        demoheader hdr;
++        memcpy(hdr.magic, DEMO_MAGIC, sizeof(hdr.magic));
++        hdr.version = DEMO_VERSION;
++        hdr.protocol = PROTOCOL_VERSION;
++        lilswap(&hdr.version, 2);
++        f->write(&hdr, sizeof(demoheader));
++
++        int basems = idx[starti].ms;
++        int lastms = basems;
++        for(int i = starti; i < idx.length(); i++)
++        {
++            // Only the STARTING keyframe carries the full synthesised welcome bundle - a
++            // later one inside the same clip window is redundant (real incremental packets
++            // already keep a live client in sync) and actively harmful to include: its own
++            // N_MAPCHANGE would force an extra, jarring map reload mid-playback. Skip it
++            // entirely rather than translate it - lastms is left untouched so the reported
++            // duration still reflects the true span of what got written.
++            if(idx[i].chan == CLIPCHAN_KEYFRAME && i != starti) continue;
++            int stamp[3];
++            stamp[0] = idx[i].ms - basems;
++            stamp[1] = idx[i].chan == CLIPCHAN_KEYFRAME ? 1 : idx[i].chan;
++            stamp[2] = idx[i].len;
++            lilswap(stamp, 3);
++            f->write(stamp, sizeof(stamp));
++            if(idx[i].len) f->write(&data[idx[i].offset], idx[i].len);
++            lastms = idx[i].ms;
++        }
++        delete f;
++
++        conoutf("saved clip: %s (%.1fs)", relpath, (lastms-basems)/1000.0f);
++    }
++    COMMAND(saveclip, "");
++    // === end SwiftGibs instant replay: keyframes + clip writing =============================
++
+     void c2sinfo(bool force) // send update to the server
+     {
+         static int lastupdate = -1000;
+         if(totalmillis - lastupdate < 33 && !force) return; // don't update faster than 30fps
+         lastupdate = totalmillis;
+         sendpositions();
++        checkclipkeyframe();   // SwiftGibs instant replay (Task 2)
+         sendmessages();
+         flushclient();
+     }
 --- a/shared/iengine.h
 +++ b/shared/iengine.h
-@@ -489,6 +489,8 @@
+@@ -489,6 +489,12 @@
  extern void neterr(const char *s, bool disc = true);
  extern void gets2c();
  extern void notifywelcome();
 +extern void cliprecord(int chan, const void *data, int len);   // SwiftGibs instant replay
 +extern bool clipactive();                                      // SwiftGibs instant replay
++extern int cliplength;                                          // SwiftGibs instant replay (VARP, minutes)
++struct clipentry { int ms, chan, len, offset; };                // SwiftGibs instant replay (Task 2)
++extern bool clipindex(vector<clipentry> &out);                  // SwiftGibs instant replay (Task 2)
++extern const uchar *clipdata();                                 // SwiftGibs instant replay (Task 2)
  
  // crypto
  extern void genprivkey(const char *seed, vector<char> &privstr, vector<char> &pubstr);
+--- a/fpsgame/game.h
++++ b/fpsgame/game.h
+@@ -829,6 +829,7 @@
+     extern void getbestteams(vector<const char *> &best);
+     extern void clearteaminfo();
+     extern void setteaminfo(const char *team, int frags);
++    extern void getteaminfos(vector<teaminfo> &out);   // SwiftGibs instant replay (Task 2)
+     extern int statuscolor(fpsent *d, int color);
+ 
+     // render
+--- a/fpsgame/scoreboard.cpp
++++ b/fpsgame/scoreboard.cpp
+@@ -34,6 +34,14 @@
+         t->frags = frags;
+     }
+ 
++    // SwiftGibs instant replay (Task 2): read-only snapshot of currently known team scores,
++    // for synthesising a keyframe's N_TEAMINFO block (fpsgame/client.cpp writeclipwelcome()).
++    // teaminfos itself stays private to this file, as it always has been - callers get a copy.
++    void getteaminfos(vector<teaminfo> &out)
++    {
++        enumerate(teaminfos, teaminfo, t, out.add(t));
++    }
++
+     static inline bool playersort(const fpsent *a, const fpsent *b)
+     {
+         if(a->state==CS_SPECTATOR)
