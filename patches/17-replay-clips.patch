@@ -312,7 +312,7 @@
                  }
                  sendclientpacket(q.finalize(), 0);
                  break;
-@@ -1298,12 +1326,564 @@
+@@ -1298,12 +1326,664 @@
          sendclientpacket(p.finalize(), 1);
      }
  
@@ -801,6 +801,106 @@
 +        files.deletearrays();
 +    }
 +
++    // === SwiftGibs instant replay: clip folder listing (playback discoverability fix) =======
++    // April's playtest-1 bug: clips land in clipdir, but neither the stock `demo` command nor
++    // the stock demo browser ever look there (both only know demodir). April's chosen fix
++    // (design doc "Playback discoverability") keeps clipdir separate and gives it its own
++    // playback surface: `playclip <name>` (a CubeScript name-resolution shim, overlay/
++    // autoexec.cfg, that builds <clipdir>/<name>.dmo and hands off to the exact same
++    // "stopdemo; if (mode -1) [map ...]" sequence the stock `demo` alias runs - no new demo
++    // reader) and this browser page's C++ backing, following the exact fpsstatscount()/
++    // fpsstatsline() division of labour (patches/18-fps-stats.patch, fpsgame/fps.cpp): C++ owns
++    // the directory read, the sort, and the label parsing; the CubeScript page is a pure viewer
++    // + click-to-play front end.
++    //
++    // Same listfiles(clipdir, "dmo", ...) call pruneclipdir() above already makes - filenames
++    // come back WITHOUT the .dmo extension (shared/stream.cpp listdir() strips a matched ext).
++    // CONTRACT with overlay/menus_settings.cfg's "clips" page: clipfilecount() refreshes this
++    // cache (one listfiles()+sort() per call); clipfilename()/clipfileline() only ever READ the
++    // cache, never list the directory themselves - the page calls clipfilecount() exactly once
++    // per frame (into sgClipTotal, before any per-row accessor), so a frame the page is visible
++    // costs one directory read total, not one per row. Sorted ascending (filenames are
++    // timestamp-prefixed, so lexicographic order is chronological order - the same fact
++    // pruneclipdir() above already relies on); accessors index from the END of the cache so row
++    // 0 is always the newest file.
++    static vector<char *> cliplistcache;
++
++    ICOMMAND(clipfilecount, "", (),
++    {
++        cliplistcache.deletearrays();
++        listfiles(clipdir, "dmo", cliplistcache);
++        cliplistcache.sort();
++        intret(cliplistcache.length());
++    });
++
++    // Filename WITH the .dmo extension restored - exactly what playclip (and a manual
++    // `/demo clips/<name>`) both expect. Never touches the filesystem itself (see CONTRACT
++    // above) - reads the cache clipfilecount() just refreshed.
++    ICOMMAND(clipfilename, "i", (int *i),
++    {
++        int n = cliplistcache.length();
++        if(*i < 0 || *i >= n) { result(""); return; }
++        defformatstring(name, "%s.dmo", cliplistcache[n-1-*i]);
++        result(name);
++    });
++
++    // Best-effort display label, never load-bearing: clipfilename() above always returns the
++    // exact name playclip needs, regardless of how well this parses. Filenames are written by
++    // saveclip()/startcliprecorder() above as a fixed-width 19-character "YYYY-MM-DD_HH.MM.SS"
++    // timestamp, an underscore, then "<map>_<mode>", optionally followed by "_rec-manual" or
++    // "_rec-auto" (startcliprecorder()'s label - a plain clip from saveclip() never carries that
++    // suffix, the same distinction cliprecordmatch() above already relies on). The timestamp is
++    // sliced by fixed POSITION, not by delimiter, because clipsanitize() legally allows '_'
++    // inside a sanitised map name; splitting map from mode instead uses the LAST underscore,
++    // because no stock mode name (fpsgame/game.h gamemodes[]) ever contains one once its spaces
++    // are stripped by that same sanitiser (e.g. "insta ctf" -> "instactf") - so the rightmost
++    // segment is always the mode, whatever the map name itself contains.
++    ICOMMAND(clipfileline, "i", (int *i),
++    {
++        int n = cliplistcache.length();
++        if(*i < 0 || *i >= n) { result(""); return; }
++        const char *raw = cliplistcache[n-1-*i];
++        int len = (int)strlen(raw);
++
++        const char *kind = "clip";
++        int striplen = 0;
++        if(len > 11 && !strcmp(raw+len-11, "_rec-manual")) { kind = "recording"; striplen = 11; }
++        else if(len > 9 && !strcmp(raw+len-9, "_rec-auto")) { kind = "auto-rec"; striplen = 9; }
++
++        if(len >= 20 && raw[10] == '_')
++        {
++            string ts;
++            copystring(ts, raw, 20);   // "YYYY-MM-DD_HH.MM.SS" + NUL, fixed 19+1 bytes
++            ts[10] = ' ';               // date/time separator, easier to read than the raw '_'
++
++            int bodylen = len - 20 - striplen;   // "<map>_<mode>", the type suffix already excluded
++            string body;
++            if(bodylen > 0 && bodylen < (int)sizeof(body)) copystring(body, raw+20, bodylen+1);
++            else copystring(body, "?");
++
++            char *sep = strrchr(body, '_');
++            if(sep)
++            {
++                *sep = '\0';
++                defformatstring(line, "%s   %s / %s   [%s]", ts, body, sep+1, kind);
++                result(line);
++            }
++            else
++            {
++                defformatstring(line, "%s   %s   [%s]", ts, body, kind);
++                result(line);
++            }
++        }
++        else
++        {
++            // Doesn't match the shape our own writers produce (e.g. a file dropped into clipdir
++            // by hand) - show the raw name rather than garbage-parse it.
++            defformatstring(line, "%s   [%s]", raw, kind);
++            result(line);
++        }
++    });
++    // === end SwiftGibs instant replay: clip folder listing ===================================
++
 +    // Closes+saves an in-progress recording: drains any still-buffered records first (so a
 +    // finalise is never lossy relative to the last flush), then closes the file and frees the
 +    // sink. `reason` is purely for the console message ("stopped", "map change",
@@ -877,7 +977,7 @@
          sendmessages();
          flushclient();
      }
-@@ -1803,6 +2383,26 @@
+@@ -1803,6 +2483,26 @@
                      if(killstreak > beststreak) beststreak = killstreak;
                      if(killstreak > matchbeststreak) matchbeststreak = killstreak;
                      if(killstreak % 5 == 0 && killstreak <= 20) killstreakmilestone(killstreak/5);
