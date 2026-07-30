@@ -258,6 +258,24 @@
  }
 --- a/fpsgame/client.cpp
 +++ b/fpsgame/client.cpp
+@@ -74,7 +74,7 @@
+             {
+                 if(!alive++)
+                 {
+-                    settexture(isteam(d->team, player1->team) ? "packages/hud/blip_blue_alive.png" : "packages/hud/blip_red_alive.png");
++                    settexture(isteam(d->team, teamviewplayer()->team) ? "packages/hud/blip_blue_alive.png" : "packages/hud/blip_red_alive.png");
+                     gle::defvertex(2); gle::deftexcoord0(); gle::begin(GL_QUADS);
+                 }
+                 drawteammate(d, x, y, s, o, scale);
+@@ -102,7 +102,7 @@
+             {
+                 if(!dead++)
+                 {
+-                    settexture(isteam(d->team, player1->team) ? "packages/hud/blip_blue_dead.png" : "packages/hud/blip_red_dead.png");
++                    settexture(isteam(d->team, teamviewplayer()->team) ? "packages/hud/blip_blue_dead.png" : "packages/hud/blip_red_dead.png");
+                     gle::defvertex(2); gle::deftexcoord0(); gle::begin(GL_QUADS);
+                 }
+                 drawteammate(d, x, y, s, o, scale);
 @@ -1165,6 +1165,14 @@
              nextmode = gamemode = INT_MAX;
              clientmap[0] = '\0';
@@ -1065,7 +1083,15 @@
  extern void genprivkey(const char *seed, vector<char> &privstr, vector<char> &pubstr);
 --- a/fpsgame/game.h
 +++ b/fpsgame/game.h
-@@ -829,6 +829,18 @@
+@@ -729,6 +729,7 @@
+     extern void teamsound(bool sameteam, int n, const vec *loc = NULL);
+     extern void teamsound(fpsent *d, int n, const vec *loc = NULL);
+     extern fpsent *pointatplayer();
++    extern fpsent *teamviewplayer();   // SwiftGibs: POV player for team-relative visuals
+     extern fpsent *hudplayer();
+     extern fpsent *followingplayer(fpsent *fallback = NULL);
+     extern void stopfollowing();
+@@ -829,6 +830,18 @@
      extern void getbestteams(vector<const char *> &best);
      extern void clearteaminfo();
      extern void setteaminfo(const char *team, int frags);
@@ -1101,6 +1127,38 @@
      static inline bool playersort(const fpsent *a, const fpsent *b)
      {
          if(a->state==CS_SPECTATOR)
+@@ -199,7 +207,7 @@
+             if((k%2)==0) g.pushlist(); // horizontal
+ 
+             scoregroup &sg = *groups[k];
+-            int bgcolor = sg.team && m_teammode ? (isteam(player1->team, sg.team) ? 0x3030C0 : 0xC03030) : 0,
++            int bgcolor = sg.team && m_teammode ? (isteam(teamviewplayer()->team, sg.team) ? 0x3030C0 : 0xC03030) : 0,
+                 fgcolor = 0xFFFF80;
+ 
+             g.pushlist(); // vertical
+@@ -229,7 +237,7 @@
+                     g.background(0x808080, numgroups>1 ? 3 : 5);
+                 }
+                 const playermodelinfo &mdl = getplayermodelinfo(o);
+-                const char *icon = sg.team && m_teammode ? (isteam(player1->team, sg.team) ? mdl.blueicon : mdl.redicon) : mdl.ffaicon;
++                const char *icon = sg.team && m_teammode ? (isteam(teamviewplayer()->team, sg.team) ? mdl.blueicon : mdl.redicon) : mdl.ffaicon;
+                 g.text("", 0, icon);
+                 if(o==player1 && highlightscore && (multiplayer(false) || demoplayback || players.length() > 1)) g.poplist();
+             });
+@@ -541,11 +549,11 @@
+         if(m_teammode)
+         {
+             score = g->score;
+-            best = isteam(player1->team, g->team);
++            best = isteam(teamviewplayer()->team, g->team);
+             if(numgroups > 1)
+             {
+                 if(best) score2 = groups[1]->score;
+-                else for(int i = 1; i < groups.length(); ++i) if(isteam(player1->team, groups[i]->team)) { score2 = groups[i]->score; break; }
++                else for(int i = 1; i < groups.length(); ++i) if(isteam(teamviewplayer()->team, groups[i]->team)) { score2 = groups[i]->score; break; }
+                 if(score2 == INT_MIN)
+                 {
+                     fpsent *p = followingplayer(player1);
 --- a/shared/igame.h
 +++ b/shared/igame.h
 @@ -101,7 +101,8 @@
@@ -1115,7 +1173,29 @@
  {
 --- a/fpsgame/fps.cpp
 +++ b/fpsgame/fps.cpp
-@@ -672,6 +672,13 @@
+@@ -133,6 +133,21 @@
+         return followingplayer(player1);
+     }
+ 
++    // SwiftGibs: the player that team-relative VISUALS (flat model colours, kill-feed name
++    // colours, radar blips, team-score HUD) are judged from. Live play: yourself. Spectating
++    // with follow: the player you are watching. Clip/demo playback with a free camera: the
++    // recording player - players[1] is reliably the recorder (players[0] is always the local
++    // player1; the first remote client created during playback is the recorder, see the POV
++    // note in the clip-export code in fpsgame/client.cpp). Never used for game logic, only
++    // presentation.
++    fpsent *teamviewplayer()
++    {
++        fpsent *f = followingplayer();
++        if(f) return f;
++        if(demoplayback && players.length() > 1 && players[1]) return players[1];
++        return player1;
++    }
++
+     void setupcamera()
+     {
+         fpsent *target = followingplayer();
+@@ -672,6 +687,13 @@
              {
                  case ID_VAR:   f->printf("%s %d\n", names[i], *id->storage.i); break;
                  case ID_FVAR:  f->printf("%s %s\n", names[i], floatstr(*id->storage.f)); break;
@@ -1129,7 +1209,7 @@
                  case ID_ALIAS: f->printf("%s = [%s]\n", names[i], id->getstr()); break;
              }
          }
-@@ -749,6 +756,16 @@
+@@ -749,6 +771,16 @@
          else
          {
              intermission = true;
@@ -1146,7 +1226,7 @@
              player1->attacking = false;
              if(cmode) cmode->gameover();
              conoutf(CON_GAMEINFO, "\f2intermission:");
-@@ -840,6 +857,24 @@
+@@ -840,6 +872,24 @@
  
      void startgame()
      {
@@ -1171,7 +1251,47 @@
          clearmovables();
          clearmonsters();
  
-@@ -1874,6 +1909,27 @@
+@@ -995,10 +1045,10 @@
+ 
+     const char *colorname(fpsent *d, const char *name, const char *prefix, const char *suffix, const char *alt)
+     {
+-        if(!name) name = alt && d == player1 ? alt : d->name;
++        if(!name) name = alt && d == teamviewplayer() ? alt : d->name;
+         // SwiftGibs: fold friend/self highlight into prefix/suffix
+         static string hpre, hsuf;
+-        if(highlightself && d == player1)
++        if(highlightself && d == teamviewplayer())
+         {
+             formatstring(hpre, "\fs\f%s%s", selfcolor, prefix);
+             formatstring(hsuf, "%s\fr", suffix);
+@@ -1026,7 +1076,7 @@
+     const char *teamcolorname(fpsent *d, const char *alt)
+     {
+         if(!teamcolortext || !m_teammode || d->state==CS_SPECTATOR) return colorname(d, NULL, "", "", alt);
+-        return colorname(d, NULL, isteam(d->team, player1->team) ? "\fs\f1" : "\fs\f3", "\fr", alt);
++        return colorname(d, NULL, isteam(d->team, teamviewplayer()->team) ? "\fs\f1" : "\fs\f3", "\fr", alt);
+     }
+ 
+     const char *teamcolor(const char *name, bool sameteam, const char *alt)
+@@ -1039,7 +1089,7 @@
+ 
+     const char *teamcolor(const char *name, const char *team, const char *alt)
+     {
+-        return teamcolor(name, team && isteam(team, player1->team), alt);
++        return teamcolor(name, team && isteam(team, teamviewplayer()->team), alt);
+     }
+ 
+     VARP(teamsounds, 0, 1, 1);
+@@ -1051,7 +1101,7 @@
+ 
+     void teamsound(fpsent *d, int n, const vec *loc)
+     {
+-        teamsound(isteam(d->team, player1->team), n, loc);
++        teamsound(isteam(d->team, teamviewplayer()->team), n, loc);
+     }
+ 
+     void suicide(physent *d)
+@@ -1874,6 +1924,27 @@
          pophudmatrix();
      }
  
@@ -1199,7 +1319,7 @@
      void gameplayhud(int w, int h)
      {
          pushhudmatrix();
-@@ -1909,6 +1965,7 @@
+@@ -1909,6 +1980,7 @@
          drawexpandedmap(w, h);
          drawkillstreak(w, h);
          drawflagpopup(w, h);
@@ -1217,3 +1337,32 @@
              addmsg(N_SHOOT, "rci2i6iv", d, lastmillis-maptime, d->gunselect,
                     (int)(from.x*DMF), (int)(from.y*DMF), (int)(from.z*DMF),
                     (int)(to.x*DMF), (int)(to.y*DMF), (int)(to.z*DMF),
+--- a/fpsgame/render.cpp
++++ b/fpsgame/render.cpp
+@@ -336,7 +336,7 @@
+             fpsent *d = players[i];
+             if(d == player1 || d->state==CS_SPECTATOR || d->state==CS_SPAWNING || d->lifesequence < 0 || d == exclude || (d->state==CS_DEAD && hidedead)) continue;
+             int team = 0;
+-            if(teamskins || m_teammode) team = isteam(player1->team, d->team) ? 1 : 2;
++            if(teamskins || m_teammode) team = isteam(teamviewplayer()->team, d->team) ? 1 : 2;
+             renderplayer(d, getplayermodelinfo(d), team, 1, mainpass);
+ 
+             vec dir = vec(d->o).sub(camera1->o);
+@@ -359,7 +359,7 @@
+         {
+             fpsent *d = ragdolls[i];
+             int team = 0;
+-            if(teamskins || m_teammode) team = isteam(player1->team, d->team) ? 1 : 2;
++            if(teamskins || m_teammode) team = isteam(teamviewplayer()->team, d->team) ? 1 : 2;
+             float fade = 1.0f;
+             if(ragdollmillis && ragdollfade) 
+                 fade -= clamp(float(lastmillis - (d->lastupdate + max(ragdollmillis - ragdollfade, 0)))/min(ragdollmillis, ragdollfade), 0.0f, 1.0f);
+@@ -449,7 +449,7 @@
+         const playermodelinfo &mdl = getplayermodelinfo(d);
+         defformatstring(gunname, "%s/%s", hudgunsdir[0] ? hudgunsdir : mdl.hudguns, guns[d->gunselect].file);
+         if((m_teammode || teamskins) && teamhudguns)
+-            concatstring(gunname, d==player1 || isteam(d->team, player1->team) ? "/blue" : "/red");
++            concatstring(gunname, d==teamviewplayer() || isteam(d->team, teamviewplayer()->team) ? "/blue" : "/red");
+         else if(testteam > 1)
+             concatstring(gunname, testteam==2 ? "/blue" : "/red");
+         modelattach a[2];
