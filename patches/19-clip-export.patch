@@ -1419,7 +1419,7 @@
  #endif
 --- a/shared/iengine.h
 +++ b/shared/iengine.h
-@@ -53,6 +53,40 @@
+@@ -53,6 +53,48 @@
  extern int thirdperson;
  extern bool isthirdperson();
  
@@ -1433,6 +1433,14 @@
 +extern int soundvol;
 +extern int fullconsole;   // engine/console.cpp - review fix: renderconsole()'s hidehud gate is "!hidehud || fullconsole", so fullconsole must be forced off too during export or console text bypasses the HUD suppression
 +extern void clearguis(int level);   // engine/menus.cpp (defined with a default there; NOT repeated here - engine/menus.cpp's own translation unit sees BOTH declarations via engine.h's #include of this file, and a default argument may only be specified once per scope, so callers outside engine/menus.cpp must pass level explicitly, e.g. clearguis(-1) for "clear everything") - review fix: gl_drawhud() calls g3d_render() (in-world menus) unconditionally, with no hidehud gate at all, so export must actively close any open menu rather than relying on hidehud
++// SwiftGibs clip export (Task 5): the live SDL window handle, so progress feedback can be
++// shown in the OS window title bar during capture - the one feedback channel that does NOT
++// land in the captured framebuffer (unlike gui/hud/console text, all suppressed above for a
++// clean capture). Declared here (engine/main.cpp, pre-existing) rather than pulling in the
++// much larger engine/engine.h just for this one pointer, same reasoning as the rest of this
++// block. shared/cube.h already #includes SDL.h before this header, so SDL_Window is a
++// complete type by the time fpsgame/client.cpp parses this declaration.
++extern SDL_Window *screen;
 +
 +// SwiftGibs clip export (Task 3): the subset of engine/engine.h's
 +// `namespace recorder` declarations that game-side export orchestration
@@ -1516,7 +1524,7 @@
      }
  
      VARP(teamcolorchat, 0, 1, 1);
-@@ -1980,6 +1991,511 @@
+@@ -1980,6 +1991,585 @@
      }
      // === end SwiftGibs instant replay: recording modes =======================================
  
@@ -1568,6 +1576,25 @@
 +    VARP(clipexportstalltimeout, 2, 8, 60);    // seconds of no encoder progress before the watchdog presumes ffmpeg wedged and force-kills it
 +    VARP(clipexportfinishtimeout, 2, 15, 120); // seconds given to ffmpeg to drain+exit after end-of-clip before the watchdog force-kills it instead
 +
++    // Task 5 (menus/settings/profiles) - the player-facing export PREFERENCES, each a real
++    // VARP (not a plain cubescript alias) so the hard caps this design calls for are enforced
++    // by the engine itself, not just by what the menu widget happens to clamp - a console
++    // assignment past the range still gets silently clamped, same as any other VARP in this
++    // codebase. All six are added to sgProfileVars (overlay/autoexec.cfg) alongside videodir
++    // above, matching the design doc's Configuration list one-for-one (format, resolution
++    // preset incl. match-window, fps with a hard cap, sound on/off, quality target, output
++    // folder). Read directly by checkclipexport()/clipexportapplysettings() below rather than
++    // threaded through exportclip()'s own argument list - they are ambient preferences the
++    // player sets once on the export settings page (overlay/menus_settings.cfg's "swiftexport"
++    // gui), not per-call parameters, so exportclip()'s existing 5-argument signature
++    // (name/width/height/fps/format - already stable, already used by the menu for the values
++    // that DO vary per click) is left untouched.
++    VARP(clipexportresmode, 0, 1, 3);     // 0=480p 1=720p (default - April's requested default preset) 2=1080p 3=match my resolution (read live via clipexportscreenw/h() below, not snapshotted at menu time, so it tracks a resized window)
++    VARP(clipexportfpspref, 15, 60, 120); // the player's chosen export fps; HARD CAPPED at 120 by the VARP's own range - no script or console input can push it higher
++    VARP(clipexportformatpref, 0, 0, 1);  // 0=mp4 (H.264, default - plays everywhere) 1=webm (VP9)
++    VARP(clipexportquality, 0, 1, 2);     // 0=smaller file 1=normal (default - the exact crf values Task 3 originally hardcoded, unchanged) 2=best quality/largest file; selects the -crf argument in checkclipexport() below, per format
++    VARP(clipexportsound, 0, 0, 1);       // 0=mute the EXPORTING PLAYER'S OWN live game audio during capture (default - matches the courtesy-mute behaviour Tasks 1-4 already tested) 1=leave the player's own soundvol alone. Deliberately NOT "does the exported file have sound" - it never does yet (checkclipexport()'s ffmpeg invocation is unconditionally "-an"; the piped stream carries video frames only, see engine/movie.cpp's pipewriter and ce-task-3-report.md) - this toggle is a live-monitoring courtesy only, and the settings page labels it that way so it can never be read as promising audio in the output.
++
 +    // Where the bundled ffmpeg lives when clipexportffmpeg (above) is left at its default empty
 +    // string: a fixed path relative to the CURRENT DIRECTORY the game process was launched
 +    // from - never searched via PATH. All three shipped launchers guarantee that directory is
@@ -1613,6 +1640,14 @@
 +    // (moviewriter::blockwhenfull()) - see the task report for the reasoning.
 +    static bool clipexportsettingsapplied = false;
 +    static int clipexportsavedhidehud = 0, clipexportsavedthirdperson = 0, clipexportsavedsoundvol = 255, clipexportsavedfullconsole = 0;
++    // Task 5: the window TITLE is the one progress channel that survives clean capture intact -
++    // g3d_render()'s gui rendering and renderconsole() both land IN the captured framebuffer
++    // (see the review-fix comments on clearguis()/fullconsole below), but SDL_SetWindowTitle()
++    // only ever touches OS window-manager chrome, which is compositor-drawn outside the app's
++    // own pixel buffer and is never part of what glReadPixels()/the FBO blit captures. Snapshot
++    // + restore follows the exact same idiom as hidehud/thirdperson/soundvol/fullconsole above.
++    static string clipexportsavedtitle = "";
++    static int clipexportlasttitleupdate = 0;
 +
 +    static void clipexportapplysettings()
 +    {
@@ -1621,11 +1656,15 @@
 +        clipexportsavedthirdperson = thirdperson;
 +        clipexportsavedsoundvol = soundvol;
 +        clipexportsavedfullconsole = fullconsole;
++        if(screen) copystring(clipexportsavedtitle, SDL_GetWindowTitle(screen));
++        else clipexportsavedtitle[0] = '\0';
 +        hidehud = 1;       // clean capture: no HUD/crosshair/console (the SwiftGibs overlays piggyback on this same var - see fpsgame/fps.cpp's gameplayhud() comment)
 +        thirdperson = 0;   // first-person: hudplayer()/isthirdperson() (engine/rendergl.cpp) only bypass the followed target's POV when thirdperson is nonzero AND allowthirdperson() - forcing 0 guarantees the locked POV actually renders in first person
-+        soundvol = 0;      // courtesy mute: export is real-time foreground playback (the design doc is explicit this takes at least as long as the clip), and the piped output never carries audio yet (task 2's documented limitation) regardless of this setting
++        if(!clipexportsound) soundvol = 0; // Task 5's "sound on/off" setting (clipexportsound VARP, above): a courtesy mute for the exporting player's OWN live playback ONLY - export is real-time foreground playback (the design doc is explicit this takes at least as long as the clip). The piped output never carries audio yet regardless of this setting (task 2's documented limitation) - see checkclipexport()'s unconditional "-an" below - so this can never be mistaken for an "include audio in the video" toggle.
 +        fullconsole = 0;   // review fix: renderconsole()'s gate (engine/rendergl.cpp) is "!hidehud || fullconsole" - fullconsole BYPASSES hidehud entirely, so a player with it toggled on would otherwise get console text burned into the video
 +        clearguis(-1);     // -1 = clear the whole gui stack (clearguis()'s own default, repeated explicitly here - see the extern declaration in shared/iengine.h for why). review fix: gl_drawhud()'s g3d_render() call (engine/rendergl.cpp) has no hidehud gate at all (unlike gameplayhud/drawcrosshair/renderconsole) - closing whatever menu launched the export (Task 5's clips-page row) is the only thing that actually keeps it out of the opening frames
++        if(screen) SDL_SetWindowTitle(screen, "SwiftGibs - preparing clip export...");
++        clipexportlasttitleupdate = 0;
 +        clipexportsettingsapplied = true;
 +    }
 +
@@ -1636,6 +1675,7 @@
 +        thirdperson = clipexportsavedthirdperson;
 +        soundvol = clipexportsavedsoundvol;
 +        fullconsole = clipexportsavedfullconsole;
++        if(screen) SDL_SetWindowTitle(screen, clipexportsavedtitle);
 +        clipexportsettingsapplied = false;
 +        stopfollowing(); // release the POV lock regardless of player1's current state - stopfollowing() only requires following>=0, not CS_SPECTATOR (unlike engaging follow()), so this is always safe to call
 +    }
@@ -1861,6 +1901,15 @@
 +            formatstring(sizearg, "%dx%d", clipexportwidth, clipexportheight);
 +            formatstring(fpsarg, "%d", clipexportfps);
 +            bool webm = !strcmp(clipexportext, "webm");
++            // clipexportquality (Task 5 VARP, above) selects the -crf value per format. Index
++            // 1 (normal) is exactly the crf Task 3 originally hardcoded for each codec - 0/2
++            // are a documented +/-6 crf step either side, the standard x264/vpx rule-of-thumb
++            // for "roughly half/double the bitrate at the same resolution" (also used as the
++            // basis for the size-estimate ratios on the export settings page - see
++            // overlay/menus_settings.cfg's "swiftexport" gui and ce-task-5-report.md).
++            static const char *const mp4crf[3]  = { "26", "20", "16" };
++            static const char *const webmcrf[3] = { "38", "32", "26" };
++            int qidx = clamp(clipexportquality, 0, 2); // defensive; the VARP's own range already guarantees this
 +            const char *resolvedout = findfile(clipexportoutpath, "w");
 +            const char *argv[32];
 +            int argc = 0;
@@ -1880,7 +1929,7 @@
 +                argv[argc++] = "-c:v"; argv[argc++] = "libvpx-vp9";
 +                argv[argc++] = "-pix_fmt"; argv[argc++] = "yuv420p";
 +                argv[argc++] = "-b:v"; argv[argc++] = "0";
-+                argv[argc++] = "-crf"; argv[argc++] = "32";
++                argv[argc++] = "-crf"; argv[argc++] = webmcrf[qidx];
 +                argv[argc++] = "-deadline"; argv[argc++] = "good";
 +            }
 +            else
@@ -1888,7 +1937,7 @@
 +                argv[argc++] = "-c:v"; argv[argc++] = "libx264";
 +                argv[argc++] = "-pix_fmt"; argv[argc++] = "yuv420p";
 +                argv[argc++] = "-preset"; argv[argc++] = "veryfast";
-+                argv[argc++] = "-crf"; argv[argc++] = "20";
++                argv[argc++] = "-crf"; argv[argc++] = mp4crf[qidx];
 +                argv[argc++] = "-movflags"; argv[argc++] = "+faststart";
 +            }
 +            argv[argc++] = resolvedout;
@@ -1933,6 +1982,30 @@
 +        // until the next startpipe() - no reset-and-miss window. Calling clipexportabort()
 +        // here when that happens is still safe even though stop() may already have run: its
 +        // own recorder::stop() call is a documented no-op once file is already NULL.
++        // Task 5: progress feedback. No gui/hud survives clean capture (clipexportapplysettings()
++        // above already closed every menu and hid the hud), so the window title bar is the one
++        // channel a player can actually see live (see the comment on clipexportsavedtitle,
++        // above) - throttled to once a second so it's not churning the OS window manager every
++        // frame. A slower console line (every 10s) leaves a permanent, scrollable record even
++        // after the title bar reverts on completion - useful for "why did that take so long"
++        // after the fact, not just in the moment.
++        if(totalmillis - clipexportlasttitleupdate >= 1000)
++        {
++            clipexportlasttitleupdate = totalmillis;
++            int frames = (int)recorder::exportframessofar();
++            int dropped = (int)(recorder::duplicatedframes() + recorder::skippedpadframes());
++            int secs = clipexportfps > 0 ? frames/clipexportfps : 0;
++            if(screen)
++            {
++                defformatstring(titlebuf, "SwiftGibs - exporting clip... %ds captured (%d frames%s) - not hung, this plays in real time, press ESC to cancel", secs, frames, dropped ? ", some duplicated" : "");
++                SDL_SetWindowTitle(screen, titlebuf);
++            }
++            if(secs > 0 && secs%10 == 0)
++            {
++                static int lastlogsecs = -1;
++                if(secs != lastlogsecs) { lastlogsecs = secs; conoutf("clip export progress: %ds captured (%d frames, %d duplicated/skipped to hold timing)", secs, frames, dropped); }
++            }
++        }
 +        if(!recorder::isrecording()) { clipexportabort("ffmpeg failed or capture stopped unexpectedly"); return; }
 +        // NOTE: the clip's natural end is handled by clipexportonplaybackend() (case
 +        // N_DEMOPLAYBACK, above), not polled here - demoplayback dropping to false with no
@@ -2023,12 +2096,21 @@
 +    ICOMMAND(clipexportcapturing, "", (), intret(clipexportphase == CLIPEXPORT_CAPTURING ? 1 : 0));
 +    ICOMMAND(clipexportprogress, "", (), intret((int)recorder::exportframessofar()));
 +    ICOMMAND(clipexportdropped, "", (), intret((int)(recorder::duplicatedframes() + recorder::skippedpadframes())));
++
++    // Task 5: read-only accessors for the "match my resolution" preset (overlay/
++    // menus_settings.cfg's "swiftexport" gui, clipexportresmode==3) - screenw/screenh
++    // (shared/iengine.h) are the engine's actual live backbuffer resolution, not exposed to
++    // cubescript anywhere else in this codebase. Deliberately read LIVE at menu-render time
++    // (not snapshotted into a var once), so the shown "-> WxH" preview tracks a resized window
++    // right up until the moment "start export" is actually clicked.
++    ICOMMAND(clipexportscreenw, "", (), intret(screenw));
++    ICOMMAND(clipexportscreenh, "", (), intret(screenh));
 +    // === end SwiftGibs clip video export ======================================================
 +
      void c2sinfo(bool force) // send update to the server
      {
          static int lastupdate = -1000;
-@@ -2768,6 +3284,13 @@
+@@ -2768,6 +3358,13 @@
                  player1->clientnum = getint(p);
                  gamepaused = false;
                  execident(on ? "demostart" : "demoend");
