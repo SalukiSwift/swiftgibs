@@ -1803,7 +1803,7 @@
      }
  
      VARP(teamcolorchat, 0, 1, 1);
-@@ -1980,6 +1991,795 @@
+@@ -1980,6 +1991,840 @@
      }
      // === end SwiftGibs instant replay: recording modes =======================================
  
@@ -2264,14 +2264,54 @@
 +        if(clipexportphase == CLIPEXPORT_CAPTURING) clipexportabort("map changed during export");
 +    }
 +
++    // Ensure `dir` (a virtual/relative directory path in the same "/"-joined convention as
++    // videodir/clipdir/screenshotdir - never a raw OS path) genuinely exists on disk, creating
++    // it if necessary, and reporting the real resolved path on failure.
++    //
++    // WINDOWS BUG THIS WORKS AROUND (root-caused via a standalone harness that forces
++    // PATHDIV='\\' through the actual findfile()/path() logic, plus April's real installed
++    // bundle: see ce-winfix-report.md for the full trace and proof): every directory var in
++    // this codebase is joined onto a filename with a literal '/', by hand, never passed
++    // through path() first. findfile()'s OWN intermediate-directory-creation loop
++    // (shared/stream.cpp) only ever recognises PATHDIV ('\\' on Windows, '/' everywhere else)
++    // as a component separator. On Linux/macOS PATHDIV IS '/', so a literal-'/'-joined path
++    // already matches what that loop looks for, and it silently does the right thing - this is
++    // exactly why this feature "worked in the Linux harness". On Windows PATHDIV is '\\', so
++    // findfile() never even attempts to create the FINAL '/'-joined directory component (it
++    // only ever walks components already separated by a literal '\\' - i.e. homedir's own,
++    // pre-existing, directories) - videodir's own top-level folder was simply never created,
++    // so the first write into it (the sound temp file, or the video pipe target) failed
++    // outright. saveclip() already avoids this by calling path(relpath, true) on its FULL path
++    // before ever reaching findfile() - which is exactly why a real installed bundle can have a
++    // working clips/ folder (auto-created) but no videos/ folder at all the first time export
++    // is used. This function applies the same path() normalisation, but to the directory alone,
++    // up front, so every candidate filename clipexportuniquepath() builds below is guaranteed
++    // to land in a directory that actually exists - independent of, and without touching, the
++    // filename-building/dot-prefix logic further down in exportclip().
++    static bool clipexportensuredir(const char *dir)
++    {
++        if(!dir[0]) return true; // empty videodir means "current directory" - always exists
++        defformatstring(dirslash, "%s/", dir);
++        path(dirslash); // normalise "/" -> PATHDIV so findfile()'s own splitting loop actually reaches this component
++        const char *resolved = findfile(dirslash, "w");
++        string resolveddir;
++        copystring(resolveddir, resolved);
++        size_t rlen = strlen(resolveddir);
++        if(rlen && (resolveddir[rlen-1]=='/' || resolveddir[rlen-1]=='\\')) resolveddir[rlen-1] = '\0';
++        if(!fileexists(resolveddir, "d") && !createdir(resolveddir))
++        {
++            conoutf(CON_ERROR, "exportclip: could not create output folder %s", resolveddir);
++            return false;
++        }
++        return true;
++    }
++
 +    // Derives videos/<clip-basename>.<ext>, sanitised the same way clip filenames themselves
 +    // are (clipsanitize(), above). Collision policy: never silently overwrite a previous export
 +    // of the same clip - try the plain name first, then -2, -3, ... up to 999, and use the
-+    // first one that doesn't already exist. (The alternative of refusing outright was rejected -
-+    // re-exporting the same clip with different settings is a completely normal thing to want
-+    // to do - and silently overwriting was ruled out by the brief.) findfile(...,"w") also
-+    // creates videodir on demand, the same mechanism screenshot()/saveclip() already rely on for
-+    // clipdir/screenshotdir.
++    // first one that doesn't already exist. Requires the caller to have already ensured
++    // videodir exists (clipexportensuredir(), above) - findfile(...,"w")'s own on-demand
++    // directory creation is not relied on here (see that function's comment for why).
 +    static bool clipexportuniquepath(const char *base, const char *ext, char *dst, int dstsize)
 +    {
 +        loopi(1000)
@@ -2519,6 +2559,11 @@
 +        // merely dot-stripped basename, not an empty one - clipsanitize()'s "clip" fallback below
 +        // only matters for a name that is nothing BUT stripped characters.
 +        clipsanitize(clipbase, sizeof(clipbase), clipbase, "clip");
++        // Ensure videodir actually exists on disk BEFORE trying any candidate filename in it -
++        // see clipexportensuredir()'s own doc comment above for the Windows bug this avoids.
++        // Failure here reports the real resolved path and returns; a distinct failure below
++        // (1000 collisions, effectively unreachable in practice) keeps its own message.
++        if(!clipexportensuredir(videodir)) return;
 +        if(!clipexportuniquepath(clipbase, clipexportext, clipexportoutpath, sizeof(clipexportoutpath)))
 +        {
 +            conoutf(CON_ERROR, "exportclip: could not find a free output filename in %s", videodir);
@@ -2599,7 +2644,7 @@
      void c2sinfo(bool force) // send update to the server
      {
          static int lastupdate = -1000;
-@@ -2768,6 +3568,13 @@
+@@ -2768,6 +3613,13 @@
                  player1->clientnum = getint(p);
                  gamepaused = false;
                  execident(on ? "demostart" : "demoend");
