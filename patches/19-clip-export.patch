@@ -1803,7 +1803,7 @@
      }
  
      VARP(teamcolorchat, 0, 1, 1);
-@@ -1980,6 +1991,840 @@
+@@ -2000,6 +2011,841 @@
      }
      // === end SwiftGibs instant replay: recording modes =======================================
  
@@ -1885,6 +1885,7 @@
 +    // checkclipexport()/clipexportonplaybackend() below (the two-ffmpeg-pass mux) for how the audio actually gets
 +    // into the output file, and ce-task-5b-report.md for the sync verification.
 +    VARP(clipexportsound, 0, 1, 1);
++    VARP(clipexporthud, 0, 1, 1);   // 1 = draw the normal in-game HUD (crosshair, kill feed, hud gun overlays) in the exported video; 0 = clean capture (April's playtest: default on - a clip without the crosshair "doesn't look like the game")
 +    VARP(clipexportmuxtimeout, 5, 30, 300); // seconds given to the audio+video mux pass (clipexportonplaybackend()'s pass 2, below) before the watchdog force-kills it - generous because it's still bounded, but the pass itself is fast (-c:v copy, no video re-encode; only a small WAV gets encoded)
 +
 +    // Where the bundled ffmpeg lives when clipexportffmpeg (above) is left at its default empty
@@ -1966,7 +1967,7 @@
 +        clipexportsavedfullconsole = fullconsole;
 +        if(screen) copystring(clipexportsavedtitle, SDL_GetWindowTitle(screen));
 +        else clipexportsavedtitle[0] = '\0';
-+        hidehud = 1;       // clean capture: no HUD/crosshair/console (the SwiftGibs overlays piggyback on this same var - see fpsgame/fps.cpp's gameplayhud() comment)
++        hidehud = clipexporthud ? 0 : 1;   // export look is deterministic either way: forced full HUD or forced clean, never "whatever hidehud happened to be"
 +        thirdperson = 0;   // first-person: hudplayer()/isthirdperson() (engine/rendergl.cpp) only bypass the followed target's POV when thirdperson is nonzero AND allowthirdperson() - forcing 0 guarantees the locked POV actually renders in first person
 +        // soundvol is deliberately left untouched now (see clipexportsound's own comment above) -
 +        // audio in the export comes from the same live Mix_SetPostMix stream the player hears, so
@@ -2644,7 +2645,7 @@
      void c2sinfo(bool force) // send update to the server
      {
          static int lastupdate = -1000;
-@@ -2768,6 +3613,13 @@
+@@ -2788,6 +3634,13 @@
                  player1->clientnum = getint(p);
                  gamepaused = false;
                  execident(on ? "demostart" : "demoend");
