@@ -1,0 +1,445 @@
+--- a/Makefile
++++ b/Makefile
+@@ -105,6 +105,7 @@
+ 	engine/octaedit.o \
+ 	engine/octarender.o \
+ 	engine/physics.o \
++	engine/processpipe.o \
+ 	engine/pvs.o \
+ 	engine/rendergl.o \
+ 	engine/rendermodel.o \
+--- a/engine/processpipe.h
++++ b/engine/processpipe.h
+@@ -0,0 +1,74 @@
++// engine/processpipe.h: controlled child-process launch with a writable
++// pipe to the child's stdin.
++//
++// This is the one and only way SwiftGibs is allowed to run an external
++// program (the bundled ffmpeg, for clip video export - see
++// docs/superpowers/specs/2026-07-30-clip-video-export-design.md). It exists
++// so ffmpeg can be run as a wholly separate process rather than linked into
++// the engine: SwiftGibs is zlib licensed and ffmpeg's H.264 encoder is
++// typically GPL, so linking would force the engine binary itself to GPL.
++// Running it as a child process fed by a pipe is mere aggregation and keeps
++// the two licences apart. Do NOT add an alternate path that shells out or
++// links an encoder library - this file is the load-bearing boundary.
++//
++// The caller always assembles a fixed, NULL-terminated argument vector
++// itself. Nothing in here goes through a shell (no popen, no system()), so
++// there is no command string to mis-tokenise or inject into - argv[0] is
++// the exact program to run and argv[1..] are passed to it verbatim.
++
++#ifndef __PROCESSPIPE_H__
++#define __PROCESSPIPE_H__
++
++struct processpipe
++{
++#ifdef WIN32
++    void *process;   // HANDLE (kept as void* so this header doesn't need windows.h)
++    void *writepipe; // HANDLE
++#else
++    int pid;
++    int writefd;
++#endif
++    bool isopen;
++
++    processpipe() :
++#ifdef WIN32
++        process(NULL), writepipe(NULL),
++#else
++        pid(-1), writefd(-1),
++#endif
++        isopen(false)
++    {}
++};
++
++// Spawns argv[0] with arguments argv[1..], connecting its standard input to
++// a pipe this process can write to. argv must be NULL-terminated; argv[0]
++// is an exact path, never searched via a shell or PATH-parsed command
++// string. Returns false (and leaks nothing - all handles/descriptors this
++// call created are cleaned up) if the pipe couldn't be created or the
++// child couldn't be launched at all.
++extern bool openprocesspipe(processpipe &p, const char *const *argv);
++
++// Writes len bytes to the child's stdin, retrying on partial writes.
++// Returns false if the child has gone away (its end of the pipe is
++// closed/broken) or any other write error occurs; this is a normal,
++// checked failure the caller should treat as an export error - it can
++// never crash the game (SIGPIPE, where it exists, is ignored).
++extern bool writeprocesspipe(processpipe &p, const void *data, size_t len);
++
++// Closes the write end of the pipe (so the child sees EOF on stdin), waits
++// for the child to exit, and returns its exit status (0 = success). Always
++// reaps the child and releases every handle/descriptor this facility holds,
++// even if the child already died or the pipe was already broken. Returns
++// -1 if the exit status could not be determined (e.g. the child was killed
++// by a signal). Safe to call on a pipe that was never successfully opened,
++// or more than once - the second call is a no-op returning -1.
++extern int closeprocesspipe(processpipe &p);
++
++// Cancellation path: closes the pipe and forcibly terminates the child
++// (SIGKILL / TerminateProcess) instead of waiting for it to exit on its
++// own, then reaps it so no zombie/orphan is left behind. Use this instead
++// of closeprocesspipe() when aborting an export; safe to call on a pipe
++// that isn't open.
++extern void killprocesspipe(processpipe &p);
++
++#endif
+--- a/engine/processpipe.cpp
++++ b/engine/processpipe.cpp
+@@ -0,0 +1,355 @@
++// engine/processpipe.cpp: controlled child-process launch with a writable
++// pipe to its stdin. See processpipe.h for why this exists (the licensing
++// boundary between zlib-licensed SwiftGibs and GPL ffmpeg builds) and what
++// it guarantees.
++//
++// Confirmed mechanism, cross-platform:
++//
++// Windows: CreatePipe() makes both ends inheritable, then the write end
++// (which the parent keeps) is explicitly un-inherited with
++// SetHandleInformation, so only the read end crosses into the child.
++// stdout/stderr are pointed at an inheritable NUL handle - once
++// STARTF_USESTDHANDLES is set, all three standard handle fields are
++// significant, not just the one being overridden, so ffmpeg needs
++// somewhere valid to write. CreateProcess() is given lpApplicationName
++// (the exact bundled binary path - no PATH search, no extension guessing)
++// and a separately-built, correctly quoted lpCommandLine; this is NOT
++// popen and there is no shell in the loop at any point. (NOT compiled or
++// run on real Windows in this environment; compiled here only via the
++// mingw-w64 cross toolchain - see the task report for what that did and
++// didn't prove.)
++//
++// macOS/Linux: pipe() + posix_spawn() with a posix_spawn_file_actions_t
++// that dup2()s the read end onto fd 0 in the child and closes both the
++// original read end and the write end there, so the child ends up holding
++// nothing but its own stdin - in particular it never keeps a second open
++// copy of the write end, which is the classic bug that stops a piped
++// child from ever seeing EOF. SIGPIPE is set to SIG_IGN before any write,
++// so a reader that has already exited turns write() into a checked EPIPE
++// failure instead of a signal that kills the whole game.
++
++#include "engine.h"
++#include "processpipe.h"
++
++#ifdef WIN32
++
++namespace
++{
++    // Opens the NUL device with an inheritable handle, for the child's
++    // stdout/stderr - ffmpeg always needs somewhere harmless to write its
++    // (frequently very chatty) status output; a later task may replace this
++    // with a real pipe to capture that output for diagnostics.
++    HANDLE opennuldevice()
++    {
++        SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
++        return CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_READ|FILE_SHARE_WRITE, &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
++    }
++
++    // Appends one argument to a growing Win32 command line, quoting and
++    // escaping it per the rules the MSVC runtime uses to split
++    // lpCommandLine back into argv (the same rules CommandLineToArgvW
++    // implements) - this is what makes it safe to hand CreateProcess a
++    // flat string built from a fixed argv[] without a shell or the caller
++    // having to think about quoting: filenames with spaces or embedded
++    // quotes cannot be reinterpreted as extra arguments or option flags.
++    void appendarg(vector<char> &cmd, const char *arg)
++    {
++        if(!cmd.empty()) cmd.add(' ');
++
++        bool needsquotes = !*arg;
++        for(const char *s = arg; *s && !needsquotes; s++)
++        {
++            if(*s==' ' || *s=='\t' || *s=='\n' || *s=='\v' || *s=='"') needsquotes = true;
++        }
++
++        if(!needsquotes)
++        {
++            for(const char *s = arg; *s; s++) cmd.add(*s);
++            return;
++        }
++
++        cmd.add('"');
++        const char *s = arg;
++        for(;;)
++        {
++            int backslashes = 0;
++            while(*s == '\\') { backslashes++; s++; }
++            if(!*s)
++            {
++                while(backslashes-- > 0) { cmd.add('\\'); cmd.add('\\'); }
++                break;
++            }
++            else if(*s == '"')
++            {
++                while(backslashes-- > 0) { cmd.add('\\'); cmd.add('\\'); }
++                cmd.add('\\'); cmd.add('"');
++                s++;
++            }
++            else
++            {
++                while(backslashes-- > 0) cmd.add('\\');
++                cmd.add(*s);
++                s++;
++            }
++        }
++        cmd.add('"');
++    }
++
++    int reapprocesspipe(processpipe &p)
++    {
++        if(!p.process) return -1;
++        WaitForSingleObject((HANDLE)p.process, INFINITE);
++        DWORD code = (DWORD)-1;
++        if(!GetExitCodeProcess((HANDLE)p.process, &code)) code = (DWORD)-1;
++        CloseHandle((HANDLE)p.process);
++        p.process = NULL;
++        return (int)code;
++    }
++}
++
++bool openprocesspipe(processpipe &p, const char *const *argv)
++{
++    p = processpipe();
++
++    if(!argv || !argv[0])
++    {
++        conoutf(CON_ERROR, "processpipe: empty argument vector");
++        return false;
++    }
++
++    SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
++    HANDLE readend = NULL, writeend = NULL;
++    if(!CreatePipe(&readend, &writeend, &sa, 0))
++    {
++        conoutf(CON_ERROR, "processpipe: CreatePipe failed (%lu)", (unsigned long)GetLastError());
++        return false;
++    }
++    if(!SetHandleInformation(writeend, HANDLE_FLAG_INHERIT, 0))
++    {
++        conoutf(CON_ERROR, "processpipe: could not restrict pipe write handle inheritance (%lu)", (unsigned long)GetLastError());
++        CloseHandle(readend);
++        CloseHandle(writeend);
++        return false;
++    }
++
++    HANDLE nul = opennuldevice();
++    if(nul == INVALID_HANDLE_VALUE)
++    {
++        conoutf(CON_ERROR, "processpipe: could not open NUL device (%lu)", (unsigned long)GetLastError());
++        CloseHandle(readend);
++        CloseHandle(writeend);
++        return false;
++    }
++
++    vector<char> cmdline;
++    for(const char *const *a = argv; *a; a++) appendarg(cmdline, *a);
++    cmdline.add('\0');
++
++    STARTUPINFOA si;
++    memset(&si, 0, sizeof(si));
++    si.cb = sizeof(si);
++    si.dwFlags = STARTF_USESTDHANDLES;
++    si.hStdInput = readend;
++    si.hStdOutput = nul;
++    si.hStdError = nul;
++
++    PROCESS_INFORMATION pi;
++    memset(&pi, 0, sizeof(pi));
++
++    BOOL ok = CreateProcessA(
++        argv[0],           // lpApplicationName: exact path, no shell, no PATH search, no extension guessing
++        cmdline.getbuf(),  // lpCommandLine: mutable buffer, CreateProcess may write into it
++        NULL, NULL,
++        TRUE,               // bInheritHandles - but only readend and nul above were made inheritable
++        CREATE_NO_WINDOW,
++        NULL, NULL,
++        &si, &pi);
++
++    CloseHandle(readend);
++    CloseHandle(nul);
++
++    if(!ok)
++    {
++        conoutf(CON_ERROR, "processpipe: failed to launch %s (%lu)", argv[0], (unsigned long)GetLastError());
++        CloseHandle(writeend);
++        return false;
++    }
++
++    CloseHandle(pi.hThread);
++
++    p.process = pi.hProcess;
++    p.writepipe = writeend;
++    p.isopen = true;
++    return true;
++}
++
++bool writeprocesspipe(processpipe &p, const void *data, size_t len)
++{
++    if(!p.isopen || !p.writepipe) return false;
++    const uchar *buf = (const uchar *)data;
++    while(len > 0)
++    {
++        DWORD chunk = len > (size_t)0x40000000 ? (DWORD)0x40000000 : (DWORD)len;
++        DWORD written = 0;
++        if(!WriteFile((HANDLE)p.writepipe, buf, chunk, &written, NULL) || written == 0)
++        {
++            return false; // broken pipe (child gone) or any other failure - never fatal to us
++        }
++        buf += written;
++        len -= written;
++    }
++    return true;
++}
++
++int closeprocesspipe(processpipe &p)
++{
++    if(!p.isopen) return -1;
++    if(p.writepipe) { CloseHandle((HANDLE)p.writepipe); p.writepipe = NULL; }
++    int exitcode = reapprocesspipe(p);
++    p.isopen = false;
++    return exitcode;
++}
++
++void killprocesspipe(processpipe &p)
++{
++    if(!p.isopen) return;
++    if(p.writepipe) { CloseHandle((HANDLE)p.writepipe); p.writepipe = NULL; }
++    if(p.process) TerminateProcess((HANDLE)p.process, 1);
++    reapprocesspipe(p);
++    p.isopen = false;
++}
++
++#else // !WIN32
++
++#include <unistd.h>
++#include <signal.h>
++#include <spawn.h>
++#include <sys/wait.h>
++#include <errno.h>
++#include <fcntl.h>
++
++#if defined(__APPLE__)
++  #include <crt_externs.h>
++  #define SG_ENVIRON (*_NSGetEnviron())
++#else
++  extern char **environ;
++  #define SG_ENVIRON environ
++#endif
++
++namespace
++{
++    // Ignoring SIGPIPE is process-wide and cheap; do it once, lazily, the
++    // first time anything actually writes to a child's pipe rather than
++    // touching global signal state at startup for a feature most sessions
++    // never use.
++    void ignoresigpipe()
++    {
++        static bool done = false;
++        if(!done) { signal(SIGPIPE, SIG_IGN); done = true; }
++    }
++
++    int reapprocesspipe(processpipe &p)
++    {
++        if(p.pid < 0) return -1;
++        int status = 0, exitcode = -1;
++        pid_t r;
++        do { r = waitpid((pid_t)p.pid, &status, 0); } while(r < 0 && errno == EINTR);
++        if(r == (pid_t)p.pid && WIFEXITED(status)) exitcode = WEXITSTATUS(status);
++        // else: killed/stopped by a signal, or waitpid itself failed - either
++        // way the child is gone (or was never ours), we just can't report a
++        // clean exit code for it. -1 covers both.
++        p.pid = -1;
++        return exitcode;
++    }
++}
++
++bool openprocesspipe(processpipe &p, const char *const *argv)
++{
++    p = processpipe();
++    ignoresigpipe();
++
++    if(!argv || !argv[0])
++    {
++        conoutf(CON_ERROR, "processpipe: empty argument vector");
++        return false;
++    }
++
++    int fds[2];
++    if(pipe(fds) < 0)
++    {
++        conoutf(CON_ERROR, "processpipe: pipe() failed: %s", strerror(errno));
++        return false;
++    }
++    // Belt and braces against another thread forking/exec-ing between here
++    // and posix_spawn() below and inheriting these unintentionally; the
++    // file actions below are what actually guarantee correct behaviour for
++    // *this* child regardless.
++    fcntl(fds[0], F_SETFD, FD_CLOEXEC);
++    fcntl(fds[1], F_SETFD, FD_CLOEXEC);
++
++    posix_spawn_file_actions_t actions;
++    posix_spawn_file_actions_init(&actions);
++    posix_spawn_file_actions_addclose(&actions, fds[1]);        // child never sees the write end at all
++    posix_spawn_file_actions_adddup2(&actions, fds[0], STDIN_FILENO);
++    if(fds[0] != STDIN_FILENO) posix_spawn_file_actions_addclose(&actions, fds[0]);
++
++    pid_t pid = -1;
++    int err = posix_spawn(&pid, argv[0], &actions, NULL, (char *const *)argv, SG_ENVIRON);
++    posix_spawn_file_actions_destroy(&actions);
++
++    close(fds[0]); // parent never reads; drop its copy of the read end either way
++
++    if(err != 0)
++    {
++        // POSIX leaves *pid unspecified on failure and, per the documented
++        // posix_spawn() contract, no child is created when it returns an
++        // error - so there is nothing to reap here, just the pipe to close.
++        close(fds[1]);
++        conoutf(CON_ERROR, "processpipe: failed to launch %s: %s", argv[0], strerror(err));
++        return false;
++    }
++
++    p.pid = (int)pid;
++    p.writefd = fds[1];
++    p.isopen = true;
++    return true;
++}
++
++bool writeprocesspipe(processpipe &p, const void *data, size_t len)
++{
++    if(!p.isopen || p.writefd < 0) return false;
++    const uchar *buf = (const uchar *)data;
++    while(len > 0)
++    {
++        ssize_t n = write(p.writefd, buf, len);
++        if(n < 0)
++        {
++            if(errno == EINTR) continue;
++            return false; // EPIPE (reader gone) or any other error - checked failure, never a crash
++        }
++        if(n == 0) return false; // shouldn't happen writing to a pipe, but don't spin if it does
++        buf += n;
++        len -= (size_t)n;
++    }
++    return true;
++}
++
++int closeprocesspipe(processpipe &p)
++{
++    if(!p.isopen) return -1;
++    if(p.writefd >= 0) { close(p.writefd); p.writefd = -1; }
++    int exitcode = reapprocesspipe(p);
++    p.isopen = false;
++    return exitcode;
++}
++
++void killprocesspipe(processpipe &p)
++{
++    if(!p.isopen) return;
++    if(p.writefd >= 0) { close(p.writefd); p.writefd = -1; }
++    if(p.pid >= 0) kill((pid_t)p.pid, SIGKILL);
++    reapprocesspipe(p);
++    p.isopen = false;
++}
++
++#endif
