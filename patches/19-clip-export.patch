@@ -10,7 +10,7 @@
  	engine/rendermodel.o \
 --- a/engine/processpipe.h
 +++ b/engine/processpipe.h
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,172 @@
 +// engine/processpipe.h: controlled child-process launch with a writable
 +// pipe to the child's stdin.
 +//
@@ -154,10 +154,38 @@
 +// that isn't open.
 +extern void killprocesspipe(processpipe &p);
 +
++// Sends a termination signal to the child ONLY - does not touch p.isopen,
++// p.writefd/p.writepipe, or reap anything. This is the one piece of this
++// facility that IS safe to call concurrently with another thread's
++// in-flight writeprocesspipe() on the same struct (killprocesspipe() and
++// closeprocesspipe() are NOT: they mutate p's fields and reap the child,
++// which races with a thread still reading/using those same fields).
++//
++// Exists for exactly one job: a watchdog thread that has independently
++// decided the child looks wedged (blocked reading nothing, no progress in
++// too long) can call this to force it to die. Once the child is gone, any
++// thread blocked inside writeprocesspipe() on this pipe wakes up with a
++// checked failure (EPIPE) and can unwind on its own - only AFTER that
++// thread has actually returned/been joined is it safe to call
++// closeprocesspipe()/killprocesspipe() (which finish the job: close our
++// own end, reap, clear state) from the struct's owning thread. See the
++// clip-export watchdog in fpsgame/client.cpp for the full sequencing this
++// is designed for.
++//
++// Safe to call on a pid/handle that has already exited or been reaped (a
++// harmless signal-to-nobody, per kill()/TerminateProcess()'s own
++// documented behaviour) PROVIDED the caller isn't holding a STALE pid the
++// OS has since recycled for an unrelated process - satisfied by the
++// watchdog's own design (it reads p.pid/p.process exactly once, before it
++// is even created as a thread, and the owning thread never reaps - which
++// is the only thing that could free the value for reuse - until after the
++// watchdog has been joined).
++extern void requestchildkill(const processpipe &p);
++
 +#endif
 --- a/engine/processpipe.cpp
 +++ b/engine/processpipe.cpp
-@@ -0,0 +1,372 @@
+@@ -0,0 +1,388 @@
 +// engine/processpipe.cpp: controlled child-process launch with a writable
 +// pipe to its stdin. See processpipe.h for why this exists (the licensing
 +// boundary between zlib-licensed SwiftGibs and GPL ffmpeg builds) and what
@@ -387,6 +415,14 @@
 +    p.isopen = false;
 +}
 +
++// See processpipe.h: deliberately touches nothing but p.process (read-only),
++// so it is safe to call from a watchdog thread while another thread may be
++// mid-write on the same struct.
++void requestchildkill(const processpipe &p)
++{
++    if(p.process) TerminateProcess((HANDLE)p.process, 1);
++}
++
 +#else // !WIN32
 +
 +#include <unistd.h>
@@ -529,6 +565,14 @@
 +    p.isopen = false;
 +}
 +
++// See processpipe.h: deliberately touches nothing but p.pid (read-only), so
++// it is safe to call from a watchdog thread while another thread may be
++// mid-write on the same struct.
++void requestchildkill(const processpipe &p)
++{
++    if(p.pid >= 0) kill((pid_t)p.pid, SIGKILL);
++}
++
 +#endif
 --- a/engine/movie.cpp
 +++ b/engine/movie.cpp
@@ -540,7 +584,7 @@
  
  VAR(dbgmovie, 0, 0, 1);
  
-@@ -31,27 +32,278 @@
+@@ -31,27 +32,298 @@
      avisegmentinfo(stream::offset offset, int firstindex) : offset(offset), videoindexoffset(0), soundindexoffset(0), firstindex(firstindex), videoindexsize(0), soundindexsize(0), indexframes(0), videoframes(0), soundframes(0) {}
  };
  
@@ -592,6 +636,26 @@
 +    // never calls it anyway.
 +    virtual bool writesound(uchar *data, uint framesize, uint frame) { return true; }
 +    virtual double filespaceguess() { return 0; }
++    // Cumulative count of output frame slots that were fast-forwarded past
++    // WITHOUT a physical write because a single writevideoframe() call's
++    // padding burst hit its cap (see pipewriter::MAXPADPERCALL below).
++    // aviwriter never hits this (its "duplicate" is a free index entry, no
++    // cap needed) so the default is always 0.
++    virtual uint skippedpadframes() { return 0; }
++
++    // Whether readbuffer()'s producer (main/render thread) should honour
++    // the persisted `moviesync` VARP and CondWait when the 2-slot video
++    // queue is full. True (the aviwriter/vanilla-movie-command default)
++    // preserves existing behaviour exactly. pipewriter overrides this to
++    // false: a piped export must never let the main thread block on the
++    // encoder thread, which can itself be blocked in a slow/stuck
++    // writeprocesspipe() call - moviesync=1 plus a pipe writer would be
++    // exactly the "producer blocks on a thread that's blocked on ffmpeg"
++    // hang the clip-export review flagged. This is deliberately a
++    // per-writer policy rather than temporarily overwriting the player's
++    // own persisted moviesync setting (and having to remember to restore
++    // it on every export exit path) - one fewer setting to get wrong.
++    virtual bool blockwhenfull() { return true; }
 +
      int soundfrequency, soundchannels;
      Uint16 soundformat;
@@ -830,7 +894,7 @@
      aviindexentry &addindex(int frame, int type, int size)
      {
          avisegmentinfo &seg = segments.last();
-@@ -172,14 +424,17 @@
+@@ -172,14 +444,17 @@
          DELETEP(f);
      }
      
@@ -851,7 +915,7 @@
          {
              Mix_QuerySpec(&soundfrequency, &soundformat, &soundchannels);
              const char *desc;
-@@ -196,11 +451,10 @@
+@@ -196,11 +471,10 @@
              if(dbgmovie) conoutf(CON_DEBUG, "soundspec: %dhz %s x %d", soundfrequency, desc, soundchannels);
          }
      }
@@ -864,7 +928,7 @@
      }
      
      bool open()
-@@ -614,13 +868,6 @@
+@@ -614,13 +888,6 @@
      }
     
  
@@ -878,7 +942,7 @@
      void flushsegment()
      {
          endlistchunk(); // LIST movi
-@@ -717,28 +964,98 @@
+@@ -717,30 +984,151 @@
      bool writevideoframe(const uchar *pixels, uint srcw, uint srch, int format, uint frame)
      {
          if(frame < videoframes) return true;
@@ -907,8 +971,8 @@
          return true;
      }
 -    
-+};
-+
+ };
+ 
 +// Feeds raw I420 frames into a bundled ffmpeg's stdin via a caller-owned
 +// processpipe, instead of writing an AVI to disk - the piped clip-export
 +// path from the design doc (docs/superpowers/specs/2026-07-30-clip-video-
@@ -952,12 +1016,33 @@
 +    processpipe *pipe;
 +    ullong byteswritten;
 +    bool failed;
++    uint skipped;
++    const volatile bool *cancelled; // owned by namespace recorder (pipeexportcancel below); read-only here
 +
-+    pipewriter(processpipe *p, uint w, uint h, uint fps) :
-+        moviewriter(w, h, fps), pipe(p), byteswritten(0), failed(false)
++    // Bounds the worst-case blocking duration of ONE writevideoframe() call
++    // (found in code review): the old unbounded "while(videoframes <=
++    // frame)" loop fires one full blocking pipe write per missed output
++    // frame slot, with no way out. A single capture gap (a hitch, a GPU
++    // stall, a spectate transition) can make `frame` jump far ahead of
++    // `videoframes` - at 720p60 a 10s gap is ~600 slots, ~791MB pushed in
++    // one uninterruptible burst, during which the encoder thread cannot
++    // notice a cancellation request. aviwriter's equivalent loop is cheap
++    // per iteration (an index append, no IO) so it never needed this cap;
++    // the pipe path's iterations are real blocking writes, which is the
++    // asymmetry that made this bite. 60 is a deliberately generous cap (a
++    // full second at 60fps, two at 30fps) - large captures gaps still get
++    // padded close to correctly timed, but any single call is bounded to
++    // at most this many blocking writes before it re-checks *cancelled and
++    // otherwise gives up and fast-forwards instead of continuing to block.
++    enum { MAXPADPERCALL = 60 };
++
++    pipewriter(processpipe *p, uint w, uint h, uint fps, const volatile bool *cancelledflag) :
++        moviewriter(w, h, fps), pipe(p), byteswritten(0), failed(false), skipped(0), cancelled(cancelledflag)
 +    {}
 +
 +    double filespaceguess() { return double(byteswritten); }
++    uint skippedpadframes() { return skipped; }
++    bool blockwhenfull() { return false; } // see moviewriter::blockwhenfull() doc comment
 +
 +    // Raw video piped to ffmpeg (-f rawvideo) carries no index or
 +    // timestamps of its own - ffmpeg just plays frame N+1 back immediately
@@ -979,18 +1064,50 @@
 +        const uchar *framedata = toi420(pixels, srcw, srch, format);
 +        const uint framesize = (videow * videoh * 3) / 2;
 +
++        uint written = 0;
 +        while(videoframes <= frame)
 +        {
++            if(cancelled && *cancelled) { failed = true; return false; }
++            if(written >= MAXPADPERCALL)
++            {
++                // Cap reached: fast-forward the remaining slots without a
++                // physical write rather than blocking further - reported
++                // distinctly from duplicatedframes() (which counts frames
++                // that WERE physically written) so a caller can tell "the
++                // export ran a little short/discontinuous here" apart
++                // from ordinary duplicate-padding.
++                skipped += frame - videoframes + 1;
++                videoframes = frame + 1;
++                break;
++            }
 +            if(!writeprocesspipe(*pipe, framedata, framesize)) { failed = true; return false; }
 +            byteswritten += framesize;
 +            videoframes++;
++            written++;
 +        }
 +        return true;
 +    }
- };
- 
++};
++
++// Set true to make BOTH the padding-loop cap above AND a still-in-progress
++// writeprocesspipe() call itself fail fast: pipewriter checks this between
++// every physical write, but the write it might currently be blocked inside
++// can only be unstuck by the child actually dying (see requestchildkill()
++// in processpipe.h) - setting this flag alone does not interrupt an
++// in-flight blocking write, only the loop's next iteration. Namespace
++// recorder's requestpipecancel()/exportcancelled() (further down) are the
++// only intended way to touch this from outside movie.cpp; kept as a plain
++// file-scope flag (like `state` below) rather than adding synchronisation
++// this codebase doesn't use elsewhere for cross-thread signals of this
++// kind - a torn read of a single bool is not a realistic risk on any
++// platform this ships on, and the worst case is checking one iteration
++// late, not incorrectness.
++static volatile bool pipeexportcancel = false;
++
  VAR(movieaccelblit, 0, 0, 1);
-@@ -750,13 +1067,19 @@
+ VAR(movieaccelyuv, 0, 1, 1);
+ VARP(movieaccel, 0, 1, 1);
+@@ -750,13 +1138,19 @@
  namespace recorder
  {
      static enum { REC_OK = 0, REC_USERHALT, REC_TOOSLOW, REC_FILERROR } state = REC_OK;
@@ -1013,7 +1130,28 @@
      
      enum { MAXSOUNDBUFFERS = 128 }; // sounds queue up until there is a video frame, so at low fps you'll need a bigger queue
      struct soundbuffer
-@@ -865,6 +1188,7 @@
+@@ -819,8 +1213,19 @@
+     static SDL_mutex *videolock = NULL;
+     static SDL_cond *shouldencode = NULL, *shouldread = NULL;
+ 
++    // Pre-existing (vanilla "movie" command uses this to refuse a second
++    // concurrent recording). Newly exposed outside this file for clip
++    // export (Task 3): this is the RIGHT way for a caller to notice
++    // "capture has stopped, for any reason" - readbuffer() below has its
++    // own long-standing self-heal ("if(state != REC_OK) stop();"), called
++    // every frame via swapbuffers(), and stop()'s own last line resets
++    // state back to REC_OK - so polling state/a "failed" flag from outside
++    // this file loses the race almost every time (state flips back before
++    // an external poller's next call ever sees it). file becoming NULL,
++    // by contrast, is a one-way transition until the next start()/
++    // startpipe() - no reset-and-miss window.
+     bool isrecording() { return file != NULL; }
+-    
++
+     float calcquality()
+     {
+         return 1.0f - float(dps)/float(dps+file->videofps); // strictly speaking should lock to read dps - 1.0=perfect, 0.5=half of frames are beingdropped
+@@ -865,6 +1270,7 @@
              int duplicates = m.frame - (int)file->videoframes + 1;
              if(duplicates > 0) // determine how many frames have been dropped over the sample window
              {
@@ -1021,7 +1159,7 @@
                  dps -= stats[statsindex];
                  stats[statsindex] = duplicates-1;
                  dps += stats[statsindex];
-@@ -896,37 +1220,22 @@
+@@ -896,37 +1302,22 @@
          SDL_UnlockMutex(soundlock);
      }
      
@@ -1069,7 +1207,7 @@
          lastframe = ~0U;
          videobuffers.clear();
          loopi(MAXVIDEOBUFFERS)
-@@ -935,17 +1244,100 @@
+@@ -935,17 +1326,118 @@
              videobuffers.data[i].init(w, h, 4);
              videobuffers.data[i].frame = ~0U;
          }
@@ -1154,12 +1292,30 @@
 +        if(videow%2) videow += 1;
 +        if(videoh%2) videoh += 1;
 +
-+        pipewriter *pw = new pipewriter(&pipe, videow, videoh, videofps);
++        pipeexportcancel = false; // fresh export: clear any stale flag from a previous one
++        pipewriter *pw = new pipewriter(&pipe, videow, videoh, videofps, &pipeexportcancel);
 +        conoutf("movie export piping to ffmpeg: %dx%d @ %dfps", pw->videow, pw->videoh, pw->videofps);
 +
 +        commonstart(pw);
 +        return true;
 +    }
++
++    // Out-of-band cancellation signal for the padding-loop cap in
++    // pipewriter::writevideoframe() (see MAXPADPERCALL there) - settable
++    // from any thread. Note this alone does not unstick an
++    // ALREADY-blocked writeprocesspipe() call; a caller that suspects the
++    // child is wedged (not just slow) also needs requestchildkill() from
++    // processpipe.h to actually force that call to return. See the
++    // clip-export watchdog in fpsgame/client.cpp for the full sequence.
++    void requestpipecancel() { pipeexportcancel = true; }
++
++    // Live progress accessors for a watchdog/UI to poll. exportframessofar()
++    // is also the clip-export watchdog's heartbeat: if it stops advancing
++    // for too long while capture is still expected to be in progress, the
++    // child is presumed wedged. Both safe to call at any point, including
++    // when nothing is recording (return 0).
++    uint exportframessofar() { return file ? file->videoframes : 0; }
++    uint skippedpadframes() { return file ? file->skippedpadframes() : 0; }
 +
 +    // Cumulative count of output frames that were re-written copies of a
 +    // previous frame (padding to keep the output's frame count in step
@@ -1174,7 +1330,7 @@
      void cleanup()
      {
          if(scalefb) { glDeleteFramebuffers_(1, &scalefb); scalefb = 0; }
-@@ -982,8 +1374,9 @@
+@@ -982,8 +1474,9 @@
          thread = NULL;
   
          static const char * const mesgs[] = { "ok", "stopped", "computer too slow", "file error"};
@@ -1186,7 +1342,7 @@
          DELETEP(file);
          state = REC_OK;
      }
-@@ -995,7 +1388,7 @@
+@@ -995,7 +1488,7 @@
          uint w = screenw, h = screenh;
          if(usefbo) { w = file->videow; h = file->videoh; }
          if(w != m.w || h != m.h) m.init(w, h, 4);
@@ -1195,7 +1351,7 @@
          m.frame = nextframe;
  
          glPixelStorei(GL_PACK_ALIGNMENT, texalign(m.video, m.w, 4));
-@@ -1050,7 +1443,7 @@
+@@ -1050,7 +1543,7 @@
                      glFramebufferTexture2D_(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, scaletex[1], 0);
                      glViewport(0, 0, dw, dh);
                      glBindTexture(GL_TEXTURE_2D, scaletex[0]);
@@ -1204,7 +1360,7 @@
                      else SETSHADER(moviergb);
                      screenquad(tw/float(scalew), th/float(scaleh));
                      tw = dw;
-@@ -1072,7 +1465,7 @@
+@@ -1072,7 +1565,7 @@
                  glReadPixels(m.w/4, 0, m.w/8, m.h/2, GL_BGRA, GL_UNSIGNED_BYTE, &m.video[planesize]);
                  glPixelStorei(GL_PACK_ALIGNMENT, texalign(&m.video[planesize + planesize/4], m.w/8, 4));
                  glReadPixels(m.w/4, m.h/2, m.w/8, m.h/2, GL_BGRA, GL_UNSIGNED_BYTE, &m.video[planesize + planesize/4]);
@@ -1213,9 +1369,18 @@
              }
              else
              {
+@@ -1095,7 +1588,7 @@
+             return false;
+         }
+         SDL_LockMutex(videolock);
+-        if(moviesync && videobuffers.full()) SDL_CondWait(shouldread, videolock);
++        if(moviesync && file->blockwhenfull() && videobuffers.full()) SDL_CondWait(shouldread, videolock);
+         uint nextframe = (max(gettime() - starttime, 0)*file->videofps)/1000;
+         if(!videobuffers.full() && (lastframe == ~0U || nextframe > lastframe))
+         {
 --- a/engine/engine.h
 +++ b/engine/engine.h
-@@ -600,11 +600,29 @@
+@@ -600,11 +600,36 @@
  
  // recorder
  
@@ -1227,6 +1392,7 @@
      extern void stop();
      extern void capture(bool overlay = true);
      extern void cleanup();
++    extern bool isrecording();
 +
 +    // Clip-export entry point: see the doc comment on recorder::startpipe()
 +    // in engine/movie.cpp for the full contract (ownership of the pipe,
@@ -1242,6 +1408,618 @@
 +    // with real elapsed time) over the current/most recent recording -
 +    // the "were frames dropped" report, for either recording kind.
 +    extern uint duplicatedframes();
++
++    // Task 3 (export orchestration) additions - all declared/documented in
++    // full in engine/movie.cpp next to their definitions:
++    extern void requestpipecancel();   // out-of-band "please give up" signal for the padding-loop cap; does NOT by itself unstick an already-blocked write
++    extern uint exportframessofar();   // live progress / watchdog heartbeat
++    extern uint skippedpadframes();    // frames fast-forwarded past (not physically written) after a padding-loop cap hit
  }
  
  #endif
+--- a/shared/iengine.h
++++ b/shared/iengine.h
+@@ -53,6 +53,38 @@
+ extern int thirdperson;
+ extern bool isthirdperson();
+ 
++// SwiftGibs clip export (Task 3): externs for settings the export
++// orchestration (fpsgame/client.cpp) temporarily overrides for a clean POV
++// capture, then restores. hidehud/fov live in engine/rendergl.cpp,
++// soundvol in engine/sound.cpp - all pre-existing engine VARs/VARFPs, none
++// of them previously reachable from game-side code.
++extern int hidehud;
++extern int fov;
++extern int soundvol;
++
++// SwiftGibs clip export (Task 3): the subset of engine/engine.h's
++// `namespace recorder` declarations that game-side export orchestration
++// (fpsgame/client.cpp) needs. Mirrored here rather than having
++// fpsgame/client.cpp #include "engine.h" directly - that header pulls in
++// world.h/octa.h/lightmap.h/bih.h/texture.h/model.h, a large slice of
++// engine-internal machinery no game-side file currently depends on. This
++// is the same "game sees iengine.h, not engine.h" boundary the rest of
++// this file already draws; the real definitions (engine/movie.cpp) don't
++// care which header a caller found the declaration through, so
++// re-declaring the same externs here is safe (matching extern
++// redeclarations across headers are fine in C++, not an ODR violation).
++struct processpipe; // engine/processpipe.h - full definition not needed just to declare these
++namespace recorder
++{
++    extern void stop();
++    extern bool startpipe(processpipe &pipe, int videofps, int videow, int videoh);
++    extern uint duplicatedframes();
++    extern void requestpipecancel();
++    extern uint exportframessofar();
++    extern uint skippedpadframes();
++    extern bool isrecording();
++}
++
+ extern bool settexture(const char *name, int clamp = 0);
+ 
+ // octaedit
+--- a/fpsgame/game.h
++++ b/fpsgame/game.h
+@@ -732,6 +732,7 @@
+     extern fpsent *hudplayer();
+     extern fpsent *followingplayer(fpsent *fallback = NULL);
+     extern void stopfollowing();
++    extern void follow(char *arg); // SwiftGibs clip export (Task 3): locks the POV camera onto the recording player during export playback
+     extern void clientdisconnected(int cn, bool notify = true);
+     extern void clearclients(bool notify = true);
+     extern void startgame();
+@@ -840,6 +841,13 @@
+     extern bool cliprecordwasactivematch();                   // SwiftGibs fps stats (patches/18): was a
+                                                                 // recording sink active at any point this
+                                                                 // match - read once at match end, never per-frame
++    // SwiftGibs clip video export (Task 3): cross-file hooks, same pattern as the clip-recording
++    // ones just above - implemented in fpsgame/client.cpp alongside the rest of the export
++    // orchestration, called from fpsgame/fps.cpp's updateworld() (per-frame poll) and
++    // startgame() (interruption safety: an unexpected map change mid-export). Both are no-ops
++    // (cheap int compares) when no export is in progress - safe to call unconditionally.
++    extern void checkclipexport();     // per-frame poll/state machine driver
++    extern void clipexportonmapchange(); // startgame() interruption guard - only acts if a capture was already in progress (never the export's OWN initial map load, which also runs through startgame())
+     extern int statuscolor(fpsent *d, int color);
+ 
+     // render
+--- a/fpsgame/client.cpp
++++ b/fpsgame/client.cpp
+@@ -1,4 +1,5 @@
+ #include "game.h"
++#include "processpipe.h" // SwiftGibs clip export (Task 3): found via -Iengine on the include path (Makefile); a plain, self-contained header (no engine.h needed for the processpipe TYPE itself - see shared/iengine.h for the recorder:: functions this file also calls)
+ 
+ namespace game
+ {
+@@ -1139,6 +1140,8 @@
+     ICOMMAND(numchatlines, "", (), intret(chatlog.length()));
+     ICOMMAND(getchatline, "i", (int *i), { if(chatlog.inrange(*i)) result(chatlog[*i]); });
+ 
++    void clipexportabort(const char *reason); // fwd decl - SwiftGibs clip export (Task 3), defined further down; interruption-safety hook below needs it before its real definition
++
+     void gamedisconnect(bool cleanup)
+     {
+         if(remote) stopfollowing();
+@@ -1177,6 +1180,14 @@
+         // hook at the very TOP (right after stopfollowing()) so that patch's context match is
+         // undisturbed.
+         cliprecordfinalizeall("disconnect");
++        // SwiftGibs clip export (Task 3): same interruption-safety idiom as the line above -
++        // gamedisconnect() is the one place both a real `disconnect` AND `quit` (which routes
++        // through here first - see the comment above) are guaranteed to pass through, so an
++        // export that's mid-flight when the player quits/disconnects gets torn down (settings
++        // restored, incomplete output removed, ffmpeg reaped) here rather than left dangling.
++        // A no-op (single int compare) when no export is active - safe to call unconditionally,
++        // including on every ordinary disconnect that has nothing to do with export.
++        clipexportabort("disconnected");
+     }
+ 
+     VARP(teamcolorchat, 0, 1, 1);
+@@ -1980,6 +1991,462 @@
+     }
+     // === end SwiftGibs instant replay: recording modes =======================================
+ 
++    // === SwiftGibs clip video export (Task 3): POV playback, clean capture, settings restore ==
++    //
++    // Orchestrates: start playback of a saved clip, lock the camera to the RECORDING player's
++    // own first-person view, suppress HUD/menus, pipe captured frames through
++    // recorder::startpipe() into a spawned ffmpeg, stop at clip end, and restore every setting
++    // touched - on every exit path (success, failure, cancellation, clip ending early, the
++    // player quitting/disconnecting mid-export). Bundling ffmpeg itself is Task 4 - the binary
++    // path here comes from clipexportffmpeg (SVARP, below), which is empty until Task 4 wires a
++    // real bundled default; set it to an absolute path to test export today (this is how it was
++    // verified for this task - see the task report).
++    //
++    // Identifying "the recording player" (the risky part the brief asked to find, not
++    // approximate): a clip's keyframe (writeclipwelcome(), above) writes players[] in
++    // WRITE-TIME order, and players[] ALWAYS has the local player1 at index 0 for the entire
++    // life of the client process - players.add(player1) happens exactly once, in initclient()
++    // (fpsgame/fps.cpp), at engine startup, and nothing ever removes it (clientdisconnected()/
++    // clearclients() only ever tear down REMOTE entries). So whoever recorded a clip was ALWAYS
++    // written first among that keyframe's N_RESUME/N_INITCLIENT entries, before any bot or
++    // other player who joined afterward - confirmed by reading writeclipwelcome() and
++    // initclient(), not assumed.
++    //
++    // On the PLAYBACK side: a fresh `map <clip>` tears players[]/clients[] back down to just
++    // [player1] before the new session's packets arrive (the same map-change reset any real
++    // connect goes through - gamedisconnect()'s clearclients(), confirmed by reading the
++    // connect/map-change call chain, not the N_DEMOPLAYBACK packet handler, which does NOT
++    // clear on playback start - only on end). The keyframe's own case N_RESUME (above) then
++    // processes entries strictly in file order, calling newclient(cn) for each in turn - never
++    // player1 itself, since a demo's N_DEMOPLAYBACK packet always carries clientnum -1
++    // regardless of file content (fpsgame/server.cpp's setupdemoplayback(), confirmed by
++    // reading, not assumed - vanilla demos are recorded server-side with no participant
++    // identity at all, so stock playback never treats you as any of the recorded players).
++    // So the FIRST entry newclient() ever adds to players[] once a clip starts playing -
++    // players[1], right after our own view-side player1 at players[0] - is reliably the
++    // reconstructed identity of whoever recorded the clip.
++    //
++    // Deliberately NOT name-matching (the obvious-looking alternative): the player may have
++    // renamed since recording, or share a name with a bot/another player in the clip, and the
++    // clip format has no dedicated identity field to fall back on (checked: the 24-byte
++    // demoheader is just magic/version/protocol). The ordering approach above falls straight
++    // out of guarantees already present in the EXISTING clip format, so it works unmodified
++    // against clips saved before this task existed - verified against April's real
++    // pre-existing clip from her Desktop bundle, see the task report.
++
++    SVARP(videodir, "videos");     // export output folder, same convention as clipdir/screenshotdir - created on demand via findfile(...,"w"), same as both of those
++    SVARP(clipexportffmpeg, "");   // absolute path to the ffmpeg binary to invoke - empty until Task 4 bundles one; set this to test (e.g. "clipexportffmpeg /usr/bin/ffmpeg")
++    VARP(clipexportstalltimeout, 2, 8, 60);    // seconds of no encoder progress before the watchdog presumes ffmpeg wedged and force-kills it
++    VARP(clipexportfinishtimeout, 2, 15, 120); // seconds given to ffmpeg to drain+exit after end-of-clip before the watchdog force-kills it instead
++
++    enum { CLIPEXPORT_IDLE = 0, CLIPEXPORT_WAITING, CLIPEXPORT_CAPTURING };
++
++    static int clipexportphase = CLIPEXPORT_IDLE;
++    static processpipe clipexportpipe;
++    static int clipexportwidth = 0, clipexportheight = 0, clipexportfps = 0;
++    static string clipexportoutpath = "";
++    static string clipexportext = "mp4";
++    static int clipexportwaitstart = 0;
++    static int clipexporttargetcn = -1;
++
++    // Settings snapshot - the correctness-critical part. Every var touched is enumerated here
++    // and nowhere else; clipexportapplysettings()/clipexportrestoresettings() are the only two
++    // places that ever write to hidehud/thirdperson/soundvol for this feature, and the "applied"
++    // bool makes restore idempotent (safe to call from more than one exit path without double-
++    // restoring or restoring when nothing was ever changed). fov is deliberately NOT in this
++    // list - see the task report for why (no signal in a clip to set it to anything more
++    // "correct" than the exporting player's own preference; changing it would be an unjustified
++    // side effect, not a POV-lock requirement). moviesync is also deliberately not here: rather
++    // than temporarily overwriting that persisted VARP (one more setting that could be left
++    // wrong if something went badly enough), engine/movie.cpp's pipewriter simply ignores it
++    // (moviewriter::blockwhenfull()) - see the task report for the reasoning.
++    static bool clipexportsettingsapplied = false;
++    static int clipexportsavedhidehud = 0, clipexportsavedthirdperson = 0, clipexportsavedsoundvol = 255;
++
++    static void clipexportapplysettings()
++    {
++        if(clipexportsettingsapplied) return;
++        clipexportsavedhidehud = hidehud;
++        clipexportsavedthirdperson = thirdperson;
++        clipexportsavedsoundvol = soundvol;
++        hidehud = 1;       // clean capture: no HUD/crosshair/console (the SwiftGibs overlays piggyback on this same var - see fpsgame/fps.cpp's gameplayhud() comment)
++        thirdperson = 0;   // first-person: hudplayer()/isthirdperson() (engine/rendergl.cpp) only bypass the followed target's POV when thirdperson is nonzero AND allowthirdperson() - forcing 0 guarantees the locked POV actually renders in first person
++        soundvol = 0;      // courtesy mute: export is real-time foreground playback (the design doc is explicit this takes at least as long as the clip), and the piped output never carries audio yet (task 2's documented limitation) regardless of this setting
++        clipexportsettingsapplied = true;
++    }
++
++    static void clipexportrestoresettings()
++    {
++        if(!clipexportsettingsapplied) return;
++        hidehud = clipexportsavedhidehud;
++        thirdperson = clipexportsavedthirdperson;
++        soundvol = clipexportsavedsoundvol;
++        clipexportsettingsapplied = false;
++        stopfollowing(); // release the POV lock regardless of player1's current state - stopfollowing() only requires following>=0, not CS_SPECTATOR (unlike engaging follow()), so this is always safe to call
++    }
++
++    // --- watchdog: an out-of-band trigger that notices a wedged ffmpeg and recovers WITHOUT
++    // needing the main thread, a click, or any other input (code review finding: if
++    // recorder::stop() ever blocks the main thread on a truly stuck encoder, there is no live
++    // UI left for a player to click a cancel button with - see processpipe.h's
++    // requestchildkill() for the thread-safety argument this design leans on). Two distinct
++    // failure windows, one thread:
++    //   - WHILE CAPTURING: a heartbeat (recorder::exportframessofar(), bumped by every physical
++    //     pipe write) must advance within clipexportstalltimeout seconds, or the child is
++    //     presumed wedged (blocked reading nothing).
++    //   - WHILE FINISHING (after we've closed our end and are waiting for ffmpeg to drain+exit):
++    //     the heartbeat necessarily stops advancing on its own (no more frames are ever coming),
++    //     so this phase uses a plain absolute deadline instead - clipexportwdfinishing/
++    //     clipexportwdfinishdeadline, set by the finishing code right before it calls
++    //     recorder::stop()/closeprocesspipe(), giving a fresh clipexportfinishtimeout-second
++    //     grace window rather than inheriting a stale "last write was N seconds ago" reading
++    //     from the moment capture stopped.
++    // Reading clipexportpipe.pid/.process here (via requestchildkill(), which touches nothing
++    // else) is safe without a lock: it's written once by openprocesspipe(), on the main thread,
++    // strictly BEFORE this thread is created (thread creation is itself a synchronisation point),
++    // and never mutated again by the owning thread until AFTER this thread has been joined
++    // (clipexportstopwatchdog(), called only after recorder::stop()+closeprocesspipe()/
++    // killprocesspipe() have already finished) - so there is no window where both a reap and a
++    // read of the same fields can be in flight at once.
++    static SDL_Thread *clipexportwatchdog = NULL;
++    static volatile bool clipexportwdstop = false;
++    static volatile bool clipexportwdfinishing = false;
++    static volatile int clipexportwdfinishdeadline = 0;
++    static volatile bool clipexportwdfired = false; // did the watchdog actually have to intervene? (surfaced in the finish/abort console message)
++
++    static int clipexportwatchdogthread(void *)
++    {
++        uint lastframes = 0;
++        int lastprogress = (int)SDL_GetTicks();
++        for(;;)
++        {
++            SDL_Delay(250);
++            if(clipexportwdstop) break;
++            if(clipexportwdfinishing)
++            {
++                if((int)SDL_GetTicks() - clipexportwdfinishdeadline >= 0)
++                {
++                    requestchildkill(clipexportpipe);
++                    recorder::requestpipecancel();
++                    clipexportwdfired = true;
++                    break;
++                }
++                continue;
++            }
++            uint frames = recorder::exportframessofar();
++            if(frames != lastframes) { lastframes = frames; lastprogress = (int)SDL_GetTicks(); }
++            if((int)SDL_GetTicks() - lastprogress > clipexportstalltimeout*1000)
++            {
++                requestchildkill(clipexportpipe);
++                recorder::requestpipecancel();
++                clipexportwdfired = true;
++                break;
++            }
++        }
++        return 0;
++    }
++
++    static void clipexportstopwatchdog()
++    {
++        if(!clipexportwatchdog) return;
++        clipexportwdstop = true;
++        SDL_WaitThread(clipexportwatchdog, NULL);
++        clipexportwatchdog = NULL;
++    }
++
++    // Deletes an incomplete/cancelled output rather than leaving a half file that looks like a
++    // finished video. Never touches anything else (in particular, never the source clip - this
++    // only ever operates on clipexportoutpath, which is always inside videodir). Safe if nothing
++    // was ever written (ffmpeg failed to launch, or we never got as far as opening the pipe) -
++    // remove() on a path that doesn't exist is a harmless, silent failure here, not reported.
++    static void clipexportremoveoutput()
++    {
++        if(!clipexportoutpath[0]) return;
++        remove(findfile(clipexportoutpath, "w"));
++    }
++
++    // The single non-success teardown path: cancellation, failure, a WAITING-phase timeout,
++    // disconnect/quit, or an unexpected map change mid-export. Always: re-arms the watchdog's
++    // grace window then kills the child directly ourselves too (faster than waiting for the
++    // watchdog's next 250ms poll), stops+reaps everything, deletes the incomplete output file,
++    // and restores every setting this export touched. Idempotent (a second call finds phase
++    // already IDLE and returns) and safe to call from ANY phase including IDLE, which is what
++    // lets gamedisconnect() and startgame()'s hooks call it unconditionally without needing to
++    // know whether an export is even running.
++    void clipexportabort(const char *reason)
++    {
++        if(clipexportphase == CLIPEXPORT_IDLE) return;
++        clipexportphase = CLIPEXPORT_IDLE;
++
++        // Kill first, THEN stop(): ffmpeg's health is unknown on most paths that reach this
++        // function (that is usually WHY we're here) - never call a bare recorder::stop() first,
++        // since its SDL_WaitThread would hang the CALLER (not just the watchdog) if the encoder
++        // thread were still blocked inside a wedged writeprocesspipe(). Re-arming the watchdog's
++        // finishing deadline here too means even if this direct kill somehow doesn't land (pid
++        // already reused, freak timing), the watchdog is still independently counting down as a
++        // backstop for the stop()/closeprocesspipe() calls below.
++        clipexportwdfinishing = true;
++        clipexportwdfinishdeadline = (int)SDL_GetTicks() + clipexportfinishtimeout*1000;
++        requestchildkill(clipexportpipe);
++        recorder::requestpipecancel();
++
++        recorder::stop();                  // safe now: the child is already dying/dead, so the encoder thread's blocked write (if any) resolves promptly
++        clipexportstopwatchdog();          // join; fast, since whatever the watchdog was guarding against is already resolved by this point
++        killprocesspipe(clipexportpipe);   // finish reaping our own pipe/child bookkeeping - safe now nothing else touches it
++
++        clipexportremoveoutput();
++        clipexportrestoresettings();
++
++        conoutf("clip export stopped: %s", reason);
++    }
++
++    // Called from case N_DEMOPLAYBACK's on==0 branch (above) - the clip's own NATURAL end
++    // (including running out early on a truncated/corrupt .dmo - either way this is "the clip's
++    // own content decided playback is over", not an external interruption). No-op if no export
++    // is in progress or capture hadn't actually started yet (a demoend before players[1] was
++    // even identified means something went wrong loading the clip, not a real export to finish -
++    // routed to the same abort/cleanup path with an explanatory reason).
++    void clipexportonplaybackend()
++    {
++        if(clipexportphase == CLIPEXPORT_IDLE) return;
++        if(clipexportphase != CLIPEXPORT_CAPTURING) { clipexportabort("clip ended before capture began"); return; }
++        clipexportphase = CLIPEXPORT_IDLE;
++
++        clipexportwdfinishing = true;
++        clipexportwdfinishdeadline = (int)SDL_GetTicks() + clipexportfinishtimeout*1000;
++
++        recorder::stop();                                       // encoder finishes delivering whatever's already queued, then its thread exits
++        clipexportstopwatchdog();
++        int exitcode = closeprocesspipe(clipexportpipe);         // close our end (ffmpeg sees EOF), wait for it to finish encoding and exit, reap it - bounded by the watchdog's finishing deadline above, not an unbounded wait
++
++        clipexportrestoresettings();
++
++        if(exitcode == 0 && !clipexportwdfired)
++        {
++            conoutf("clip exported: %s", clipexportoutpath);
++        }
++        else
++        {
++            conoutf(CON_ERROR, "exportclip: ffmpeg exited abnormally (%d)%s - output removed", exitcode,
++                    clipexportwdfired ? ", had to be force-stopped" : "");
++            clipexportremoveoutput();
++        }
++    }
++
++    // startgame() interruption guard (called unconditionally from fpsgame/fps.cpp) - only acts
++    // if a capture was already under way. The export's OWN initial map load into the clip being
++    // exported also arrives here via changemapserv() like any other map change, but that
++    // happens while phase is still WAITING (before capture starts), so it is correctly ignored;
++    // this only fires for a map change that has no business happening mid-capture.
++    void clipexportonmapchange()
++    {
++        if(clipexportphase == CLIPEXPORT_CAPTURING) clipexportabort("map changed during export");
++    }
++
++    // Derives videos/<clip-basename>.<ext>, sanitised the same way clip filenames themselves
++    // are (clipsanitize(), above). Collision policy: never silently overwrite a previous export
++    // of the same clip - try the plain name first, then -2, -3, ... up to 999, and use the
++    // first one that doesn't already exist. (The alternative of refusing outright was rejected -
++    // re-exporting the same clip with different settings is a completely normal thing to want
++    // to do - and silently overwriting was ruled out by the brief.) findfile(...,"w") also
++    // creates videodir on demand, the same mechanism screenshot()/saveclip() already rely on for
++    // clipdir/screenshotdir.
++    static bool clipexportuniquepath(const char *base, const char *ext, char *dst, int dstsize)
++    {
++        loopi(1000)
++        {
++            if(i == 0) nformatstring(dst, dstsize, "%s%s%s.%s", videodir, videodir[0] ? "/" : "", base, ext);
++            else nformatstring(dst, dstsize, "%s%s%s-%d.%s", videodir, videodir[0] ? "/" : "", base, i+1, ext);
++            if(!fileexists(findfile(dst, "w"), "r")) return true;
++        }
++        return false;
++    }
++
++    // Per-frame state machine driver, called unconditionally from fpsgame/fps.cpp's
++    // updateworld() (see the comment there for why it must be unconditional, not gated on
++    // c2sinfo()/connected). A single int compare when idle.
++    void checkclipexport()
++    {
++        if(clipexportphase == CLIPEXPORT_IDLE) return;
++
++        if(clipexportphase == CLIPEXPORT_WAITING)
++        {
++            if(!demoplayback || players.length() < 2)
++            {
++                if(totalmillis - clipexportwaitstart > 8000)
++                    clipexportabort(!demoplayback ? "clip could not be loaded" : "clip has no recorded player data");
++                return;
++            }
++
++            // Identify + lock onto the recording player - see the big design comment at the top
++            // of this section.
++            clipexporttargetcn = players[1]->clientnum;
++            defformatstring(followarg, "%d", clipexporttargetcn);
++            follow(followarg);
++
++            string sizearg, fpsarg;
++            formatstring(sizearg, "%dx%d", clipexportwidth, clipexportheight);
++            formatstring(fpsarg, "%d", clipexportfps);
++            bool webm = !strcmp(clipexportext, "webm");
++            const char *resolvedout = findfile(clipexportoutpath, "w");
++            const char *argv[32];
++            int argc = 0;
++            argv[argc++] = clipexportffmpeg;
++            argv[argc++] = "-y";
++            argv[argc++] = "-hide_banner";
++            argv[argc++] = "-loglevel"; argv[argc++] = "error";
++            argv[argc++] = "-nostats";
++            argv[argc++] = "-f"; argv[argc++] = "rawvideo";
++            argv[argc++] = "-pix_fmt"; argv[argc++] = "yuv420p";
++            argv[argc++] = "-s"; argv[argc++] = sizearg;
++            argv[argc++] = "-r"; argv[argc++] = fpsarg;
++            argv[argc++] = "-i"; argv[argc++] = "-";
++            argv[argc++] = "-an";
++            if(webm)
++            {
++                argv[argc++] = "-c:v"; argv[argc++] = "libvpx-vp9";
++                argv[argc++] = "-pix_fmt"; argv[argc++] = "yuv420p";
++                argv[argc++] = "-b:v"; argv[argc++] = "0";
++                argv[argc++] = "-crf"; argv[argc++] = "32";
++                argv[argc++] = "-deadline"; argv[argc++] = "good";
++            }
++            else
++            {
++                argv[argc++] = "-c:v"; argv[argc++] = "libx264";
++                argv[argc++] = "-pix_fmt"; argv[argc++] = "yuv420p";
++                argv[argc++] = "-preset"; argv[argc++] = "veryfast";
++                argv[argc++] = "-crf"; argv[argc++] = "20";
++                argv[argc++] = "-movflags"; argv[argc++] = "+faststart";
++            }
++            argv[argc++] = resolvedout;
++            argv[argc++] = NULL;
++
++            if(!openprocesspipe(clipexportpipe, argv))
++            {
++                clipexportabort("could not launch ffmpeg");
++                return;
++            }
++            if(!recorder::startpipe(clipexportpipe, clipexportfps, clipexportwidth, clipexportheight))
++            {
++                killprocesspipe(clipexportpipe);
++                clipexportabort("capture already active");
++                return;
++            }
++
++            clipexportwdstop = false;
++            clipexportwdfinishing = false;
++            clipexportwdfired = false;
++            clipexportwatchdog = SDL_CreateThread(clipexportwatchdogthread, "clip export watchdog", NULL);
++
++            clipexportphase = CLIPEXPORT_CAPTURING;
++            conoutf("exporting clip: %dx%d @ %dfps -> %s", clipexportwidth, clipexportheight, clipexportfps, clipexportoutpath);
++            return;
++        }
++
++        // CLIPEXPORT_CAPTURING. Deliberately checks isrecording() (file==NULL, a stable
++        // one-way transition), NOT exportfailed()/state: engine/movie.cpp's own readbuffer()
++        // has a PRE-EXISTING, unrelated self-heal - "if(state != REC_OK) { stop(); return
++        // false; }" - called every frame via swapbuffers()/capture(), same as the vanilla
++        // "movie" command already relies on for its own REC_TOOSLOW case. That check runs
++        // independently of this poll and, critically, recorder::stop() resets state back to
++        // REC_OK as its last line - so a naive "if(recorder::exportfailed())" here loses the
++        // race almost every time (found by adding temporary tracing during this task's own
++        // testing: readbuffer() reliably calls stop() and clears the failure before this
++        // function's next call ever observes it), producing exactly the bug that testing
++        // caught: "movie recording halted" prints, but nothing here ever runs, so the pipe/
++        // watchdog/settings are never cleaned up and the export looks permanently "active".
++        // isrecording() sidesteps this entirely: once ANYTHING (readbuffer()'s self-heal, or
++        // this function itself on some other path) has called stop(), file is NULL for good
++        // until the next startpipe() - no reset-and-miss window. Calling clipexportabort()
++        // here when that happens is still safe even though stop() may already have run: its
++        // own recorder::stop() call is a documented no-op once file is already NULL.
++        if(!recorder::isrecording()) { clipexportabort("ffmpeg failed or capture stopped unexpectedly"); return; }
++        // NOTE: the clip's natural end is handled by clipexportonplaybackend() (case
++        // N_DEMOPLAYBACK, above), not polled here - demoplayback dropping to false with no
++        // export-specific hook having fired would only happen via gamedisconnect() (its own
++        // hook already covers that) or a bug; nothing else sets it false.
++    }
++
++    // exportclip <name> <width> <height> <fps> [format]
++    // format is "mp4" (default, H.264) or "webm" (VP9); anything else falls back to mp4 with a
++    // warning. width/height/fps are the caller's choice - Task 5's menu will offer presets plus
++    // "match my resolution" (screenw/screenh) and a capped fps; for now the caller picks the
++    // numbers directly (e.g. "exportclip myclip 1280 720 60").
++    void exportclip(char *name, int *width, int *height, int *fps, char *format)
++    {
++        if(clipexportphase != CLIPEXPORT_IDLE) { conoutf(CON_ERROR, "exportclip: an export is already in progress (cancelclipexport to stop it)"); return; }
++        if(connected) { conoutf(CON_ERROR, "exportclip: disconnect first - clip export can't run during live play"); return; }
++        if(!name[0]) { conoutf(CON_ERROR, "exportclip: no clip name given"); return; }
++        if(!clipexportffmpeg[0]) { conoutf(CON_ERROR, "exportclip: no ffmpeg binary configured (clipexportffmpeg) - bundling is Task 4; set clipexportffmpeg to a path to test export now"); return; }
++        if(*width < 2 || *height < 2 || *width > 10000 || *height > 10000) { conoutf(CON_ERROR, "exportclip: bad resolution"); return; }
++        if(*fps < 1 || *fps > 1000) { conoutf(CON_ERROR, "exportclip: bad fps"); return; }
++
++        bool webm = format[0] && !strcasecmp(format, "webm");
++        if(format[0] && !webm && strcasecmp(format, "mp4"))
++            conoutf(CON_WARN, "exportclip: unrecognised format \"%s\", using mp4", format);
++        copystring(clipexportext, webm ? "webm" : "mp4");
++
++        // Resolve the clip source the same tolerant way playclip does (with or without ".dmo"),
++        // and refuse up front if it plainly doesn't exist - a clear message beats discovering
++        // this only after the map load already failed a few seconds from now.
++        string clipfile;
++        copystring(clipfile, name);
++        size_t namelen = strlen(clipfile);
++        if(namelen < 4 || strcasecmp(&clipfile[namelen-4], ".dmo")) concatstring(clipfile, ".dmo");
++        defformatstring(clippath, "%s%s%s", clipdir, clipdir[0] ? "/" : "", clipfile);
++        if(!fileexists(findfile(clippath, "r"), "r"))
++        {
++            conoutf(CON_ERROR, "exportclip: clip not found: %s", clippath);
++            return;
++        }
++
++        string clipbase;
++        copystring(clipbase, name);
++        size_t blen = strlen(clipbase);
++        if(blen >= 4 && !strcasecmp(&clipbase[blen-4], ".dmo")) clipbase[blen-4] = '\0';
++        if(!clipexportuniquepath(clipbase, clipexportext, clipexportoutpath, sizeof(clipexportoutpath)))
++        {
++            conoutf(CON_ERROR, "exportclip: could not find a free output filename in %s", videodir);
++            return;
++        }
++
++        clipexportwidth = *width;
++        clipexportheight = *height;
++        clipexportfps = *fps;
++        clipexporttargetcn = -1;
++
++        clipexportapplysettings();
++
++        // The exact "stopdemo; if (mode -1) [map <path>]" sequence playclip runs (overlay/
++        // autoexec.cfg) - called directly here as real C++ (stopdemo()/setmode()/changemap(),
++        // all defined in this file) with clippath passed as a genuine function argument, rather
++        // than round-tripped through execute() on a concatenated script string: the clip NAME
++        // reaching this function may not always come from trusted, pre-sanitised menu code (a
++        // console tester can type anything), and building a script string by pasting it in would
++        // reopen exactly the "user-supplied command string" risk the whole export feature is
++        // built to avoid at the ffmpeg end - so it is avoided here too, not just there.
++        stopdemo();
++        setmode(-1);
++        changemap(clippath);
++
++        clipexportphase = CLIPEXPORT_WAITING;
++        clipexportwaitstart = totalmillis;
++    }
++    COMMAND(exportclip, "siiis");
++
++    void cancelclipexport()
++    {
++        if(clipexportphase == CLIPEXPORT_IDLE) { conoutf("cancelclipexport: no export in progress"); return; }
++        clipexportabort("cancelled");
++    }
++    COMMAND(cancelclipexport, "");
++
++    ICOMMAND(clipexportactive, "", (), intret(clipexportphase != CLIPEXPORT_IDLE ? 1 : 0));
++    ICOMMAND(clipexportcapturing, "", (), intret(clipexportphase == CLIPEXPORT_CAPTURING ? 1 : 0));
++    ICOMMAND(clipexportprogress, "", (), intret((int)recorder::exportframessofar()));
++    ICOMMAND(clipexportdropped, "", (), intret((int)(recorder::duplicatedframes() + recorder::skippedpadframes())));
++    // === end SwiftGibs clip video export ======================================================
++
+     void c2sinfo(bool force) // send update to the server
+     {
+         static int lastupdate = -1000;
+@@ -2768,6 +3235,13 @@
+                 player1->clientnum = getint(p);
+                 gamepaused = false;
+                 execident(on ? "demostart" : "demoend");
++                // SwiftGibs clip export (Task 3): on==0 is stock playback's own "the file ran
++                // out, or something called stopdemo" signal - the ONE place a clip's NATURAL
++                // end (including running out early on a truncated/corrupt .dmo) is
++                // distinguishable from an export being torn down by something else (disconnect/
++                // quit go through gamedisconnect() instead, never here). No-op if no export is
++                // in progress.
++                if(!on) clipexportonplaybackend();
+                 break;
+             }
+ 
+--- a/fpsgame/fps.cpp
++++ b/fpsgame/fps.cpp
+@@ -240,6 +240,15 @@
+     void checkautorespawn();   // SwiftGibs Task 7: defined below, after the cue-demo helpers it checks
+     void updateworld()        // main game update loop
+     {
++        // SwiftGibs clip export (Task 3): a genuinely unconditional per-frame hook (updateworld()
++        // itself only gates on lastmillis - engine/main.cpp - never on `connected`), needed
++        // because the WAITING-for-playback phase runs before `connected`/`maptime` are
++        // meaningfully set. Placed before gets2c() (called further down and, in the early-return
++        // branch just below, right away) so a phase transition this function makes is never
++        // racing the SAME frame's inbound packet processing - see the big design comment on
++        // checkclipexport() for why this ordering matters for identifying the recording player.
++        // No-op (one int compare) whenever no export is in progress.
++        checkclipexport();
+         updatereloadmetronome();
+         if(!maptime) { maptime = lastmillis; maprealtime = totalmillis; return; }
+         if(!curtime) { gets2c(); if(player1->clientnum>=0) c2sinfo(); return; }
+@@ -1106,6 +1115,13 @@
+         // returns) would still be stale/empty.
+         cliprecordfinalizeall("map change");
+         cliprecordarmmatchstart();
++        // SwiftGibs clip export (Task 3): same placement reasoning as the two lines above.
++        // clipexportonmapchange() only ever ACTS if a capture was already under way (phase
++        // CAPTURING) - it must NOT fire for an export's own initial map load into the clip
++        // being exported, which also arrives here via changemapserv() like any other map
++        // change; that load happens while the export is still in its WAITING-for-playback
++        // phase, before capture starts, so this is a safe no-op for it.
++        clipexportonmapchange();
+ 
+         clearmovables();
+         clearmonsters();
