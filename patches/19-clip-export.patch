@@ -1696,6 +1696,32 @@
  }
  
  #endif
+--- a/engine/console.cpp
++++ b/engine/console.cpp
+@@ -96,6 +96,23 @@
+ 
+ ICOMMAND(clearconsole, "", (), { while(conlines.length()) delete[] conlines.pop().line; });
+ 
++// SwiftGibs clip video export (Task 3, fix round 1): forces every EXISTING console line's
++// on-screen fade timer into the past, so drawconlines() (below)'s timed gate hides them
++// immediately - clearconsole() (just above) is the wrong tool for this: it actually deletes
++// the lines outright, losing history a player might still want via toggleconsole()/
++// fullconsole (whose own gate below passes confade==0, which bypasses the outtime check
++// entirely and always shows full history regardless of this call - see drawconlines()'s own
++// "if(confade)" gate). Only the timestamp changes; the line/type/text and the buffer's
++// length are untouched. Called once, right when export capture begins (fpsgame/client.cpp's
++// clipexportapplysettings()), so pre-capture chatter (a start message, menu-era console
++// noise) cannot linger visibly into the exported video. The 120-second margin is
++// comfortably past confade/miniconfade's own max clamp of 60 (both VARPs above), regardless
++// of whatever either is currently set to.
++void expireconsolelines()
++{
++    loopv(conlines) conlines[i].outtime = totalmillis - 120000;
++}
++
+ int drawconlines(int conskip, int confade, int conwidth, int conheight, int conoff, int filter, int y = 0, int dir = 1)
+ {
+     filter &= CON_FLAGS;
 --- a/shared/iengine.h
 +++ b/shared/iengine.h
 @@ -53,6 +53,48 @@
@@ -1747,9 +1773,17 @@
  extern bool settexture(const char *name, int clamp = 0);
  
  // octaedit
+@@ -203,6 +245,7 @@
+ extern void conoutf(int type, const char *s, ...) PRINTFARGS(2, 3);
+ extern void conoutf(int type, int tag, const char *s, ...) PRINTFARGS(3, 4);
+ extern void conoutfv(int type, const char *fmt, va_list args);
++extern void expireconsolelines(); // SwiftGibs clip export (Task 3, fix round 1): engine/console.cpp - forces the on-screen fade timer of every EXISTING console line into the past (see that function's own doc comment for why, and why this is not clearconsole())
+ 
+ extern FILE *getlogfile();
+ extern void setlogfile(const char *fname);
 --- a/fpsgame/game.h
 +++ b/fpsgame/game.h
-@@ -732,6 +732,7 @@
+@@ -733,6 +733,7 @@
      extern fpsent *hudplayer();
      extern fpsent *followingplayer(fpsent *fallback = NULL);
      extern void stopfollowing();
@@ -1757,7 +1791,7 @@
      extern void clientdisconnected(int cn, bool notify = true);
      extern void clearclients(bool notify = true);
      extern void startgame();
-@@ -840,6 +841,13 @@
+@@ -842,6 +843,14 @@
      extern bool cliprecordwasactivematch();                   // SwiftGibs fps stats (patches/18): was a
                                                                  // recording sink active at any point this
                                                                  // match - read once at match end, never per-frame
@@ -1768,6 +1802,7 @@
 +    // (cheap int compares) when no export is in progress - safe to call unconditionally.
 +    extern void checkclipexport();     // per-frame poll/state machine driver
 +    extern void clipexportonmapchange(); // startgame() interruption guard - only acts if a capture was already in progress (never the export's OWN initial map load, which also runs through startgame())
++    extern bool clipexportcapturing(); // fix round 1: is a capture actively running right now (WAITING doesn't count) - fpsgame/fps.cpp's gameplayhud() gates the SPECTATOR label on this so export-machinery text never gets suppressed by mistake, only ever the label itself, only while actually capturing
      extern int statuscolor(fpsent *d, int color);
  
      // render
@@ -1803,7 +1838,7 @@
      }
  
      VARP(teamcolorchat, 0, 1, 1);
-@@ -2000,6 +2011,841 @@
+@@ -2000,6 +2011,859 @@
      }
      // === end SwiftGibs instant replay: recording modes =======================================
  
@@ -1968,6 +2003,7 @@
 +        if(screen) copystring(clipexportsavedtitle, SDL_GetWindowTitle(screen));
 +        else clipexportsavedtitle[0] = '\0';
 +        hidehud = clipexporthud ? 0 : 1;   // export look is deterministic either way: forced full HUD or forced clean, never "whatever hidehud happened to be"
++        expireconsolelines();   // fix round 1: forces every line already IN the on-screen console feed (menu-era chatter, anything left over from before this export was requested) to fade out immediately - engine/console.cpp, declared in shared/iengine.h. This runs long before the map even loads, so it cannot reach the "exporting clip..." start message printed once capture actually begins (checkclipexport(), below) - see the second expireconsolelines() call down there for that one. Unconditional (uniform regardless of clipexporthud) since fullconsole is always forced off too, whichever mode is active
 +        thirdperson = 0;   // first-person: hudplayer()/isthirdperson() (engine/rendergl.cpp) only bypass the followed target's POV when thirdperson is nonzero AND allowthirdperson() - forcing 0 guarantees the locked POV actually renders in first person
 +        // soundvol is deliberately left untouched now (see clipexportsound's own comment above) -
 +        // audio in the export comes from the same live Mix_SetPostMix stream the player hears, so
@@ -2435,6 +2471,17 @@
 +
 +            clipexportphase = CLIPEXPORT_CAPTURING;
 +            conoutf("exporting clip: %dx%d @ %dfps -> %s", clipexportwidth, clipexportheight, clipexportfps, clipexportoutpath);
++            // fix round 1: recorder::startpipe() (just above) already means capture is live THIS
++            // tick, so the conoutf line just above (plus whatever WAITING-phase chatter - join/
++            // map-load messages - had not scrolled/faded yet) is still sitting in the on-screen
++            // feed the instant frames start flowing to ffmpeg; expiring here, AFTER it is printed,
++            // retroactively fades that exact line (and any leftover WAITING-phase chatter) out
++            // before the first captured frame, while still leaving it in a real interactive
++            // session's scrollback/full console. This is the actual moment capture begins (the
++            // clipexportapplysettings() call, way above in exportclip(), runs long before the map
++            // even loads, so it only ever catches menu-era chatter from before export was
++            // requested - it cannot reach this line, which is added after that).
++            expireconsolelines();
 +            return;
 +        }
 +
@@ -2476,7 +2523,7 @@
 +            if(secs > 0 && secs%10 == 0)
 +            {
 +                static int lastlogsecs = -1;
-+                if(secs != lastlogsecs) { lastlogsecs = secs; conoutf("clip export progress: %ds captured (%d frames, %d duplicated/skipped to hold timing)", secs, frames, dropped); }
++                if(secs != lastlogsecs) { lastlogsecs = secs; logoutf("clip export progress: %ds captured (%d frames, %d duplicated/skipped to hold timing)", secs, frames, dropped); }   // fix round 1: logoutf, not conoutf - getlogfile() falls back to stdout with no log file set (engine/server.cpp), so a Linux terminal still sees progress, but it never reaches the on-screen console feed (conlines) captured into the video
 +            }
 +        }
 +        if(!recorder::isrecording()) { clipexportabort("ffmpeg failed or capture stopped unexpectedly"); return; }
@@ -2627,8 +2674,14 @@
 +    }
 +    COMMAND(cancelclipexport, "");
 +
++    // fix round 1: cross-file accessor (fpsgame/fps.cpp's gameplayhud(), via the extern
++    // declaration in fpsgame/game.h) - same pattern as cliprecordwasactivematch() (patches/17)
++    // just reused here rather than duplicated, so the ICOMMAND below and the HUD gate can never
++    // drift out of sync with each other.
++    bool clipexportcapturing() { return clipexportphase == CLIPEXPORT_CAPTURING; }
++
 +    ICOMMAND(clipexportactive, "", (), intret(clipexportphase != CLIPEXPORT_IDLE ? 1 : 0));
-+    ICOMMAND(clipexportcapturing, "", (), intret(clipexportphase == CLIPEXPORT_CAPTURING ? 1 : 0));
++    ICOMMAND(clipexportcapturing, "", (), intret(clipexportcapturing() ? 1 : 0));
 +    ICOMMAND(clipexportprogress, "", (), intret((int)recorder::exportframessofar()));
 +    ICOMMAND(clipexportdropped, "", (), intret((int)(recorder::duplicatedframes() + recorder::skippedpadframes())));
 +
@@ -2645,7 +2698,7 @@
      void c2sinfo(bool force) // send update to the server
      {
          static int lastupdate = -1000;
-@@ -2788,6 +3634,13 @@
+@@ -2788,6 +3652,13 @@
                  player1->clientnum = getint(p);
                  gamepaused = false;
                  execident(on ? "demostart" : "demoend");
@@ -2661,7 +2714,7 @@
  
 --- a/fpsgame/fps.cpp
 +++ b/fpsgame/fps.cpp
-@@ -240,6 +240,15 @@
+@@ -255,6 +255,15 @@
      void checkautorespawn();   // SwiftGibs Task 7: defined below, after the cue-demo helpers it checks
      void updateworld()        // main game update loop
      {
@@ -2677,7 +2730,7 @@
          updatereloadmetronome();
          if(!maptime) { maptime = lastmillis; maprealtime = totalmillis; return; }
          if(!curtime) { gets2c(); if(player1->clientnum>=0) c2sinfo(); return; }
-@@ -1106,6 +1115,13 @@
+@@ -1121,6 +1130,13 @@
          // returns) would still be stale/empty.
          cliprecordfinalizeall("map change");
          cliprecordarmmatchstart();
@@ -2691,4 +2744,12 @@
  
          clearmovables();
          clearmonsters();
-
+@@ -2185,7 +2201,7 @@
+         hudmatrix.scale(h/1800.0f, h/1800.0f, 1);
+         flushhudmatrix();
+ 
+-        if(player1->state==CS_SPECTATOR)
++        if(player1->state==CS_SPECTATOR && !clipexportcapturing()) // fix round 1: suppress the stock SPECTATOR label only while a clip export capture is actively running (fpsgame/client.cpp, patches/19) - normal in-game spectating/clip-watching still shows it exactly as before
+         {
+             int pw, ph, tw, th, fw, fh;
+             text_bounds("  ", pw, ph);
