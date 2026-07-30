@@ -17,7 +17,7 @@
 # just a build nuisance.
 #
 # ffmpeg's own GPLv3 licence text is NOT re-fetched per platform - the copies bundled inside the
-# Linux (johnvansickle.com) and Windows (gyan.dev) archives are byte-identical (checked), so a
+# Linux (BtbN/FFmpeg-Builds) and Windows (gyan.dev) archives are byte-identical (checked), so a
 # single verbatim copy is committed at build/ffmpeg-licence/GPLv3.txt and reused for all three
 # platforms, including macOS (whose own archive ships no licence file at all).
 #
@@ -31,14 +31,24 @@ CACHE="${SG_FFMPEG_CACHE:-/tmp/sg-ffmpeg-cache}/$PLATFORM"
 
 case "$PLATFORM" in
   linux)
-    # johnvansickle.com: the long-established, widely-used static-Linux-ffmpeg source (GPLv3,
-    # genuinely fully static - no dynamic deps at all, confirmed via ldd). Notably smaller than
-    # the alternatives checked (BtbN/FFmpeg-Builds' equivalent GPL static tar.xz is ~125MB vs
-    # this ~40MB), which matters given the size budget - see docs/ffmpeg-provenance.md.
-    URL="https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
-    SHA256="abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67"
-    ARCHIVE_NAME="ffmpeg-release-amd64-static.tar.xz"
-    ARCHIVE_BIN_PATH="ffmpeg-7.0.2-amd64-static/ffmpeg"     # update this prefix if SHA256/version above is ever repinned
+    # BtbN/FFmpeg-Builds (GitHub): switched from johnvansickle.com 2026-07-30 because that
+    # source's own "corresponding source" pages (release-source/, git-source/) turned out to be
+    # six years stale (ffmpeg-4.1 and unpinned libx264/libvpx/libx265 snapshots, all dated
+    # 2018-11-10 - checked directly, not assumed) - not the actual GPL corresponding source for
+    # the 7.0.2 binary that was shipped. BtbN publishes genuine per-dependency build scripts with
+    # an EXACT pinned git commit for every statically-linked library (scripts.d/*.sh, one file per
+    # dependency, each with its own SCRIPT_REPO/SCRIPT_COMMIT) at the EXACT repo commit that built
+    # each release - see docs/ffmpeg-provenance.md for the exact pins this build was checked
+    # against. Deliberately pinned to a MONTH-END release tag (autobuild-2026-06-30-13-34), not
+    # the newest daily one: BtbN's retention policy keeps only the last 14 daily auto-builds but
+    # keeps the last build of every month for two years - a month-end tag is the only one that
+    # won't 404 within weeks. Larger than johnvansickle's build (~137MiB vs ~76MiB) - a deliberate
+    # trade for being able to actually provide correct corresponding source, not a size
+    # optimisation; see docs/ffmpeg-provenance.md's "Size impact" section.
+    URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-06-30-13-34/ffmpeg-n8.1.2-21-gce3c09c101-linux64-gpl-8.1.tar.xz"
+    SHA256="0ba73bbd93472c7622f6dec26d334c5e62e64d858d072490b2844320970456cd"
+    ARCHIVE_NAME="ffmpeg-n8.1.2-21-gce3c09c101-linux64-gpl-8.1.tar.xz"
+    ARCHIVE_BIN_PATH="ffmpeg-n8.1.2-21-gce3c09c101-linux64-gpl-8.1/bin/ffmpeg"     # update this prefix if SHA256/version above is ever repinned
     BINNAME="ffmpeg"
     ;;
   win)

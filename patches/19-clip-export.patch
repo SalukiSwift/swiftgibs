@@ -10,7 +10,7 @@
  	engine/rendermodel.o \
 --- a/engine/processpipe.h
 +++ b/engine/processpipe.h
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,194 @@
 +// engine/processpipe.h: controlled child-process launch with a writable
 +// pipe to the child's stdin.
 +//
@@ -175,11 +175,33 @@
 +// Safe to call on a pid/handle that has already exited or been reaped (a
 +// harmless signal-to-nobody, per kill()/TerminateProcess()'s own
 +// documented behaviour) PROVIDED the caller isn't holding a STALE pid the
-+// OS has since recycled for an unrelated process - satisfied by the
-+// watchdog's own design (it reads p.pid/p.process exactly once, before it
-+// is even created as a thread, and the owning thread never reaps - which
-+// is the only thing that could free the value for reuse - until after the
-+// watchdog has been joined).
++// OS has since recycled for an unrelated process - the invariant that
++// makes that provably true in general is "the owning thread never reaps -
++// the only thing that could free the value for reuse - until after the
++// watchdog has been joined" (satisfied by the watchdog's own design: it
++// reads p.pid/p.process exactly once, before it is even created as a
++// thread).
++//
++// ACCEPTED EXCEPTION, not an oversight: fpsgame/client.cpp's
++// clipexportonplaybackend() deliberately violates this invariant, TWICE
++// per export when audio is enabled (see engine/movie.cpp's pipewriter and
++// that function's own inline comments) - it calls closeprocesspipe() (which
++// DOES reap, mutating p.pid/p.process) for the video pass, and then again
++// for the follow-up audio-mux pass, both while the SAME watchdog thread is
++// still running and could concurrently call requestchildkill() on the
++// struct being reaped. This is intentional: the alternative (joining the
++// watchdog before each closeprocesspipe() call) was the ORIGINAL, WORSE bug
++// a critical review fix corrected - closeprocesspipe()'s blocking wait has
++// no timeout of its own, so with no watchdog left alive to rescue it, a
++// child that hangs after seeing EOF would freeze the main thread forever.
++// Reaping first and joining last, twice over, trades that deterministic
++// hang for an unsynchronised read/write race on a plain int/HANDLE: the
++// realistic worst case is a redundant, harmless signal-to-a-pid-not-yet-
++// overwritten, or (astronomically unlikely, since the OS cannot reissue a
++// pid before this process's own waitpid()/GetExitCodeProcess() call has
++// already collected it) a signal to an unrelated freshly-spawned process.
++// Both outcomes are accepted, documented risk, not a silently missed case -
++// see clipexportonplaybackend()'s own comments for the exact sequencing.
 +extern void requestchildkill(const processpipe &p);
 +
 +#endif
