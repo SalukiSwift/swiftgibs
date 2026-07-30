@@ -1419,7 +1419,7 @@
  #endif
 --- a/shared/iengine.h
 +++ b/shared/iengine.h
-@@ -53,6 +53,38 @@
+@@ -53,6 +53,40 @@
  extern int thirdperson;
  extern bool isthirdperson();
  
@@ -1431,6 +1431,8 @@
 +extern int hidehud;
 +extern int fov;
 +extern int soundvol;
++extern int fullconsole;   // engine/console.cpp - review fix: renderconsole()'s hidehud gate is "!hidehud || fullconsole", so fullconsole must be forced off too during export or console text bypasses the HUD suppression
++extern void clearguis(int level);   // engine/menus.cpp (defined with a default there; NOT repeated here - engine/menus.cpp's own translation unit sees BOTH declarations via engine.h's #include of this file, and a default argument may only be specified once per scope, so callers outside engine/menus.cpp must pass level explicitly, e.g. clearguis(-1) for "clear everything") - review fix: gl_drawhud() calls g3d_render() (in-world menus) unconditionally, with no hidehud gate at all, so export must actively close any open menu rather than relying on hidehud
 +
 +// SwiftGibs clip export (Task 3): the subset of engine/engine.h's
 +// `namespace recorder` declarations that game-side export orchestration
@@ -1514,7 +1516,7 @@
      }
  
      VARP(teamcolorchat, 0, 1, 1);
-@@ -1980,6 +1991,462 @@
+@@ -1980,6 +1991,511 @@
      }
      // === end SwiftGibs instant replay: recording modes =======================================
  
@@ -1562,9 +1564,31 @@
 +    // pre-existing clip from her Desktop bundle, see the task report.
 +
 +    SVARP(videodir, "videos");     // export output folder, same convention as clipdir/screenshotdir - created on demand via findfile(...,"w"), same as both of those
-+    SVARP(clipexportffmpeg, "");   // absolute path to the ffmpeg binary to invoke - empty until Task 4 bundles one; set this to test (e.g. "clipexportffmpeg /usr/bin/ffmpeg")
++    SVARP(clipexportffmpeg, "");   // absolute path to the ffmpeg binary to invoke - EMPTY (the shipped default) means "use the bundled copy next to the game" (clipexportdefaultffmpeg, below); set this to an absolute path to use a different ffmpeg instead (e.g. "clipexportffmpeg /usr/bin/ffmpeg", how this was tested before bundling existed)
 +    VARP(clipexportstalltimeout, 2, 8, 60);    // seconds of no encoder progress before the watchdog presumes ffmpeg wedged and force-kills it
 +    VARP(clipexportfinishtimeout, 2, 15, 120); // seconds given to ffmpeg to drain+exit after end-of-clip before the watchdog force-kills it instead
++
++    // Where the bundled ffmpeg lives when clipexportffmpeg (above) is left at its default empty
++    // string: a fixed path relative to the CURRENT DIRECTORY the game process was launched
++    // from - never searched via PATH. All three shipped launchers guarantee that directory is
++    // the game/app root: the Linux launcher `cd`s into it before exec, the Windows launcher's
++    // implicit cwd is wherever swiftgibs.bat was double-clicked (the bundle root, since `start`
++    // inherits cwd), and the macOS .app chdir's to Contents/Resources at startup (the
++    // mac-datadir patch) - the same root data/ and packages/ already live in. A relative path
++    // containing a directory separator is resolved by both posix_spawn() (engine/processpipe.cpp)
++    // and Win32 CreateProcess() purely against that current directory, with no PATH search
++    // either way - confirmed by reading both implementations, not assumed (see
++    // engine/processpipe.cpp: posix_spawn(&pid, argv[0], ...) on POSIX never consults PATH for a
++    // path containing '/'; CreateProcessA(argv[0], ...) on Windows only falls back to the
++    // PATH-search sequence when the module name has NO directory component at all). See
++    // build/make-bundle-*.sh and docs/ffmpeg-provenance.md for where this file comes from, its
++    // exact version/checksum, and its licence.
++#ifdef WIN32
++    static const char *const clipexportdefaultffmpeg = "ffmpeg/ffmpeg.exe";
++#else
++    static const char *const clipexportdefaultffmpeg = "ffmpeg/ffmpeg";
++#endif
++    static string clipexportffmpegpath = ""; // clipexportffmpeg if set, else clipexportdefaultffmpeg - resolved and existence-checked once in exportclip(), then reused unchanged for the rest of that export (see the WAITING->CAPTURING argv build below)
 +
 +    enum { CLIPEXPORT_IDLE = 0, CLIPEXPORT_WAITING, CLIPEXPORT_CAPTURING };
 +
@@ -1588,7 +1612,7 @@
 +    // wrong if something went badly enough), engine/movie.cpp's pipewriter simply ignores it
 +    // (moviewriter::blockwhenfull()) - see the task report for the reasoning.
 +    static bool clipexportsettingsapplied = false;
-+    static int clipexportsavedhidehud = 0, clipexportsavedthirdperson = 0, clipexportsavedsoundvol = 255;
++    static int clipexportsavedhidehud = 0, clipexportsavedthirdperson = 0, clipexportsavedsoundvol = 255, clipexportsavedfullconsole = 0;
 +
 +    static void clipexportapplysettings()
 +    {
@@ -1596,9 +1620,12 @@
 +        clipexportsavedhidehud = hidehud;
 +        clipexportsavedthirdperson = thirdperson;
 +        clipexportsavedsoundvol = soundvol;
++        clipexportsavedfullconsole = fullconsole;
 +        hidehud = 1;       // clean capture: no HUD/crosshair/console (the SwiftGibs overlays piggyback on this same var - see fpsgame/fps.cpp's gameplayhud() comment)
 +        thirdperson = 0;   // first-person: hudplayer()/isthirdperson() (engine/rendergl.cpp) only bypass the followed target's POV when thirdperson is nonzero AND allowthirdperson() - forcing 0 guarantees the locked POV actually renders in first person
 +        soundvol = 0;      // courtesy mute: export is real-time foreground playback (the design doc is explicit this takes at least as long as the clip), and the piped output never carries audio yet (task 2's documented limitation) regardless of this setting
++        fullconsole = 0;   // review fix: renderconsole()'s gate (engine/rendergl.cpp) is "!hidehud || fullconsole" - fullconsole BYPASSES hidehud entirely, so a player with it toggled on would otherwise get console text burned into the video
++        clearguis(-1);     // -1 = clear the whole gui stack (clearguis()'s own default, repeated explicitly here - see the extern declaration in shared/iengine.h for why). review fix: gl_drawhud()'s g3d_render() call (engine/rendergl.cpp) has no hidehud gate at all (unlike gameplayhud/drawcrosshair/renderconsole) - closing whatever menu launched the export (Task 5's clips-page row) is the only thing that actually keeps it out of the opening frames
 +        clipexportsettingsapplied = true;
 +    }
 +
@@ -1608,6 +1635,7 @@
 +        hidehud = clipexportsavedhidehud;
 +        thirdperson = clipexportsavedthirdperson;
 +        soundvol = clipexportsavedsoundvol;
++        fullconsole = clipexportsavedfullconsole;
 +        clipexportsettingsapplied = false;
 +        stopfollowing(); // release the POV lock regardless of player1's current state - stopfollowing() only requires following>=0, not CS_SPECTATOR (unlike engaging follow()), so this is always safe to call
 +    }
@@ -1743,8 +1771,26 @@
 +        clipexportwdfinishdeadline = (int)SDL_GetTicks() + clipexportfinishtimeout*1000;
 +
 +        recorder::stop();                                       // encoder finishes delivering whatever's already queued, then its thread exits
-+        clipexportstopwatchdog();
-+        int exitcode = closeprocesspipe(clipexportpipe);         // close our end (ffmpeg sees EOF), wait for it to finish encoding and exit, reap it - bounded by the watchdog's finishing deadline above, not an unbounded wait
++
++        // CRITICAL review fix: the watchdog must stay ALIVE across this next call.
++        // closeprocesspipe() does a plain blocking waitpid() with no timeout of its own, waiting
++        // for ffmpeg to exit after seeing EOF. If ffmpeg accepts every frame normally but never
++        // exits, this hangs the MAIN THREAD forever - freezing the whole game (no UI left to
++        // cancel from) with clipexportrestoresettings() below never reached. Empirically
++        // reproduced by review with a fake ffmpeg that reads all stdin then sleeps: stopping the
++        // watchdog BEFORE this call (the original bug here) disarms exactly the mechanism meant
++        // to catch it. clipexportwdfinishing/clipexportwdfinishdeadline are already armed above
++        // (set the moment capture ended, before recorder::stop()) - if the deadline passes while
++        // this call is still blocked in waitpid(), the still-running watchdog thread calls
++        // requestchildkill() to force the child to exit, unblocking the wait, exactly like the
++        // WAITING-phase and stalled-capture cases already do. (This does mean
++        // requestchildkill()'s read of clipexportpipe.pid can race with this call's own eventual
++        // write of clipexportpipe.pid=-1 once the reap completes - an unsynchronised read/write
++        // of a plain int, same accepted-risk category as this codebase's other cross-thread
++        // flags; worst case is a redundant/no-op signal, not a crash. See processpipe.h's own
++        // doc comment on requestchildkill() for the general reasoning this leans on.)
++        int exitcode = closeprocesspipe(clipexportpipe);         // close our end (ffmpeg sees EOF), wait for it to finish encoding and exit, reap it - the STILL-RUNNING watchdog is what actually bounds this wait, not this call itself
++        clipexportstopwatchdog();                                 // NOW join - safe/fast, since whatever the watchdog was guarding against is already resolved (ffmpeg exited on its own, or the watchdog already killed it)
 +
 +        clipexportrestoresettings();
 +
@@ -1818,7 +1864,7 @@
 +            const char *resolvedout = findfile(clipexportoutpath, "w");
 +            const char *argv[32];
 +            int argc = 0;
-+            argv[argc++] = clipexportffmpeg;
++            argv[argc++] = clipexportffmpegpath;
 +            argv[argc++] = "-y";
 +            argv[argc++] = "-hide_banner";
 +            argv[argc++] = "-loglevel"; argv[argc++] = "error";
@@ -1904,7 +1950,12 @@
 +        if(clipexportphase != CLIPEXPORT_IDLE) { conoutf(CON_ERROR, "exportclip: an export is already in progress (cancelclipexport to stop it)"); return; }
 +        if(connected) { conoutf(CON_ERROR, "exportclip: disconnect first - clip export can't run during live play"); return; }
 +        if(!name[0]) { conoutf(CON_ERROR, "exportclip: no clip name given"); return; }
-+        if(!clipexportffmpeg[0]) { conoutf(CON_ERROR, "exportclip: no ffmpeg binary configured (clipexportffmpeg) - bundling is Task 4; set clipexportffmpeg to a path to test export now"); return; }
++        copystring(clipexportffmpegpath, clipexportffmpeg[0] ? clipexportffmpeg : clipexportdefaultffmpeg);
++        if(!fileexists(clipexportffmpegpath, "r"))
++        {
++            conoutf(CON_ERROR, "exportclip: ffmpeg binary not found at \"%s\" (looked next to the game install, never on PATH) - this install may be missing it or be broken; redownload SwiftGibs, or set clipexportffmpeg to point at another ffmpeg to use instead", clipexportffmpegpath);
++            return;
++        }
 +        if(*width < 2 || *height < 2 || *width > 10000 || *height > 10000) { conoutf(CON_ERROR, "exportclip: bad resolution"); return; }
 +        if(*fps < 1 || *fps > 1000) { conoutf(CON_ERROR, "exportclip: bad fps"); return; }
 +
@@ -1977,7 +2028,7 @@
      void c2sinfo(bool force) // send update to the server
      {
          static int lastupdate = -1000;
-@@ -2768,6 +3235,13 @@
+@@ -2768,6 +3284,13 @@
                  player1->clientnum = getint(p);
                  gamepaused = false;
                  execident(on ? "demostart" : "demoend");

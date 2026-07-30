@@ -42,6 +42,17 @@ rm -f "$OUT/autoexec.source.cfg"   # internal reference file, don't ship
 "$ROOT/build/integrate-menus.sh" "$OUT"
 rm -f "$OUT/config.cfg" "$OUT/init.cfg"   # fresh VARP defaults + native-resolution auto-detect
 
+# 4c) bundled ffmpeg (video export, clip-export feature): its own directory, sibling of bin64/
+# data/packages, matching the engine's default clipexportffmpeg lookup path (ffmpeg/ffmpeg.exe,
+# resolved relative to cwd - CreateProcess never searches PATH for a relative path that contains
+# a directory separator, and cwd here is $OUT since swiftgibs.bat below launches from wherever it
+# was double-clicked). GPL-licensed, never linked into the engine - see
+# build/ffmpeg-licence/NOTICE.txt and docs/ffmpeg-provenance.md for exact version/checksum/
+# source. Windows-only binary; nothing from another platform ends up in this bundle.
+FFMPEG_DIR="$("$ROOT/build/fetch-ffmpeg.sh" win)"
+mkdir -p "$OUT/ffmpeg"
+cp "$FFMPEG_DIR/ffmpeg.exe" "$FFMPEG_DIR/LICENSE.txt" "$FFMPEG_DIR/NOTICE.txt" "$OUT/ffmpeg/"
+
 # 5) portable launcher: '.' = home dir, so our root autoexec.cfg loads
 printf '@echo off\r\nstart bin64\\sauerbraten.exe -q.\r\n' > "$OUT/swiftgibs.bat"
 

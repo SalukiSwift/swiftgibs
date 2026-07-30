@@ -59,6 +59,20 @@ rm -f "$RES/autoexec.source.cfg"
 "$ROOT/build/integrate-menus.sh" "$RES"
 rm -f "$RES/config.cfg" "$RES/init.cfg"
 
+# 4c) bundled ffmpeg (video export, clip-export feature): its own directory inside
+# Contents/Resources, sibling of data/packages, matching the engine's default clipexportffmpeg
+# lookup path (ffmpeg/ffmpeg, resolved relative to cwd - the mac-datadir patch chdir's the
+# engine to Contents/Resources at startup, so that's cwd here too). GPL-licensed, never linked
+# into the engine - see build/ffmpeg-licence/NOTICE.txt and docs/ffmpeg-provenance.md for exact
+# version/checksum/source. macOS arm64-only binary; nothing from another platform ends up in
+# this bundle. MUST happen before the re-sign step below - codesign/rcodesign seals whatever is
+# in the bundle at the moment it runs, and a file added afterwards would not be covered by the
+# seal (Gatekeeper would then refuse the whole .app).
+FFMPEG_DIR="$("$ROOT/build/fetch-ffmpeg.sh" mac)"
+mkdir -p "$RES/ffmpeg"
+cp "$FFMPEG_DIR/ffmpeg" "$FFMPEG_DIR/LICENSE.txt" "$FFMPEG_DIR/NOTICE.txt" "$RES/ffmpeg/"
+chmod +x "$RES/ffmpeg/ffmpeg"
+
 # 5) RE-SIGN the whole bundle now that data is inside Contents/Resources. The code-only seal only
 #    covered the binary + frameworks; adding data invalidates the CodeResources seal, and the arm64
 #    binary + frameworks must stay validly signed (mandatory for Apple Silicon to run them).

@@ -1,0 +1,15 @@
+This directory ships a prebuilt ffmpeg binary, used by SwiftGibs' clip video export feature to
+compress captured gameplay into MP4/WebM.
+
+ffmpeg is a separate, independent program. SwiftGibs runs it as its own child process (fed
+through a pipe) - ffmpeg's code is never linked into, compiled with, or modified by SwiftGibs.
+It is NOT part of SwiftGibs' own zlib-licensed code, and this bundling does not change
+SwiftGibs' licence.
+
+ffmpeg is Copyright (c) the FFmpeg developers (https://ffmpeg.org) and this build is licensed
+under the GNU General Public License version 3 (GPLv3) - see LICENSE.txt in this same
+directory for the full licence text.
+
+The exact build used here (which provider, version, SHA-256 checksum, and a link to the
+corresponding source) is recorded in docs/ffmpeg-provenance.md in the SwiftGibs source repo:
+https://github.com/SalukiSwift/swiftgibs/blob/master/docs/ffmpeg-provenance.md

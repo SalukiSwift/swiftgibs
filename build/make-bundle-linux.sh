@@ -20,6 +20,17 @@ cp -a "$ROOT/overlay/." "$OUT/"; rm -f "$OUT/autoexec.source.cfg"
 "$ROOT/build/integrate-menus.sh" "$OUT"
 rm -f "$OUT/config.cfg" "$OUT/init.cfg"
 
+# Bundled ffmpeg (video export, clip-export feature): its own directory, sibling of bin/data/
+# packages, matching the engine's default clipexportffmpeg lookup path (ffmpeg/ffmpeg, resolved
+# relative to cwd - guaranteed to be $OUT since swiftgibs.sh below `cd`s here first). GPL-licensed,
+# never linked into the engine - see build/ffmpeg-licence/NOTICE.txt and
+# docs/ffmpeg-provenance.md for exact version/checksum/source. Linux-only binary; nothing from
+# another platform ends up in this bundle.
+FFMPEG_DIR="$("$ROOT/build/fetch-ffmpeg.sh" linux)"
+mkdir -p "$OUT/ffmpeg"
+cp "$FFMPEG_DIR/ffmpeg" "$FFMPEG_DIR/LICENSE.txt" "$FFMPEG_DIR/NOTICE.txt" "$OUT/ffmpeg/"
+chmod +x "$OUT/ffmpeg/ffmpeg"
+
 cat > "$OUT/swiftgibs.sh" <<'SH'
 #!/usr/bin/env bash
 cd "$(dirname "$0")" && exec ./bin/swiftgibs -q.

@@ -114,5 +114,6 @@ SwiftGibs is a modified build of Cube 2: Sauerbraten, created by Wouter van Oort
 
 - Engine code is under the zlib license (see `vendor/sauer2020/`). SwiftGibs' modifications are provided under the same license and are plainly marked as an altered version.
 - Game content (maps, textures, models, sounds) ships under its original licenses; the license files travel inside each release bundle.
+- Clip video export bundles [ffmpeg](https://ffmpeg.org/) - a separate, independent program, run as its own process and never linked into the engine, so SwiftGibs itself stays zlib licensed. ffmpeg is Copyright (c) the FFmpeg developers and is **not** SwiftGibs' code; the bundled build is licensed under the GNU General Public License version 3 (GPLv3), with the full license text shipped in every release's `ffmpeg/` folder alongside the binary. Exact version, checksum, and source for each platform's build are recorded in `docs/ffmpeg-provenance.md`.
 
 SwiftGibs is a fan-made competitive config, not affiliated with or endorsed by the Sauerbraten project.
