@@ -312,7 +312,34 @@
                  }
                  sendclientpacket(q.finalize(), 0);
                  break;
-@@ -1298,12 +1326,664 @@
+@@ -1262,6 +1290,26 @@
+         }
+     }
+ 
++    // SwiftGibs: the server never echoes our own N_SHOTFX back either (it broadcasts it to
++    // everyone EXCEPT us - fpsgame/server.cpp's "rii9x" sendf with ci->ownernum excluded), so
++    // without this record a clip plays back with the recorder's gun silent, beamless and
++    // unanimated. Mirror the server's exact payload (see case N_SHOTFX in parsemessages) on
++    // the reliable channel. Same gating as the own-position synthesiser above.
++    void cliprecordownshot(int id, int gun, const vec &from, const vec &to)
++    {
++        if(demoplayback) return;
++        if(!(clipactive() || clipanysinkactive())) return;
++        if(player1->clientnum < 0) return;
++        packetbuf q(48);
++        putint(q, N_SHOTFX);
++        putint(q, player1->clientnum);
++        putint(q, gun);
++        putint(q, id);
++        putint(q, int(from.x*DMF)); putint(q, int(from.y*DMF)); putint(q, int(from.z*DMF));
++        putint(q, int(to.x*DMF)); putint(q, int(to.y*DMF)); putint(q, int(to.z*DMF));
++        cliprecord(1, q.buf, q.len);
++    }
++
+     void sendmessages()
+     {
+         packetbuf p(MAXTRANS);
+@@ -1298,12 +1346,664 @@
          sendclientpacket(p.finalize(), 1);
      }
  
@@ -977,7 +1004,7 @@
          sendmessages();
          flushclient();
      }
-@@ -1803,6 +2483,26 @@
+@@ -1803,6 +2503,26 @@
                      if(killstreak > beststreak) beststreak = killstreak;
                      if(killstreak > matchbeststreak) matchbeststreak = killstreak;
                      if(killstreak % 5 == 0 && killstreak <= 20) killstreakmilestone(killstreak/5);
@@ -1038,7 +1065,7 @@
  extern void genprivkey(const char *seed, vector<char> &privstr, vector<char> &pubstr);
 --- a/fpsgame/game.h
 +++ b/fpsgame/game.h
-@@ -829,6 +829,17 @@
+@@ -829,6 +829,18 @@
      extern void getbestteams(vector<const char *> &best);
      extern void clearteaminfo();
      extern void setteaminfo(const char *team, int frags);
@@ -1047,6 +1074,7 @@
 +    // (startgame()/timeupdate()/gameplayhud() all live there), implemented in fpsgame/client.cpp
 +    // alongside the rest of the clip machinery - same cross-file pattern as getteaminfos() above.
 +    extern void cliprecordfinalizeall(const char *reason);   // finalise+save any in-progress recording(s)
++    extern void cliprecordownshot(int id, int gun, const vec &from, const vec &to);   // SwiftGibs: own-shot record for clips
 +    extern void cliprecordarmmatchstart();                   // arm always-on to (maybe) start next tick
 +    extern bool cliprecordmanualactive();                    // for the on-screen indicator
 +    extern bool cliprecordautoactive();                      // for the on-screen indicator
@@ -1179,3 +1207,13 @@
          if(!hitmarkerdemoing()) drawhitmarker(w, h);
          if(!streakfxdemoing()) drawstreakfx(w, h);
  
+--- a/fpsgame/weapon.cpp
++++ b/fpsgame/weapon.cpp
+@@ -831,6 +831,7 @@
+ 
+         if(d==player1 || d->ai)
+         {
++            if(d==player1) cliprecordownshot(lastmillis-maptime, d->gunselect, from, to);   // SwiftGibs: clips
+             addmsg(N_SHOOT, "rci2i6iv", d, lastmillis-maptime, d->gunselect,
+                    (int)(from.x*DMF), (int)(from.y*DMF), (int)(from.z*DMF),
+                    (int)(to.x*DMF), (int)(to.y*DMF), (int)(to.z*DMF),
