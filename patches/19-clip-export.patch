@@ -10,7 +10,7 @@
  	engine/rendermodel.o \
 --- a/engine/processpipe.h
 +++ b/engine/processpipe.h
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,144 @@
 +// engine/processpipe.h: controlled child-process launch with a writable
 +// pipe to the child's stdin.
 +//
@@ -32,6 +32,16 @@
 +#ifndef __PROCESSPIPE_H__
 +#define __PROCESSPIPE_H__
 +
++// Forward declaration of killprocesspipe (full doc comment is with the
++// other three functions below) so that processpipe's own destructor -
++// defence in depth for callers with many exit paths (cancellation,
++// failure, clip-end) that might forget to close explicitly - can call it.
++// Kept as a plain forward declaration rather than reordering the whole
++// file so the four operations stay documented together, in the order a
++// caller uses them.
++struct processpipe;
++extern void killprocesspipe(processpipe &p);
++
 +struct processpipe
 +{
 +#ifdef WIN32
@@ -51,6 +61,39 @@
 +#endif
 +        isopen(false)
 +    {}
++
++    // RAII backstop: if a caller's processpipe goes out of scope still
++    // open (an exception-free codebase, but there are still plenty of
++    // early-return exit paths - failure, cancellation, a clip ending
++    // early), force-close/reap rather than leaking the fd/handle and
++    // orphaning the child. This is a backstop, not licence to skip the
++    // explicit closeprocesspipe()/killprocesspipe() call on the normal
++    // path - it forcibly kills rather than giving ffmpeg a chance to
++    // finish writing its output cleanly.
++    ~processpipe() { if(isopen) killprocesspipe(*this); }
++
++    // Resets to the same just-constructed (not-open) state. Used
++    // internally by openprocesspipe() instead of the old "p =
++    // processpipe()" idiom, now that processpipe cannot be copied (see
++    // below) - a byte-for-byte copy would leave two structs both believing
++    // they own the same fd/handle, risking a double-close or double-reap
++    // of the same child.
++    void clear()
++    {
++#ifdef WIN32
++        process = NULL; writepipe = NULL;
++#else
++        pid = -1; writefd = -1;
++#endif
++        isopen = false;
++    }
++
++private:
++    // Noncopyable (pre-C++11 style: declared, never defined). Same
++    // reasoning as the destructor comment above - copying would duplicate
++    // ownership of one fd/handle across two live structs.
++    processpipe(const processpipe &);
++    processpipe &operator=(const processpipe &);
 +};
 +
 +// Spawns argv[0] with arguments argv[1..], connecting its standard input to
@@ -59,6 +102,18 @@
 +// string. Returns false (and leaks nothing - all handles/descriptors this
 +// call created are cleaned up) if the pipe couldn't be created or the
 +// child couldn't be launched at all.
++//
++// p must not already be open. In a debug build (_DEBUG) that is an
++// immediate ASSERT abort - reusing a struct for a new child without
++// closing the old one first is a caller bug, and process teardown on abort
++// still closes the leaked fd/handle and lets the orphaned child see EOF
++// and exit on its own, so even the crash path doesn't leave a hung
++// process behind. In a release build (where ASSERT is a no-op and
++// execution continues past it) this instead force-closes/reaps whatever
++// was already there before proceeding, so a caller mistake here still
++// leaks nothing and orphans nothing outside a debug build - but the
++// correct sequence is always closeprocesspipe() or killprocesspipe()
++// before reopening; don't rely on either backstop.
 +extern bool openprocesspipe(processpipe &p, const char *const *argv);
 +
 +// Writes len bytes to the child's stdin, retrying on partial writes.
@@ -66,6 +121,21 @@
 +// closed/broken) or any other write error occurs; this is a normal,
 +// checked failure the caller should treat as an export error - it can
 +// never crash the game (SIGPIPE, where it exists, is ignored).
++//
++// BLOCKING CONTRACT: this is a plain blocking write (blocking fd write() on
++// POSIX, synchronous non-overlapped WriteFile() on Windows - no
++// O_NONBLOCK, no overlapped IO anywhere in this file). If the pipe is full
++// because the child is reading slower than this writes, the CALLING THREAD
++// blocks until the child drains it or the child dies (at which point this
++// returns false rather than blocking forever). It never partially
++// "succeeds" under backpressure and never fails just because the pipe is
++// momentarily full - backpressure is absorbed by blocking, not reported as
++// an error. Consequently: never call this from a thread that must stay
++// responsive (the main/render thread) - only from a thread that is allowed
++// to stall waiting for a slow or stuck consumer. Callers that need smooth
++// producer-side behaviour under a slow consumer must implement their own
++// drop-when-full queue upstream of this call, on a separate thread; this
++// function itself provides no non-blocking or dropping mode.
 +extern bool writeprocesspipe(processpipe &p, const void *data, size_t len);
 +
 +// Closes the write end of the pipe (so the child sees EOF on stdin), waits
@@ -87,7 +157,7 @@
 +#endif
 --- a/engine/processpipe.cpp
 +++ b/engine/processpipe.cpp
-@@ -0,0 +1,355 @@
+@@ -0,0 +1,372 @@
 +// engine/processpipe.cpp: controlled child-process launch with a writable
 +// pipe to its stdin. See processpipe.h for why this exists (the licensing
 +// boundary between zlib-licensed SwiftGibs and GPL ffmpeg builds) and what
@@ -199,7 +269,15 @@
 +
 +bool openprocesspipe(processpipe &p, const char *const *argv)
 +{
-+    p = processpipe();
++    // Reproduced leak, fixed per code review: reopening an already-open
++    // processpipe without closing it first used to just overwrite p in
++    // place, leaking the previous write handle/fd and orphaning the
++    // previous child. ASSERT flags the caller bug loudly in debug builds;
++    // either way, force-close/reap whatever was already there so a release
++    // build never leaks even if a caller gets this wrong.
++    ASSERT(!p.isopen);
++    killprocesspipe(p); // no-op if p isn't open
++    p.clear();
 +
 +    if(!argv || !argv[0])
 +    {
@@ -355,7 +433,16 @@
 +
 +bool openprocesspipe(processpipe &p, const char *const *argv)
 +{
-+    p = processpipe();
++    // Reproduced leak, fixed per code review: reopening an already-open
++    // processpipe without closing it first used to just overwrite p in
++    // place, leaking the previous write fd and orphaning the previous
++    // child (a zombie, since nothing would ever waitpid() it). ASSERT
++    // flags the caller bug loudly in debug builds; either way, force-
++    // close/reap whatever was already there so a release build never
++    // leaks even if a caller gets this wrong.
++    ASSERT(!p.isopen);
++    killprocesspipe(p); // no-op if p isn't open
++    p.clear();
 +    ignoresigpipe();
 +
 +    if(!argv || !argv[0])
@@ -443,3 +530,718 @@
 +}
 +
 +#endif
+--- a/engine/movie.cpp
++++ b/engine/movie.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include "engine.h"
+ #include "SDL_mixer.h"
++#include "processpipe.h"
+ 
+ VAR(dbgmovie, 0, 0, 1);
+ 
+@@ -31,27 +32,278 @@
+     avisegmentinfo(stream::offset offset, int firstindex) : offset(offset), videoindexoffset(0), soundindexoffset(0), firstindex(firstindex), videoindexsize(0), soundindexsize(0), indexframes(0), videoframes(0), soundframes(0) {}
+ };
+ 
+-struct aviwriter
++// VID_RGB: raw BGRA readback, not yet scaled to output size.
++// VID_YUV: BGRA already scaled to output size, still needs BGR->I420.
++// VID_YUV420: already-converted I420 straight off the accelerated FBO path.
++// Was a member enum of aviwriter; hoisted so both writer backends below
++// (and recorder::readbuffer(), which sets videobuffer::format to one of
++// these) can share it without a class qualifier.
++enum { VID_RGB = 0, VID_YUV, VID_YUV420 };
++
++// Common ground between the two things the recorder can feed captured
++// frames to: aviwriter (writes an uncompressed I420 AVI to disk - the
++// original vanilla recorder, used by the "movie" debug command, unchanged
++// below) and pipewriter (writes raw I420 frames to a child process's
++// stdin - the clip-export path, see recorder::startpipe() further down).
++// Both need byte-identical RGB/accelerated-YUV -> I420 conversion and the
++// same duplicate-frame timing rule, so that logic - scaleyuv/encodeyuv/
++// compressyuv and the lazily-allocated yuv scratch buffer - is factored out
++// here exactly as it was, just no longer duplicated. Everything GL/SDL
++// facing (readbuffer, the encoder thread, timing, drop accounting) lives in
++// the recorder namespace below and only ever talks to this interface, never
++// to aviwriter or pipewriter by name - that's what let the piped export
++// path reuse the whole capture pipeline instead of growing a second one.
++struct moviewriter
+ {
+-    stream *f;
++    uint videow, videoh, videofps, videoframes;
+     uchar *yuv;
+-    uint videoframes;
+-    stream::offset totalsize;
+-    const uint videow, videoh, videofps;
+-    string filename;
+- 
++
++    moviewriter(uint w, uint h, uint fps) : videow(w&~1), videoh(h&~1), videofps(fps), videoframes(0), yuv(NULL) {}
++    virtual ~moviewriter() { if(yuv) delete[] yuv; }
++
++    // Encodes one already-captured frame (pixels/srcw/srch/format exactly
++    // as recorder::readbuffer() produces them) as output frame number
++    // `frame`, writing it out however many times are needed to keep the
++    // output's frame count in step with real elapsed time. Returns false on
++    // an unrecoverable output error (caller sets state = REC_FILERROR).
++    virtual bool writevideoframe(const uchar *pixels, uint srcw, uint srch, int format, uint frame) = 0;
++    // No sound support for piped export yet (see the task 2 report) - the
++    // AVI writer overrides this with its real implementation; this default
++    // is only reachable if soundfrequency is 0, in which case the caller
++    // never calls it anyway.
++    virtual bool writesound(uchar *data, uint framesize, uint frame) { return true; }
++    virtual double filespaceguess() { return 0; }
++
+     int soundfrequency, soundchannels;
+     Uint16 soundformat;
+-    
++
++    static inline void boxsample(const uchar *src, const uint stride,
++                                 const uint area, const uint w, uint h,
++                                 const uint xlow, const uint xhigh, const uint ylow, const uint yhigh,
++                                 uint &bdst, uint &gdst, uint &rdst)
++    {
++        const uchar *end = &src[w<<2];
++        uint bt = 0, gt = 0, rt = 0;
++        for(const uchar *cur = &src[4]; cur < end; cur += 4)
++        {
++            bt += cur[0];
++            gt += cur[1];
++            rt += cur[2];
++        }
++        bt = ylow*(bt + ((src[0]*xlow + end[0]*xhigh)>>12));
++        gt = ylow*(gt + ((src[1]*xlow + end[1]*xhigh)>>12));
++        rt = ylow*(rt + ((src[2]*xlow + end[2]*xhigh)>>12));
++        if(h)
++        {
++            for(src += stride, end += stride; --h; src += stride, end += stride)
++            {
++                uint b = 0, g = 0, r = 0;
++                for(const uchar *cur = &src[4]; cur < end; cur += 4)
++                {
++                    b += cur[0];
++                    g += cur[1];
++                    r += cur[2];
++                }
++                bt += (b<<12) + src[0]*xlow + end[0]*xhigh;
++                gt += (g<<12) + src[1]*xlow + end[1]*xhigh;
++                rt += (r<<12) + src[2]*xlow + end[2]*xhigh;
++            }
++            uint b = 0, g = 0, r = 0;
++            for(const uchar *cur = &src[4]; cur < end; cur += 4)
++            {
++                b += cur[0];
++                g += cur[1];
++                r += cur[2];
++            }
++            bt += yhigh*(b + ((src[0]*xlow + end[0]*xhigh)>>12));
++            gt += yhigh*(g + ((src[1]*xlow + end[1]*xhigh)>>12));
++            rt += yhigh*(r + ((src[2]*xlow + end[2]*xhigh)>>12));
++        }
++        bdst = (bt*area)>>24;
++        gdst = (gt*area)>>24;
++        rdst = (rt*area)>>24;
++    }
++
++    void scaleyuv(const uchar *pixels, uint srcw, uint srch)
++    {
++        const int flip = -1;
++        const uint planesize = videow * videoh;
++        if(!yuv) yuv = new uchar[(planesize*3)/2];
++        uchar *yplane = yuv, *uplane = yuv + planesize, *vplane = yuv + planesize + planesize/4;
++        const int ystride = flip*int(videow), uvstride = flip*int(videow)/2;
++        if(flip < 0) { yplane -= int(videoh-1)*ystride; uplane -= int(videoh/2-1)*uvstride; vplane -= int(videoh/2-1)*uvstride; }
++
++        const uint stride = srcw<<2;
++        srcw &= ~1;
++        srch &= ~1;
++        const uint wfrac = (srcw<<12)/videow, hfrac = (srch<<12)/videoh,
++                   area = ((ullong)planesize<<12)/(srcw*srch + 1),
++                   dw = videow*wfrac, dh = videoh*hfrac;
++
++        for(uint y = 0; y < dh;)
++        {
++            uint yn = y + hfrac - 1, yi = y>>12, h = (yn>>12) - yi, ylow = ((yn|(-int(h)>>24))&0xFFFU) + 1 - (y&0xFFFU), yhigh = (yn&0xFFFU) + 1;
++            y += hfrac;
++            uint y2n = y + hfrac - 1, y2i = y>>12, h2 = (y2n>>12) - y2i, y2low = ((y2n|(-int(h2)>>24))&0xFFFU) + 1 - (y&0xFFFU), y2high = (y2n&0xFFFU) + 1;
++            y += hfrac;
++
++            const uchar *src = &pixels[yi*stride], *src2 = &pixels[y2i*stride];
++            uchar *ydst = yplane, *ydst2 = yplane + ystride, *udst = uplane, *vdst = vplane;
++            for(uint x = 0; x < dw;)
++            {
++                uint xn = x + wfrac - 1, xi = x>>12, w = (xn>>12) - xi, xlow = ((w+0xFFFU)&0x1000U) - (x&0xFFFU), xhigh = (xn&0xFFFU) + 1;
++                x += wfrac;
++                uint x2n = x + wfrac - 1, x2i = x>>12, w2 = (x2n>>12) - x2i, x2low = ((w2+0xFFFU)&0x1000U) - (x&0xFFFU), x2high = (x2n&0xFFFU) + 1;
++                x += wfrac;
++
++                uint b1, g1, r1, b2, g2, r2, b3, g3, r3, b4, g4, r4;
++                boxsample(&src[xi<<2], stride, area, w, h, xlow, xhigh, ylow, yhigh, b1, g1, r1);
++                boxsample(&src[x2i<<2], stride, area, w2, h, x2low, x2high, ylow, yhigh, b2, g2, r2);
++                boxsample(&src2[xi<<2], stride, area, w, h2, xlow, xhigh, y2low, y2high, b3, g3, r3);
++                boxsample(&src2[x2i<<2], stride, area, w2, h2, x2low, x2high, y2low, y2high, b4, g4, r4);
++
++
++                // Y  = 16 + 65.481*R + 128.553*G + 24.966*B
++                // Cb = 128 - 37.797*R - 74.203*G + 112.0*B
++                // Cr = 128 + 112.0*R - 93.786*G - 18.214*B
++                *ydst++ = ((16<<12) + 1052*r1 + 2065*g1 + 401*b1)>>12;
++                *ydst++ = ((16<<12) + 1052*r2 + 2065*g2 + 401*b2)>>12;
++                *ydst2++ = ((16<<12) + 1052*r3 + 2065*g3 + 401*b3)>>12;;
++                *ydst2++ = ((16<<12) + 1052*r4 + 2065*g4 + 401*b4)>>12;;
++
++                const uint b = b1 + b2 + b3 + b4,
++                           g = g1 + g2 + g3 + g4,
++                           r = r1 + r2 + r3 + r4;
++                // note: weights here are scaled by 1<<10, as opposed to 1<<12, since r/g/b are already *4
++                *udst++ = ((128<<12) - 152*r - 298*g + 450*b)>>12;
++                *vdst++ = ((128<<12) + 450*r - 377*g - 73*b)>>12;
++            }
++
++            yplane += 2*ystride;
++            uplane += uvstride;
++            vplane += uvstride;
++        }
++    }
++
++    void encodeyuv(const uchar *pixels)
++    {
++        const int flip = -1;
++        const uint planesize = videow * videoh;
++        if(!yuv) yuv = new uchar[(planesize*3)/2];
++        uchar *yplane = yuv, *uplane = yuv + planesize, *vplane = yuv + planesize + planesize/4;
++        const int ystride = flip*int(videow), uvstride = flip*int(videow)/2;
++        if(flip < 0) { yplane -= int(videoh-1)*ystride; uplane -= int(videoh/2-1)*uvstride; vplane -= int(videoh/2-1)*uvstride; }
++
++        const uint stride = videow<<2;
++        const uchar *src = pixels, *yend = src + videoh*stride;
++        while(src < yend)
++        {
++            const uchar *src2 = src + stride, *xend = src2;
++            uchar *ydst = yplane, *ydst2 = yplane + ystride, *udst = uplane, *vdst = vplane;
++            while(src < xend)
++            {
++                const uint b1 = src[0], g1 = src[1], r1 = src[2],
++                           b2 = src[4], g2 = src[5], r2 = src[6],
++                           b3 = src2[0], g3 = src2[1], r3 = src2[2],
++                           b4 = src2[4], g4 = src2[5], r4 = src2[6];
++
++                // Y  = 16 + 65.481*R + 128.553*G + 24.966*B
++                // Cb = 128 - 37.797*R - 74.203*G + 112.0*B
++                // Cr = 128 + 112.0*R - 93.786*G - 18.214*B
++                *ydst++ = ((16<<12) + 1052*r1 + 2065*g1 + 401*b1)>>12;
++                *ydst++ = ((16<<12) + 1052*r2 + 2065*g2 + 401*b2)>>12;
++                *ydst2++ = ((16<<12) + 1052*r3 + 2065*g3 + 401*b3)>>12;;
++                *ydst2++ = ((16<<12) + 1052*r4 + 2065*g4 + 401*b4)>>12;;
++
++                const uint b = b1 + b2 + b3 + b4,
++                           g = g1 + g2 + g3 + g4,
++                           r = r1 + r2 + r3 + r4;
++                // note: weights here are scaled by 1<<10, as opposed to 1<<12, since r/g/b are already *4
++                *udst++ = ((128<<12) - 152*r - 298*g + 450*b)>>12;
++                *vdst++ = ((128<<12) + 450*r - 377*g - 73*b)>>12;
++
++                src += 8;
++                src2 += 8;
++            }
++            src = src2;
++            yplane += 2*ystride;
++            uplane += uvstride;
++            vplane += uvstride;
++        }
++    }
++
++    void compressyuv(const uchar *pixels)
++    {
++        const int flip = -1;
++        const uint planesize = videow * videoh;
++        if(!yuv) yuv = new uchar[(planesize*3)/2];
++        uchar *yplane = yuv, *uplane = yuv + planesize, *vplane = yuv + planesize + planesize/4;
++        const int ystride = flip*int(videow), uvstride = flip*int(videow)/2;
++        if(flip < 0) { yplane -= int(videoh-1)*ystride; uplane -= int(videoh/2-1)*uvstride; vplane -= int(videoh/2-1)*uvstride; }
++
++        const uint stride = videow<<2;
++        const uchar *src = pixels, *yend = src + videoh*stride;
++        while(src < yend)
++        {
++            const uchar *src2 = src + stride, *xend = src2;
++            uchar *ydst = yplane, *ydst2 = yplane + ystride, *udst = uplane, *vdst = vplane;
++            while(src < xend)
++            {
++                *ydst++ = src[0];
++                *ydst++ = src[4];
++                *ydst2++ = src2[0];
++                *ydst2++ = src2[4];
++
++                *udst++ = (uint(src[1]) + uint(src[5]) + uint(src2[1]) + uint(src2[5])) >> 2;
++                *vdst++ = (uint(src[2]) + uint(src[6]) + uint(src2[2]) + uint(src2[6])) >> 2;
++
++                src += 8;
++                src2 += 8;
++            }
++            src = src2;
++            yplane += 2*ystride;
++            uplane += uvstride;
++            vplane += uvstride;
++        }
++    }
++
++    // Shared conversion dispatch used by both writers' writevideoframe():
++    // converts pixels/srcw/srch/format into I420 in the shared `yuv`
++    // buffer (or, for the already-I420 accelerated path, does nothing and
++    // just hands `pixels` straight back) - structurally identical to the
++    // switch+ternary that used to live directly inside aviwriter's
++    // writevideoframe(), just named and shared.
++    const uchar *toi420(const uchar *pixels, uint srcw, uint srch, int format)
++    {
++        switch(format)
++        {
++            case VID_RGB:
++                if(srcw != videow || srch != videoh) scaleyuv(pixels, srcw, srch);
++                else encodeyuv(pixels);
++                break;
++            case VID_YUV:
++                compressyuv(pixels);
++                break;
++        }
++        return format == VID_YUV420 ? pixels : yuv;
++    }
++};
++
++struct aviwriter : moviewriter
++{
++    stream *f;
++    stream::offset totalsize;
++    string filename;
++
+     vector<aviindexentry> index;
+     vector<avisegmentinfo> segments;
+-    
++
+     stream::offset fileframesoffset, fileextframesoffset, filevideooffset, filesoundoffset, superindexvideooffset, superindexsoundoffset;
+-    
++
+     enum { MAX_CHUNK_DEPTH = 16, MAX_SUPER_INDEX = 1024 };
+     stream::offset chunkoffsets[MAX_CHUNK_DEPTH];
+     int chunkdepth;
+-    
++
+     aviindexentry &addindex(int frame, int type, int size)
+     {
+         avisegmentinfo &seg = segments.last();
+@@ -172,14 +424,17 @@
+         DELETEP(f);
+     }
+     
+-    aviwriter(const char *name, uint w, uint h, uint fps, bool sound) : f(NULL), yuv(NULL), videoframes(0), totalsize(0), videow(w&~1), videoh(h&~1), videofps(fps), soundfrequency(0),soundchannels(0),soundformat(0)
++    aviwriter(const char *name, uint w, uint h, uint fps, bool sound) : moviewriter(w, h, fps), f(NULL), totalsize(0)
+     {
++        soundfrequency = soundchannels = 0;
++        soundformat = 0;
++
+         copystring(filename, name);
+         path(filename);
+         if(!strrchr(filename, '.')) concatstring(filename, ".avi");
+-        
++
+         extern bool nosound; // sound.cpp
+-        if(sound && !nosound) 
++        if(sound && !nosound)
+         {
+             Mix_QuerySpec(&soundfrequency, &soundformat, &soundchannels);
+             const char *desc;
+@@ -196,11 +451,10 @@
+             if(dbgmovie) conoutf(CON_DEBUG, "soundspec: %dhz %s x %d", soundfrequency, desc, soundchannels);
+         }
+     }
+-    
++
+     ~aviwriter()
+     {
+         close();
+-        if(yuv) delete [] yuv;
+     }
+     
+     bool open()
+@@ -614,13 +868,6 @@
+     }
+    
+ 
+-    enum
+-    {
+-        VID_RGB = 0,
+-        VID_YUV,
+-        VID_YUV420
+-    };
+-
+     void flushsegment()
+     {
+         endlistchunk(); // LIST movi
+@@ -717,28 +964,98 @@
+     bool writevideoframe(const uchar *pixels, uint srcw, uint srch, int format, uint frame)
+     {
+         if(frame < videoframes) return true;
+-        
+-        switch(format)
+-        {
+-            case VID_RGB: 
+-                if(srcw != videow || srch != videoh) scaleyuv(pixels, srcw, srch);
+-                else encodeyuv(pixels);
+-                break;
+-            case VID_YUV:
+-                compressyuv(pixels);
+-                break;
+-        }
++
++        const uchar *framedata = toi420(pixels, srcw, srch, format);
+ 
+         const uint framesize = (videow * videoh * 3) / 2;
+         if(totalsize - segments.last().offset + framesize > 1000*1000*1000 && !nextsegment()) return false;
+ 
+         while(videoframes <= frame) addindex(videoframes++, 0, framesize);
+ 
+-        writechunk("00dc", format == VID_YUV420 ? pixels : yuv, framesize);
++        writechunk("00dc", framedata, framesize);
+ 
+         return true;
+     }
+-    
++};
++
++// Feeds raw I420 frames into a bundled ffmpeg's stdin via a caller-owned
++// processpipe, instead of writing an AVI to disk - the piped clip-export
++// path from the design doc (docs/superpowers/specs/2026-07-30-clip-video-
++// export-design.md: "each captured frame is written to the pipe instead of
++// to a temporary AVI"). See recorder::startpipe() below for how this gets
++// wired into the exact same capture pipeline aviwriter uses.
++//
++// Ownership: pipewriter never opens or closes the processpipe it's given -
++// that lifecycle belongs entirely to the caller (export orchestration,
++// task 3), symmetric with how aviwriter never invented the file path
++// convention it was handed. openprocesspipe() happens before
++// recorder::startpipe(); closeprocesspipe()/killprocesspipe() happens
++// after recorder::stop() - this class only ever writes to an
++// already-open pipe while a capture is in progress.
++//
++// Threading: writevideoframe() below is called exclusively from
++// recorder::videoencoder(), the dedicated off-thread encoder thread the
++// existing recorder machinery already runs (see recorder::start() /
++// recorder::commonstart() further down) - never from the main/render
++// thread. writeprocesspipe() is a plain BLOCKING write (confirmed in
++// engine/processpipe.h's doc comment on writeprocesspipe: no O_NONBLOCK,
++// no overlapped IO - a full-but-alive pipe blocks the calling thread until
++// the child drains it or dies). Blocking here only ever stalls that
++// dedicated encoder thread, never the game loop - exactly the same
++// property the AVI path already has with its own (blocking) disk writes.
++// Backpressure is absorbed upstream of this class entirely: the recorder's
++// existing producer (readbuffer(), the no-arg driver) already drops a
++// frame outright rather than queuing it when the 2-slot video queue is
++// full and moviesync is off (the engine's existing default) - so a slow
++// ffmpeg shows up as this thread taking longer to drain the queue, which
++// in turn causes MORE frames to be dropped at the producer, never as the
++// main thread blocking. This is a deliberate reuse of the recorder's
++// existing drop-rather-than-stall default, not a new policy - see the
++// task 2 report for the full reasoning and the one edge case it does NOT
++// cover (a completely hung ffmpeg blocking the encoder thread forever,
++// which would make recorder::stop()'s SDL_WaitThread hang the caller in
++// turn - flagged there for task 3's cancellation path, which already has
++// killprocesspipe() for exactly this).
++struct pipewriter : moviewriter
++{
++    processpipe *pipe;
++    ullong byteswritten;
++    bool failed;
++
++    pipewriter(processpipe *p, uint w, uint h, uint fps) :
++        moviewriter(w, h, fps), pipe(p), byteswritten(0), failed(false)
++    {}
++
++    double filespaceguess() { return double(byteswritten); }
++
++    // Raw video piped to ffmpeg (-f rawvideo) carries no index or
++    // timestamps of its own - ffmpeg just plays frame N+1 back immediately
++    // after frame N at the fixed -framerate it was told. So, unlike
++    // aviwriter (which can point several AVI index entries at one
++    // physically-written chunk to "duplicate" a frame for free), keeping
++    // the piped output's duration locked to real elapsed time here means
++    // physically re-writing the same converted frame's bytes once per
++    // output frame slot that needs filling. That is the one genuinely new
++    // piece of logic this task adds; everything upstream deciding WHICH
++    // slots need filling (frame vs videoframes, fed by recorder's existing
++    // real-time-driven frame numbering in readbuffer()) is the recorder's
++    // existing duplicate-frame timing, reused completely unchanged.
++    bool writevideoframe(const uchar *pixels, uint srcw, uint srch, int format, uint frame)
++    {
++        if(failed) return false;
++        if(frame < videoframes) return true; // already delivered this many output frames
++
++        const uchar *framedata = toi420(pixels, srcw, srch, format);
++        const uint framesize = (videow * videoh * 3) / 2;
++
++        while(videoframes <= frame)
++        {
++            if(!writeprocesspipe(*pipe, framedata, framesize)) { failed = true; return false; }
++            byteswritten += framesize;
++            videoframes++;
++        }
++        return true;
++    }
+ };
+ 
+ VAR(movieaccelblit, 0, 0, 1);
+@@ -750,13 +1067,19 @@
+ namespace recorder
+ {
+     static enum { REC_OK = 0, REC_USERHALT, REC_TOOSLOW, REC_FILERROR } state = REC_OK;
+-    
+-    static aviwriter *file = NULL;
++
++    // Was aviwriter* - generalised to the shared base so this whole
++    // namespace (readbuffer, the encoder thread, timing, drop accounting)
++    // can feed either an aviwriter (disk, the vanilla "movie" command,
++    // unchanged) or a pipewriter (piped export, new) without knowing or
++    // caring which. See moviewriter/aviwriter/pipewriter above.
++    static moviewriter *file = NULL;
+     static int starttime = 0;
+-    
++
+     static int stats[1000];
+     static int statsindex = 0;
+     static uint dps = 0; // dropped frames per sample
++    static uint totalduplicates = 0; // cumulative duplicate/padding frames this recording, for the end-of-recording report (dps above is only a rolling per-second window, not a final total)
+     
+     enum { MAXSOUNDBUFFERS = 128 }; // sounds queue up until there is a video frame, so at low fps you'll need a bigger queue
+     struct soundbuffer
+@@ -865,6 +1188,7 @@
+             int duplicates = m.frame - (int)file->videoframes + 1;
+             if(duplicates > 0) // determine how many frames have been dropped over the sample window
+             {
++                totalduplicates += duplicates - 1; // cumulative total, independent of the rolling dps window below
+                 dps -= stats[statsindex];
+                 stats[statsindex] = duplicates-1;
+                 dps += stats[statsindex];
+@@ -896,37 +1220,22 @@
+         SDL_UnlockMutex(soundlock);
+     }
+     
+-    void start(const char *filename, int videofps, int videow, int videoh, bool sound) 
++    // Shared tail end of both start() (AVI) and startpipe() (piped export):
++    // once the concrete writer is constructed and ready, everything else -
++    // resetting the timing/drop-accounting state, the double-buffered
++    // video queue, the sound queue, and spinning up the off-thread
++    // encoder - is identical regardless of which writer it is. Factored
++    // out so startpipe() doesn't duplicate any of it.
++    static void commonstart(moviewriter *newfile)
+     {
+-        if(file) return;
+-       
+-        useshaderbyname("moviergb");
+-        useshaderbyname("movieyuv");
+-        useshaderbyname("moviey");
+-        useshaderbyname("movieu");
+-        useshaderbyname("moviev");
+- 
+-        int fps, bestdiff, worstdiff;
+-        getfps(fps, bestdiff, worstdiff);
+-        if(videofps > fps) conoutf(CON_WARN, "frame rate may be too low to capture at %d fps", videofps);
+-        
+-        if(videow%2) videow += 1;
+-        if(videoh%2) videoh += 1;
++        file = newfile;
+ 
+-        file = new aviwriter(filename, videow, videoh, videofps, sound);
+-        if(!file->open()) 
+-        { 
+-            conoutf(CON_ERROR, "unable to create file %s", filename);
+-            DELETEP(file);
+-            return;
+-        }
+-        conoutf("movie recording to: %s %dx%d @ %dfps%s", file->filename, file->videow, file->videoh, file->videofps, (file->soundfrequency>0)?" + sound":"");
+-        
+         starttime = gettime();
+         loopi(file->videofps) stats[i] = 0;
+         statsindex = 0;
+         dps = 0;
+-        
++        totalduplicates = 0;
++
+         lastframe = ~0U;
+         videobuffers.clear();
+         loopi(MAXVIDEOBUFFERS)
+@@ -935,17 +1244,100 @@
+             videobuffers.data[i].init(w, h, 4);
+             videobuffers.data[i].frame = ~0U;
+         }
+-        
++
+         soundbuffers.clear();
+-        
++
+         soundlock = SDL_CreateMutex();
+         videolock = SDL_CreateMutex();
+         shouldencode = SDL_CreateCond();
+         shouldread = SDL_CreateCond();
+-        thread = SDL_CreateThread(videoencoder, "video encoder", NULL); 
++        thread = SDL_CreateThread(videoencoder, "video encoder", NULL);
+         if(file->soundfrequency > 0) Mix_SetPostMix(soundencoder, NULL);
+     }
+-    
++
++    void start(const char *filename, int videofps, int videow, int videoh, bool sound)
++    {
++        if(file) return;
++
++        useshaderbyname("moviergb");
++        useshaderbyname("movieyuv");
++        useshaderbyname("moviey");
++        useshaderbyname("movieu");
++        useshaderbyname("moviev");
++
++        int fps, bestdiff, worstdiff;
++        getfps(fps, bestdiff, worstdiff);
++        if(videofps > fps) conoutf(CON_WARN, "frame rate may be too low to capture at %d fps", videofps);
++
++        if(videow%2) videow += 1;
++        if(videoh%2) videoh += 1;
++
++        aviwriter *avi = new aviwriter(filename, videow, videoh, videofps, sound);
++        if(!avi->open())
++        {
++            conoutf(CON_ERROR, "unable to create file %s", filename);
++            delete avi;
++            return;
++        }
++        conoutf("movie recording to: %s %dx%d @ %dfps%s", avi->filename, avi->videow, avi->videoh, avi->videofps, (avi->soundfrequency>0)?" + sound":"");
++
++        commonstart(avi);
++    }
++
++    // Clip-export entry point: starts capturing frames into an
++    // ALREADY-OPEN processpipe (opened by the caller via openprocesspipe()
++    // before calling this - see the ownership note on pipewriter above)
++    // instead of an AVI file, using the exact same GL capture, scaling,
++    // I420 conversion, off-thread encoder queue and real-time-driven frame
++    // pacing as start()/the "movie" command. The caller drives capture
++    // exactly like the AVI path too: nothing here schedules its own
++    // frames, recorder::capture() (already wired into swapbuffers() below
++    // main.cpp's render loop) is what pulls frames in, once per rendered
++    // frame, for as long as this is active.
++    //
++    // Not this function's job (left to task 3's export orchestration,
++    // which is the caller): opening/closing the pipe, spawning ffmpeg,
++    // locking playback to the recording player's POV, hiding the HUD, or
++    // restoring any settings. This only ever starts/stops frame delivery
++    // into a pipe it was handed.
++    bool startpipe(processpipe &pipe, int videofps, int videow, int videoh)
++    {
++        if(file) return false;
++
++        useshaderbyname("moviergb");
++        useshaderbyname("movieyuv");
++        useshaderbyname("moviey");
++        useshaderbyname("movieu");
++        useshaderbyname("moviev");
++
++        // stats[] is sized for moviefps's own existing 1..1000 VARP range;
++        // clamp defensively rather than trusting the caller's fps to
++        // already be in range (unlike moviefps, an export fps setting
++        // hasn't gone through CubeScript's own range clamp by the time it
++        // gets here).
++        if(videofps < 1) videofps = 1;
++        else if(videofps > 1000) videofps = 1000;
++
++        if(videow%2) videow += 1;
++        if(videoh%2) videoh += 1;
++
++        pipewriter *pw = new pipewriter(&pipe, videow, videoh, videofps);
++        conoutf("movie export piping to ffmpeg: %dx%d @ %dfps", pw->videow, pw->videoh, pw->videofps);
++
++        commonstart(pw);
++        return true;
++    }
++
++    // Cumulative count of output frames that were re-written copies of a
++    // previous frame (padding to keep the output's frame count in step
++    // with real elapsed time - see pipewriter::writevideoframe() and
++    // aviwriter::writevideoframe() above) over the CURRENT/most recent
++    // recording. Valid to call at any point, including after stop(); reset
++    // to 0 by the next start()/startpipe(). This is how "frames were
++    // dropped" gets reported outside the conoutf line at stop() - task 3/5
++    // can poll it for on-screen export progress.
++    uint duplicatedframes() { return totalduplicates; }
++
+     void cleanup()
+     {
+         if(scalefb) { glDeleteFramebuffers_(1, &scalefb); scalefb = 0; }
+@@ -982,8 +1374,9 @@
+         thread = NULL;
+  
+         static const char * const mesgs[] = { "ok", "stopped", "computer too slow", "file error"};
+-        conoutf("movie recording halted: %s, %d frames", mesgs[state], file->videoframes);
+-        
++        if(totalduplicates) conoutf("movie recording halted: %s, %d frames (%d duplicated to hold timing)", mesgs[state], file->videoframes, totalduplicates);
++        else conoutf("movie recording halted: %s, %d frames", mesgs[state], file->videoframes);
++
+         DELETEP(file);
+         state = REC_OK;
+     }
+@@ -995,7 +1388,7 @@
+         uint w = screenw, h = screenh;
+         if(usefbo) { w = file->videow; h = file->videoh; }
+         if(w != m.w || h != m.h) m.init(w, h, 4);
+-        m.format = aviwriter::VID_RGB;
++        m.format = VID_RGB;
+         m.frame = nextframe;
+ 
+         glPixelStorei(GL_PACK_ALIGNMENT, texalign(m.video, m.w, 4));
+@@ -1050,7 +1443,7 @@
+                     glFramebufferTexture2D_(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, scaletex[1], 0);
+                     glViewport(0, 0, dw, dh);
+                     glBindTexture(GL_TEXTURE_2D, scaletex[0]);
+-                    if(dw == m.w && dh == m.h && !accelyuv) { SETSHADER(movieyuv); m.format = aviwriter::VID_YUV; }
++                    if(dw == m.w && dh == m.h && !accelyuv) { SETSHADER(movieyuv); m.format = VID_YUV; }
+                     else SETSHADER(moviergb);
+                     screenquad(tw/float(scalew), th/float(scaleh));
+                     tw = dw;
+@@ -1072,7 +1465,7 @@
+                 glReadPixels(m.w/4, 0, m.w/8, m.h/2, GL_BGRA, GL_UNSIGNED_BYTE, &m.video[planesize]);
+                 glPixelStorei(GL_PACK_ALIGNMENT, texalign(&m.video[planesize + planesize/4], m.w/8, 4));
+                 glReadPixels(m.w/4, m.h/2, m.w/8, m.h/2, GL_BGRA, GL_UNSIGNED_BYTE, &m.video[planesize + planesize/4]);
+-                m.format = aviwriter::VID_YUV420;
++                m.format = VID_YUV420;
+             }
+             else
+             {
+--- a/engine/engine.h
++++ b/engine/engine.h
+@@ -600,11 +600,29 @@
+ 
+ // recorder
+ 
++struct processpipe; // engine/processpipe.h - forward-declared only; callers that
++                     // actually construct one must include processpipe.h themselves
++
+ namespace recorder
+ {
+     extern void stop();
+     extern void capture(bool overlay = true);
+     extern void cleanup();
++
++    // Clip-export entry point: see the doc comment on recorder::startpipe()
++    // in engine/movie.cpp for the full contract (ownership of the pipe,
++    // which thread writes to it, what happens when the encoder falls
++    // behind). Starts capturing frames - via the same GL capture/scale/
++    // I420/timing machinery the "movie" command already uses - into an
++    // ALREADY-OPEN processpipe instead of an AVI file. Returns false if a
++    // recording (of either kind) is already in progress.
++    extern bool startpipe(processpipe &pipe, int videofps, int videow, int videoh);
++
++    // Cumulative count of output frames that were re-written duplicates of
++    // a previous frame (padding to keep the output frame count in step
++    // with real elapsed time) over the current/most recent recording -
++    // the "were frames dropped" report, for either recording kind.
++    extern uint duplicatedframes();
+ }
+ 
+ #endif
