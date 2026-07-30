@@ -584,7 +584,7 @@
  
  VAR(dbgmovie, 0, 0, 1);
  
-@@ -31,27 +32,298 @@
+@@ -31,27 +32,369 @@
      avisegmentinfo(stream::offset offset, int firstindex) : offset(offset), videoindexoffset(0), soundindexoffset(0), firstindex(firstindex), videoindexsize(0), soundindexsize(0), indexframes(0), videoframes(0), soundframes(0) {}
  };
  
@@ -660,6 +660,77 @@
      int soundfrequency, soundchannels;
      Uint16 soundformat;
 -    
++
++    // Shared sound-spec query, used by both writers' constructors: queries
++    // SDL_mixer's actually-open audio spec (Mix_QuerySpec) when the caller
++    // wants sound and the engine has an audio device at all (!nosound),
++    // leaving soundfrequency at the default-constructed 0 otherwise -
++    // videoencoder()'s "if(file->soundfrequency > 0)" gate below is what a
++    // frequency of 0 disables, for either writer. Was duplicated inline in
++    // aviwriter's own constructor before pipewriter needed the identical
++    // query for its own sound capture (see pipewriter's doc comment further
++    // down) - shared now rather than copy-pasted a second time.
++    void querysoundspec(bool wantsound)
++    {
++        soundfrequency = soundchannels = 0;
++        soundformat = 0;
++
++        extern bool nosound; // engine/sound.cpp
++        if(wantsound && !nosound)
++        {
++            Mix_QuerySpec(&soundfrequency, &soundformat, &soundchannels);
++            const char *desc;
++            switch(soundformat)
++            {
++                case AUDIO_U8:     desc = "u8"; break;
++                case AUDIO_S8:     desc = "s8"; break;
++                case AUDIO_U16LSB: desc = "u16l"; break;
++                case AUDIO_U16MSB: desc = "u16b"; break;
++                case AUDIO_S16LSB: desc = "s16l"; break;
++                case AUDIO_S16MSB: desc = "s16b"; break;
++                default:           desc = "unkn";
++            }
++            if(dbgmovie) conoutf(CON_DEBUG, "soundspec: %dhz %s x %d", soundfrequency, desc, soundchannels);
++        }
++    }
++
++    // Shared PCM normalisation, used by both writers' writesound(): converts
++    // whatever SDL_mixer's actual open format is into plain little-endian
++    // PCM in place (always ends up signed - see the switch below for the
++    // exact per-format rule). This is the identical conversion aviwriter has
++    // always applied to a sound chunk before writing it into its AVI;
++    // pipewriter's WAV writer (below) reuses it unchanged so both writers
++    // produce byte-identical samples from one rule, not two independently
++    // hand-copied switch statements.
++    void normalizesoundendian(uchar *data, uint framesize)
++    {
++        // note that xoring by half the range yields the same bit pattern as subtracting the range regardless of signedness
++        // ... so can toggle signedness just by xoring the high byte with 0x80
++        switch(soundformat)
++        {
++            case AUDIO_U8:
++                for(uchar *dst = data, *end = &data[framesize]; dst < end; dst++) *dst ^= 0x80;
++                break;
++            case AUDIO_S8:
++                break;
++            case AUDIO_U16LSB:
++                for(uchar *dst = &data[1], *end = &data[framesize]; dst < end; dst += 2) *dst ^= 0x80;
++                break;
++            case AUDIO_U16MSB:
++                for(ushort *dst = (ushort *)data, *end = (ushort *)&data[framesize]; dst < end; dst++)
++#if SDL_BYTEORDER == SDL_BIG_ENDIAN
++                    *dst = endianswap(*dst) ^ 0x0080;
++#else
++                    *dst = endianswap(*dst) ^ 0x8000;
++#endif
++                break;
++            case AUDIO_S16LSB:
++                break;
++            case AUDIO_S16MSB:
++                endianswap((short *)data, framesize/2);
++                break;
++        }
++    }
 +
 +    static inline void boxsample(const uchar *src, const uint stride,
 +                                 const uint area, const uint w, uint h,
@@ -894,30 +965,36 @@
      aviindexentry &addindex(int frame, int type, int size)
      {
          avisegmentinfo &seg = segments.last();
-@@ -172,14 +444,17 @@
+@@ -172,35 +515,18 @@
          DELETEP(f);
      }
      
 -    aviwriter(const char *name, uint w, uint h, uint fps, bool sound) : f(NULL), yuv(NULL), videoframes(0), totalsize(0), videow(w&~1), videoh(h&~1), videofps(fps), soundfrequency(0),soundchannels(0),soundformat(0)
 +    aviwriter(const char *name, uint w, uint h, uint fps, bool sound) : moviewriter(w, h, fps), f(NULL), totalsize(0)
      {
-+        soundfrequency = soundchannels = 0;
-+        soundformat = 0;
-+
          copystring(filename, name);
          path(filename);
          if(!strrchr(filename, '.')) concatstring(filename, ".avi");
 -        
-+
-         extern bool nosound; // sound.cpp
+-        extern bool nosound; // sound.cpp
 -        if(sound && !nosound) 
-+        if(sound && !nosound)
-         {
-             Mix_QuerySpec(&soundfrequency, &soundformat, &soundchannels);
-             const char *desc;
-@@ -196,11 +471,10 @@
-             if(dbgmovie) conoutf(CON_DEBUG, "soundspec: %dhz %s x %d", soundfrequency, desc, soundchannels);
-         }
+-        {
+-            Mix_QuerySpec(&soundfrequency, &soundformat, &soundchannels);
+-            const char *desc;
+-            switch(soundformat)
+-            {
+-                case AUDIO_U8:     desc = "u8"; break;
+-                case AUDIO_S8:     desc = "s8"; break;
+-                case AUDIO_U16LSB: desc = "u16l"; break;
+-                case AUDIO_U16MSB: desc = "u16b"; break;
+-                case AUDIO_S16LSB: desc = "s16l"; break;
+-                case AUDIO_S16MSB: desc = "s16b"; break;
+-                default:           desc = "unkn";
+-            }
+-            if(dbgmovie) conoutf(CON_DEBUG, "soundspec: %dhz %s x %d", soundfrequency, desc, soundchannels);
+-        }
++
++        querysoundspec(sound);
      }
 -    
 +
@@ -928,7 +1005,44 @@
      }
      
      bool open()
-@@ -614,13 +888,6 @@
+@@ -576,34 +902,8 @@
+ 
+     bool writesound(uchar *data, uint framesize, uint frame)
+     {
+-        // do conversion in-place to little endian format
+-        // note that xoring by half the range yields the same bit pattern as subtracting the range regardless of signedness
+-        // ... so can toggle signedness just by xoring the high byte with 0x80
+-        switch(soundformat)
+-        {
+-            case AUDIO_U8:
+-                for(uchar *dst = data, *end = &data[framesize]; dst < end; dst++) *dst ^= 0x80;
+-                break;
+-            case AUDIO_S8:
+-                break;
+-            case AUDIO_U16LSB:
+-                for(uchar *dst = &data[1], *end = &data[framesize]; dst < end; dst += 2) *dst ^= 0x80;
+-                break;
+-            case AUDIO_U16MSB:
+-                for(ushort *dst = (ushort *)data, *end = (ushort *)&data[framesize]; dst < end; dst++)
+-#if SDL_BYTEORDER == SDL_BIG_ENDIAN
+-                    *dst = endianswap(*dst) ^ 0x0080;
+-#else
+-                    *dst = endianswap(*dst) ^ 0x8000;
+-#endif
+-                break;
+-            case AUDIO_S16LSB:
+-                break;
+-            case AUDIO_S16MSB:
+-                endianswap((short *)data, framesize/2);
+-                break;
+-        }
+-       
++        normalizesoundendian(data, framesize); // do conversion in-place to little endian format (shared with pipewriter's WAV writer below - see moviewriter::normalizesoundendian())
++
+         if(totalsize - segments.last().offset + framesize > 1000*1000*1000 && !nextsegment()) return false;
+  
+         addindex(frame, 1, framesize);
+@@ -614,13 +914,6 @@
      }
     
  
@@ -942,7 +1056,7 @@
      void flushsegment()
      {
          endlistchunk(); // LIST movi
-@@ -717,30 +984,151 @@
+@@ -717,30 +1010,254 @@
      bool writevideoframe(const uchar *pixels, uint srcw, uint srch, int format, uint frame)
      {
          if(frame < videoframes) return true;
@@ -1011,6 +1125,35 @@
 +// which would make recorder::stop()'s SDL_WaitThread hang the caller in
 +// turn - flagged there for task 3's cancellation path, which already has
 +// killprocesspipe() for exactly this).
++//
++// Sound (this task - exports must carry audio, not ship silent): unlike
++// video, the captured audio is NOT written down this same pipe. A raw
++// video pipe has no room for a second stream, and the two cross-platform
++// ways to add one - a second anonymous pipe/fd, or a POSIX named pipe -
++// would each need real new per-platform process-launch code in
++// processpipe.cpp (Windows named pipes are a wholly different API from an
++// anonymous pipe; a second POSIX fd needs its own posix_spawn_file_actions
++// entry and a verified ffmpeg "pipe:N" fd number on every platform this
++// ships on). Instead, pipewriter captures sound (via the EXACT same
++// Mix_SetPostMix/soundbuffer-queue/starttime-clock machinery the AVI
++// writer already uses - see writesound() below and recorder::videoencoder()
++// - completely unchanged there) into a small WAV file it opens and owns
++// itself, alongside the caller-owned video pipe. Once capture ends, the
++// caller (fpsgame/client.cpp's clipexportonplaybackend()) runs a SECOND,
++// fast ffmpeg pass - `-i <compressed-video> -i <wav> -c:v copy -c:a ...` -
++// to mux the two into the real final output, using the exact same
++// openprocesspipe()/closeprocesspipe() primitives already proven across
++// tasks 1-4 (no new process-launch code at all). This trades one extra
++// (very fast, since it never re-encodes video) child-process invocation
++// for zero new cross-platform IPC surface - the simplicity/risk trade the
++// design notes asked to weigh explicitly, and the one taken; see
++// ce-task-5b-report.md for the full comparison. Sync between the two
++// streams falls out of construction, not a second timing scheme: both the
++// first captured video frame (readbuffer(), driven by starttime) and the
++// first captured audio buffer (soundencoder() below, driven by the SAME
++// starttime) begin at the instant commonstart() arms them together -
++// exactly the same starttime-anchored relationship the AVI writer has
++// relied on for its own (index-based) audio/video interleaving all along.
 +struct pipewriter : moviewriter
 +{
 +    processpipe *pipe;
@@ -1018,6 +1161,16 @@
 +    bool failed;
 +    uint skipped;
 +    const volatile bool *cancelled; // owned by namespace recorder (pipeexportcancel below); read-only here
++
++    // Sound capture: unlike the video pipe (caller-owned, see the ownership
++    // note above), pipewriter opens, writes, and closes this WAV file
++    // itself - symmetric with how aviwriter owns its own AVI file. NULL
++    // (and soundfrequency == 0, via querysoundspec()) whenever sound wasn't
++    // requested, or the engine has no audio device, or the file couldn't be
++    // created (see openfailed below).
++    stream *wavfile;
++    ullong wavbyteswritten; // raw PCM bytes written - patched into the WAV header's two size fields by closewav()
++    bool openfailed; // sound was requested but the wav file could not be created - recorder::startpipe() checks this and fails the whole export (matching aviwriter's own "unable to create file" contract) rather than silently going silent
 +
 +    // Bounds the worst-case blocking duration of ONE writevideoframe() call
 +    // (found in code review): the old unbounded "while(videoframes <=
@@ -1036,11 +1189,75 @@
 +    // otherwise gives up and fast-forwards instead of continuing to block.
 +    enum { MAXPADPERCALL = 60 };
 +
-+    pipewriter(processpipe *p, uint w, uint h, uint fps, const volatile bool *cancelledflag) :
-+        moviewriter(w, h, fps), pipe(p), byteswritten(0), failed(false), skipped(0), cancelled(cancelledflag)
-+    {}
++    pipewriter(processpipe *p, uint w, uint h, uint fps, const volatile bool *cancelledflag, bool sound, const char *soundpath) :
++        moviewriter(w, h, fps), pipe(p), byteswritten(0), failed(false), skipped(0), cancelled(cancelledflag),
++        wavfile(NULL), wavbyteswritten(0), openfailed(false)
++    {
++        querysoundspec(sound);
++        if(soundfrequency > 0) openwav(soundpath);
++    }
 +
-+    double filespaceguess() { return double(byteswritten); }
++    ~pipewriter() { closewav(); }
++
++    // Minimal 44-byte canonical PCM WAV header - sizes are written as 0 and
++    // patched by closewav() once the real total is known, the same
++    // "placeholder now, seek back and patch at close" idiom aviwriter's own
++    // open()/close() already use for its (much larger) AVI header. Always
++    // plain integer PCM (format tag 1): normalizesoundendian() has already
++    // converted whatever SDL_mixer's actual spec was into plain signed PCM
++    // bytes by the time anything reaches writesound() below.
++    bool openwav(const char *path)
++    {
++        wavfile = openfile(path, "wb");
++        if(!wavfile) { openfailed = true; return false; }
++        const int bps = (soundformat==AUDIO_U8 || soundformat==AUDIO_S8) ? 1 : 2;
++        wavfile->write("RIFF", 4);
++        wavfile->putlil<uint>(0); // ChunkSize, patched by closewav()
++        wavfile->write("WAVE", 4);
++        wavfile->write("fmt ", 4);
++        wavfile->putlil<uint>(16); // Subchunk1Size (PCM)
++        wavfile->putlil<ushort>(1); // AudioFormat = PCM
++        wavfile->putlil<ushort>((ushort)soundchannels);
++        wavfile->putlil<uint>((uint)soundfrequency);
++        wavfile->putlil<uint>((uint)(soundfrequency*bps*soundchannels)); // ByteRate
++        wavfile->putlil<ushort>((ushort)(bps*soundchannels)); // BlockAlign
++        wavfile->putlil<ushort>((ushort)(bps*8)); // BitsPerSample
++        wavfile->write("data", 4);
++        wavfile->putlil<uint>(0); // Subchunk2Size, patched by closewav()
++        return true;
++    }
++
++    void closewav()
++    {
++        if(!wavfile) return;
++        wavfile->seek(4, SEEK_SET);
++        wavfile->putlil<uint>(uint(min(wavbyteswritten + 36, (ullong)0xFFFFFFFFU)));
++        wavfile->seek(40, SEEK_SET);
++        wavfile->putlil<uint>(uint(min(wavbyteswritten, (ullong)0xFFFFFFFFU)));
++        DELETEP(wavfile);
++    }
++
++    // Called from recorder::videoencoder() exactly like aviwriter's own
++    // writesound() - same thread (the dedicated encoder thread, never the
++    // main/render thread), same soundbuffers queue, same starttime-anchored
++    // frame numbering upstream. Unlike aviwriter, the `frame` argument is
++    // unused here: a WAV file has no index or per-chunk timestamps to place
++    // it into (aviwriter needs `frame` to build its AVI index; a flat PCM
++    // stream just needs bytes appended in the order they were captured,
++    // which the soundbuffers queue's own strict FIFO removal order already
++    // guarantees) - so the file's own byte-offset/sample-rate timeline
++    // reproduces the real-time relationship the AVI index's frame-tagging
++    // encodes explicitly, just implicitly.
++    bool writesound(uchar *data, uint framesize, uint frame)
++    {
++        if(!wavfile) return true; // sound not requested/available for this export - a no-op success, matching moviewriter's own default contract
++        normalizesoundendian(data, framesize);
++        if(wavfile->write(data, framesize) != framesize) { DELETEP(wavfile); return false; }
++        wavbyteswritten += framesize;
++        return true;
++    }
++
++    double filespaceguess() { return double(byteswritten + wavbyteswritten); }
 +    uint skippedpadframes() { return skipped; }
 +    bool blockwhenfull() { return false; } // see moviewriter::blockwhenfull() doc comment
 +
@@ -1107,7 +1324,7 @@
  VAR(movieaccelblit, 0, 0, 1);
  VAR(movieaccelyuv, 0, 1, 1);
  VARP(movieaccel, 0, 1, 1);
-@@ -750,13 +1138,19 @@
+@@ -750,13 +1267,19 @@
  namespace recorder
  {
      static enum { REC_OK = 0, REC_USERHALT, REC_TOOSLOW, REC_FILERROR } state = REC_OK;
@@ -1130,7 +1347,7 @@
      
      enum { MAXSOUNDBUFFERS = 128 }; // sounds queue up until there is a video frame, so at low fps you'll need a bigger queue
      struct soundbuffer
-@@ -819,8 +1213,19 @@
+@@ -819,8 +1342,19 @@
      static SDL_mutex *videolock = NULL;
      static SDL_cond *shouldencode = NULL, *shouldread = NULL;
  
@@ -1151,7 +1368,7 @@
      float calcquality()
      {
          return 1.0f - float(dps)/float(dps+file->videofps); // strictly speaking should lock to read dps - 1.0=perfect, 0.5=half of frames are beingdropped
-@@ -865,6 +1270,7 @@
+@@ -865,6 +1399,7 @@
              int duplicates = m.frame - (int)file->videoframes + 1;
              if(duplicates > 0) // determine how many frames have been dropped over the sample window
              {
@@ -1159,7 +1376,7 @@
                  dps -= stats[statsindex];
                  stats[statsindex] = duplicates-1;
                  dps += stats[statsindex];
-@@ -896,37 +1302,22 @@
+@@ -896,37 +1431,22 @@
          SDL_UnlockMutex(soundlock);
      }
      
@@ -1207,7 +1424,7 @@
          lastframe = ~0U;
          videobuffers.clear();
          loopi(MAXVIDEOBUFFERS)
-@@ -935,17 +1326,118 @@
+@@ -935,17 +1455,135 @@
              videobuffers.data[i].init(w, h, 4);
              videobuffers.data[i].frame = ~0U;
          }
@@ -1271,7 +1488,18 @@
 +    // locking playback to the recording player's POV, hiding the HUD, or
 +    // restoring any settings. This only ever starts/stops frame delivery
 +    // into a pipe it was handed.
-+    bool startpipe(processpipe &pipe, int videofps, int videow, int videoh)
++    //
++    // sound/soundpath (this task): when sound is true, captures the game's
++    // own audio (Mix_SetPostMix, same mechanism as the AVI writer) into a
++    // small WAV file at soundpath, opened/owned/closed entirely by the
++    // pipewriter this call creates - the caller never touches it directly,
++    // only knows its path (to hand to the mux pass once capture ends - see
++    // pipewriter's own doc comment above for why a second ffmpeg pass,
++    // rather than a second pipe/fd, was chosen). Returns false - same
++    // failure contract as start()'s "unable to create file" - if sound is
++    // requested but the wav file couldn't be created; soundpath is ignored
++    // when sound is false.
++    bool startpipe(processpipe &pipe, int videofps, int videow, int videoh, bool sound, const char *soundpath)
 +    {
 +        if(file) return false;
 +
@@ -1293,8 +1521,14 @@
 +        if(videoh%2) videoh += 1;
 +
 +        pipeexportcancel = false; // fresh export: clear any stale flag from a previous one
-+        pipewriter *pw = new pipewriter(&pipe, videow, videoh, videofps, &pipeexportcancel);
-+        conoutf("movie export piping to ffmpeg: %dx%d @ %dfps", pw->videow, pw->videoh, pw->videofps);
++        pipewriter *pw = new pipewriter(&pipe, videow, videoh, videofps, &pipeexportcancel, sound, soundpath);
++        if(pw->openfailed)
++        {
++            conoutf(CON_ERROR, "movie export: could not create sound temp file %s", soundpath);
++            delete pw;
++            return false;
++        }
++        conoutf("movie export piping to ffmpeg: %dx%d @ %dfps%s", pw->videow, pw->videoh, pw->videofps, pw->soundfrequency>0 ? " + sound" : "");
 +
 +        commonstart(pw);
 +        return true;
@@ -1330,7 +1564,7 @@
      void cleanup()
      {
          if(scalefb) { glDeleteFramebuffers_(1, &scalefb); scalefb = 0; }
-@@ -982,8 +1474,9 @@
+@@ -982,8 +1620,9 @@
          thread = NULL;
   
          static const char * const mesgs[] = { "ok", "stopped", "computer too slow", "file error"};
@@ -1342,7 +1576,7 @@
          DELETEP(file);
          state = REC_OK;
      }
-@@ -995,7 +1488,7 @@
+@@ -995,7 +1634,7 @@
          uint w = screenw, h = screenh;
          if(usefbo) { w = file->videow; h = file->videoh; }
          if(w != m.w || h != m.h) m.init(w, h, 4);
@@ -1351,7 +1585,7 @@
          m.frame = nextframe;
  
          glPixelStorei(GL_PACK_ALIGNMENT, texalign(m.video, m.w, 4));
-@@ -1050,7 +1543,7 @@
+@@ -1050,7 +1689,7 @@
                      glFramebufferTexture2D_(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, scaletex[1], 0);
                      glViewport(0, 0, dw, dh);
                      glBindTexture(GL_TEXTURE_2D, scaletex[0]);
@@ -1360,7 +1594,7 @@
                      else SETSHADER(moviergb);
                      screenquad(tw/float(scalew), th/float(scaleh));
                      tw = dw;
-@@ -1072,7 +1565,7 @@
+@@ -1072,7 +1711,7 @@
                  glReadPixels(m.w/4, 0, m.w/8, m.h/2, GL_BGRA, GL_UNSIGNED_BYTE, &m.video[planesize]);
                  glPixelStorei(GL_PACK_ALIGNMENT, texalign(&m.video[planesize + planesize/4], m.w/8, 4));
                  glReadPixels(m.w/4, m.h/2, m.w/8, m.h/2, GL_BGRA, GL_UNSIGNED_BYTE, &m.video[planesize + planesize/4]);
@@ -1369,7 +1603,7 @@
              }
              else
              {
-@@ -1095,7 +1588,7 @@
+@@ -1095,7 +1734,7 @@
              return false;
          }
          SDL_LockMutex(videolock);
@@ -1380,7 +1614,7 @@
          {
 --- a/engine/engine.h
 +++ b/engine/engine.h
-@@ -600,11 +600,36 @@
+@@ -600,11 +600,42 @@
  
  // recorder
  
@@ -1400,8 +1634,14 @@
 +    // behind). Starts capturing frames - via the same GL capture/scale/
 +    // I420/timing machinery the "movie" command already uses - into an
 +    // ALREADY-OPEN processpipe instead of an AVI file. Returns false if a
-+    // recording (of either kind) is already in progress.
-+    extern bool startpipe(processpipe &pipe, int videofps, int videow, int videoh);
++    // recording (of either kind) is already in progress, or if sound is
++    // requested but the wav temp file at soundpath could not be created.
++    // sound/soundpath: capture the game's own audio (same Mix_SetPostMix
++    // mechanism as the AVI writer) into a small WAV file at soundpath,
++    // owned entirely by the pipewriter this creates - see pipewriter's own
++    // doc comment in movie.cpp for why a WAV file rather than a second
++    // pipe/fd. soundpath is ignored when sound is false.
++    extern bool startpipe(processpipe &pipe, int videofps, int videow, int videoh, bool sound, const char *soundpath);
 +
 +    // Cumulative count of output frames that were re-written duplicates of
 +    // a previous frame (padding to keep the output frame count in step
@@ -1457,7 +1697,7 @@
 +namespace recorder
 +{
 +    extern void stop();
-+    extern bool startpipe(processpipe &pipe, int videofps, int videow, int videoh);
++    extern bool startpipe(processpipe &pipe, int videofps, int videow, int videoh, bool sound, const char *soundpath);
 +    extern uint duplicatedframes();
 +    extern void requestpipecancel();
 +    extern uint exportframessofar();
@@ -1524,7 +1764,7 @@
      }
  
      VARP(teamcolorchat, 0, 1, 1);
-@@ -1980,6 +1991,585 @@
+@@ -1980,6 +1991,745 @@
      }
      // === end SwiftGibs instant replay: recording modes =======================================
  
@@ -1593,7 +1833,20 @@
 +    VARP(clipexportfpspref, 15, 60, 120); // the player's chosen export fps; HARD CAPPED at 120 by the VARP's own range - no script or console input can push it higher
 +    VARP(clipexportformatpref, 0, 0, 1);  // 0=mp4 (H.264, default - plays everywhere) 1=webm (VP9)
 +    VARP(clipexportquality, 0, 1, 2);     // 0=smaller file 1=normal (default - the exact crf values Task 3 originally hardcoded, unchanged) 2=best quality/largest file; selects the -crf argument in checkclipexport() below, per format
-+    VARP(clipexportsound, 0, 0, 1);       // 0=mute the EXPORTING PLAYER'S OWN live game audio during capture (default - matches the courtesy-mute behaviour Tasks 1-4 already tested) 1=leave the player's own soundvol alone. Deliberately NOT "does the exported file have sound" - it never does yet (checkclipexport()'s ffmpeg invocation is unconditionally "-an"; the piped stream carries video frames only, see engine/movie.cpp's pipewriter and ce-task-3-report.md) - this toggle is a live-monitoring courtesy only, and the settings page labels it that way so it can never be read as promising audio in the output.
++    // clipexportsound now means exactly what its label says: 0=export without audio (silent video) 1=include
++    // the game's own audio in the exported video (DEFAULT - April's mandate: exports must carry sound, not ship
++    // silent). Previously (Tasks 1-4) this VARP instead forced soundvol=0 as a live-monitoring courtesy while the
++    // piped path had no audio channel at all; that mute is REMOVED (see clipexportapplysettings() below) rather
++    // than kept alongside real audio capture, because soundvol==0 calls stopchannels() (engine/sound.cpp), which
++    // halts every sound channel outright - forcing it during capture would silence the very Mix_SetPostMix stream
++    // this setting is now supposed to deliver into the file, directly defeating itself when on. Leaving the
++    // player's own live audio untouched during export matches how the pre-existing vanilla "movie" AVI-record
++    // command has always behaved (sound plays normally to speakers while being captured) - "sane" live monitoring
++    // here means "expected, not silently broken," not "muted." See engine/movie.cpp's pipewriter (WAV capture) and
++    // checkclipexport()/clipexportonplaybackend() below (the two-ffmpeg-pass mux) for how the audio actually gets
++    // into the output file, and ce-task-5b-report.md for the sync verification.
++    VARP(clipexportsound, 0, 1, 1);
++    VARP(clipexportmuxtimeout, 5, 30, 300); // seconds given to the audio+video mux pass (clipexportonplaybackend()'s pass 2, below) before the watchdog force-kills it - generous because it's still bounded, but the pass itself is fast (-c:v copy, no video re-encode; only a small WAV gets encoded)
 +
 +    // Where the bundled ffmpeg lives when clipexportffmpeg (above) is left at its default empty
 +    // string: a fixed path relative to the CURRENT DIRECTORY the game process was launched
@@ -1626,10 +1879,22 @@
 +    static string clipexportext = "mp4";
 +    static int clipexportwaitstart = 0;
 +    static int clipexporttargetcn = -1;
++    // Audio (this task): this export's own snapshot of clipexportsound, taken once at exportclip() time (like
++    // width/height/fps/ext above) so a mid-export settings-page change never affects an export already in
++    // flight. clipexporttmpvideopath/clipexporttmpwavpath are the two small intermediates the two-ffmpeg-pass
++    // design needs when sound is enabled - see engine/movie.cpp's pipewriter doc comment and
++    // clipexportonplaybackend() below. Both are computed unconditionally in exportclip() (cheap string
++    // formatting) regardless of clipexportsoundenabled, so clipexportremovetempfiles() can always safely attempt
++    // to remove them on every exit path - remove() on a path never actually created (the sound-disabled case,
++    // where pass 1 writes straight to clipexportoutpath as it always has) is the same harmless no-op
++    // clipexportremoveoutput() below already relies on.
++    static bool clipexportsoundenabled = false;
++    static string clipexporttmpvideopath = "";
++    static string clipexporttmpwavpath = "";
 +
 +    // Settings snapshot - the correctness-critical part. Every var touched is enumerated here
 +    // and nowhere else; clipexportapplysettings()/clipexportrestoresettings() are the only two
-+    // places that ever write to hidehud/thirdperson/soundvol for this feature, and the "applied"
++    // places that ever write to hidehud/thirdperson/fullconsole for this feature, and the "applied"
 +    // bool makes restore idempotent (safe to call from more than one exit path without double-
 +    // restoring or restoring when nothing was ever changed). fov is deliberately NOT in this
 +    // list - see the task report for why (no signal in a clip to set it to anything more
@@ -1637,15 +1902,17 @@
 +    // side effect, not a POV-lock requirement). moviesync is also deliberately not here: rather
 +    // than temporarily overwriting that persisted VARP (one more setting that could be left
 +    // wrong if something went badly enough), engine/movie.cpp's pipewriter simply ignores it
-+    // (moviewriter::blockwhenfull()) - see the task report for the reasoning.
++    // (moviewriter::blockwhenfull()) - see the task report for the reasoning. soundvol is ALSO
++    // deliberately no longer in this list (it was, through Task 5) - see clipexportsound's own
++    // comment above for why forcing it during capture would now be self-defeating.
 +    static bool clipexportsettingsapplied = false;
-+    static int clipexportsavedhidehud = 0, clipexportsavedthirdperson = 0, clipexportsavedsoundvol = 255, clipexportsavedfullconsole = 0;
++    static int clipexportsavedhidehud = 0, clipexportsavedthirdperson = 0, clipexportsavedfullconsole = 0;
 +    // Task 5: the window TITLE is the one progress channel that survives clean capture intact -
 +    // g3d_render()'s gui rendering and renderconsole() both land IN the captured framebuffer
 +    // (see the review-fix comments on clearguis()/fullconsole below), but SDL_SetWindowTitle()
 +    // only ever touches OS window-manager chrome, which is compositor-drawn outside the app's
 +    // own pixel buffer and is never part of what glReadPixels()/the FBO blit captures. Snapshot
-+    // + restore follows the exact same idiom as hidehud/thirdperson/soundvol/fullconsole above.
++    // + restore follows the exact same idiom as hidehud/thirdperson/fullconsole above.
 +    static string clipexportsavedtitle = "";
 +    static int clipexportlasttitleupdate = 0;
 +
@@ -1654,13 +1921,14 @@
 +        if(clipexportsettingsapplied) return;
 +        clipexportsavedhidehud = hidehud;
 +        clipexportsavedthirdperson = thirdperson;
-+        clipexportsavedsoundvol = soundvol;
 +        clipexportsavedfullconsole = fullconsole;
 +        if(screen) copystring(clipexportsavedtitle, SDL_GetWindowTitle(screen));
 +        else clipexportsavedtitle[0] = '\0';
 +        hidehud = 1;       // clean capture: no HUD/crosshair/console (the SwiftGibs overlays piggyback on this same var - see fpsgame/fps.cpp's gameplayhud() comment)
 +        thirdperson = 0;   // first-person: hudplayer()/isthirdperson() (engine/rendergl.cpp) only bypass the followed target's POV when thirdperson is nonzero AND allowthirdperson() - forcing 0 guarantees the locked POV actually renders in first person
-+        if(!clipexportsound) soundvol = 0; // Task 5's "sound on/off" setting (clipexportsound VARP, above): a courtesy mute for the exporting player's OWN live playback ONLY - export is real-time foreground playback (the design doc is explicit this takes at least as long as the clip). The piped output never carries audio yet regardless of this setting (task 2's documented limitation) - see checkclipexport()'s unconditional "-an" below - so this can never be mistaken for an "include audio in the video" toggle.
++        // soundvol is deliberately left untouched now (see clipexportsound's own comment above) -
++        // audio in the export comes from the same live Mix_SetPostMix stream the player hears, so
++        // muting soundvol here would silence the capture, not just the speakers.
 +        fullconsole = 0;   // review fix: renderconsole()'s gate (engine/rendergl.cpp) is "!hidehud || fullconsole" - fullconsole BYPASSES hidehud entirely, so a player with it toggled on would otherwise get console text burned into the video
 +        clearguis(-1);     // -1 = clear the whole gui stack (clearguis()'s own default, repeated explicitly here - see the extern declaration in shared/iengine.h for why). review fix: gl_drawhud()'s g3d_render() call (engine/rendergl.cpp) has no hidehud gate at all (unlike gameplayhud/drawcrosshair/renderconsole) - closing whatever menu launched the export (Task 5's clips-page row) is the only thing that actually keeps it out of the opening frames
 +        if(screen) SDL_SetWindowTitle(screen, "SwiftGibs - preparing clip export...");
@@ -1673,7 +1941,6 @@
 +        if(!clipexportsettingsapplied) return;
 +        hidehud = clipexportsavedhidehud;
 +        thirdperson = clipexportsavedthirdperson;
-+        soundvol = clipexportsavedsoundvol;
 +        fullconsole = clipexportsavedfullconsole;
 +        if(screen) SDL_SetWindowTitle(screen, clipexportsavedtitle);
 +        clipexportsettingsapplied = false;
@@ -1760,6 +2027,20 @@
 +        remove(findfile(clipexportoutpath, "w"));
 +    }
 +
++    // Deletes this export's two possible temp intermediates - the small, already-compressed
++    // video-only file and the small WAV audio file the two-ffmpeg-pass audio design uses (see
++    // clipexportsoundenabled/clipexporttmpvideopath/clipexporttmpwavpath above and
++    // clipexportonplaybackend() below) - if they exist. Called unconditionally on every exit path
++    // (success or failure), regardless of whether sound was actually enabled for THIS export:
++    // remove() on a path that was never created (the sound-disabled case, where pass 1 writes
++    // straight to clipexportoutpath as it always has) is the same harmless no-op
++    // clipexportremoveoutput() above already relies on. Never touches clipexportoutpath itself.
++    static void clipexportremovetempfiles()
++    {
++        if(clipexporttmpvideopath[0]) remove(findfile(clipexporttmpvideopath, "w"));
++        if(clipexporttmpwavpath[0]) remove(findfile(clipexporttmpwavpath, "w"));
++    }
++
 +    // The single non-success teardown path: cancellation, failure, a WAITING-phase timeout,
 +    // disconnect/quit, or an unexpected map change mid-export. Always: re-arms the watchdog's
 +    // grace window then kills the child directly ourselves too (faster than waiting for the
@@ -1790,6 +2071,7 @@
 +        killprocesspipe(clipexportpipe);   // finish reaping our own pipe/child bookkeeping - safe now nothing else touches it
 +
 +        clipexportremoveoutput();
++        clipexportremovetempfiles();
 +        clipexportrestoresettings();
 +
 +        conoutf("clip export stopped: %s", reason);
@@ -1801,6 +2083,15 @@
 +    // is in progress or capture hadn't actually started yet (a demoend before players[1] was
 +    // even identified means something went wrong loading the clip, not a real export to finish -
 +    // routed to the same abort/cleanup path with an explanatory reason).
++    //
++    // Audio (this task): when clipexportsoundenabled, pass 1 (above, in checkclipexport()) wrote
++    // a small ALREADY-COMPRESSED video-only file to clipexporttmpvideopath rather than straight to
++    // clipexportoutpath, and engine/movie.cpp's pipewriter captured the game's own audio into
++    // clipexporttmpwavpath alongside it. Once pass 1 has cleanly finished (below), a SECOND, fast
++    // ffmpeg pass muxes those two small intermediates - `-c:v copy` (no video re-encode at all,
++    // just remux) plus an audio encode of the small WAV - into the real clipexportoutpath. When
++    // sound is disabled, none of this runs: pass 1 already wrote directly to clipexportoutpath,
++    // exactly as before this task.
 +    void clipexportonplaybackend()
 +    {
 +        if(clipexportphase == CLIPEXPORT_IDLE) return;
@@ -1810,9 +2101,9 @@
 +        clipexportwdfinishing = true;
 +        clipexportwdfinishdeadline = (int)SDL_GetTicks() + clipexportfinishtimeout*1000;
 +
-+        recorder::stop();                                       // encoder finishes delivering whatever's already queued, then its thread exits
++        recorder::stop();                                       // encoder finishes delivering whatever's already queued (video AND sound - see pipewriter::writesound()), then its thread exits; DELETEP(file) inside stop() also finalises + closes the WAV temp file's header (pipewriter's destructor)
 +
-+        // CRITICAL review fix: the watchdog must stay ALIVE across this next call.
++        // CRITICAL review fix (Task 4): the watchdog must stay ALIVE across this next call.
 +        // closeprocesspipe() does a plain blocking waitpid() with no timeout of its own, waiting
 +        // for ffmpeg to exit after seeing EOF. If ffmpeg accepts every frame normally but never
 +        // exits, this hangs the MAIN THREAD forever - freezing the whole game (no UI left to
@@ -1828,15 +2119,90 @@
 +        // write of clipexportpipe.pid=-1 once the reap completes - an unsynchronised read/write
 +        // of a plain int, same accepted-risk category as this codebase's other cross-thread
 +        // flags; worst case is a redundant/no-op signal, not a crash. See processpipe.h's own
-+        // doc comment on requestchildkill() for the general reasoning this leans on.)
++        // doc comment on requestchildkill() for the general reasoning this leans on, and for the
++        // SAME pattern being deliberately repeated a second time below for the mux pass.)
 +        int exitcode = closeprocesspipe(clipexportpipe);         // close our end (ffmpeg sees EOF), wait for it to finish encoding and exit, reap it - the STILL-RUNNING watchdog is what actually bounds this wait, not this call itself
-+        clipexportstopwatchdog();                                 // NOW join - safe/fast, since whatever the watchdog was guarding against is already resolved (ffmpeg exited on its own, or the watchdog already killed it)
++        bool pass1failed = (exitcode != 0 || clipexportwdfired);
 +
++        // Pass 2: mux audio in, only if pass 1 succeeded cleanly and this export actually wanted
++        // sound. The watchdog is DELIBERATELY kept alive across this second blocking wait too
++        // (not stopped and restarted) - for the exact same reason the critical fix above keeps it
++        // alive across the first: closeprocesspipe() here has no timeout of its own either, and a
++        // mux ffmpeg that hangs would otherwise freeze the main thread with nothing left to
++        // rescue it. Reusing clipexportpipe (already closed and reaped by the line above, so
++        // openprocesspipe() below is reopening a non-open struct - the ordinary supported case)
++        // for this second child is what lets the watchdog thread's own code (which only ever
++        // reads clipexportpipe.pid/.process, completely unchanged since Task 3) protect this new
++        // phase with ZERO changes to the watchdog thread itself.
++        bool muxattempted = false, muxfailed = false, wdfiredmux = false;
++        int muxexitcode = 0;
++        if(!pass1failed && clipexportsoundenabled)
++        {
++            muxattempted = true;
++            clipexportwdfired = false; // fresh flag for this second wait - pass 1's is already consumed above (pass1failed)
++            clipexportwdfinishdeadline = (int)SDL_GetTicks() + clipexportmuxtimeout*1000;
++
++            // findfile() returns a pointer into its own single static scratch buffer - resolving
++            // three paths here (final output, tmp video, tmp wav) needs each copied out
++            // immediately, same fix and same reasoning as checkclipexport()'s pass 1 argv build
++            // above (found by the same test failure: ffmpeg's inputs pointed at the wrong path
++            // until this was fixed).
++            string resolvedfinal, resolvedtmpvideo, resolvedtmpwav;
++            copystring(resolvedfinal, findfile(clipexportoutpath, "w"));
++            copystring(resolvedtmpvideo, findfile(clipexporttmpvideopath, "w"));
++            copystring(resolvedtmpwav, findfile(clipexporttmpwavpath, "w"));
++            bool webm = !strcmp(clipexportext, "webm");
++            const char *argv[24]; // needs 21 slots at most (non-webm branch: 18 fixed + -shortest + output + NULL) - sized with headroom, matching pass 1's own argv[32] convention
++            int argc = 0;
++            argv[argc++] = clipexportffmpegpath;
++            argv[argc++] = "-y";
++            argv[argc++] = "-hide_banner";
++            argv[argc++] = "-loglevel"; argv[argc++] = "error";
++            argv[argc++] = "-nostats";
++            argv[argc++] = "-i"; argv[argc++] = resolvedtmpvideo;
++            argv[argc++] = "-i"; argv[argc++] = resolvedtmpwav;
++            argv[argc++] = "-c:v"; argv[argc++] = "copy"; // pass 1 already encoded the video - never re-encode it here, this pass only adds audio
++            if(webm)
++            {
++                argv[argc++] = "-c:a"; argv[argc++] = "libopus"; // royalty-free, matching the design doc's own reasoning for offering WebM/VP9 at all
++            }
++            else
++            {
++                argv[argc++] = "-c:a"; argv[argc++] = "aac"; argv[argc++] = "-b:a"; argv[argc++] = "160k";
++                argv[argc++] = "-movflags"; argv[argc++] = "+faststart"; // matches pass 1's own mp4 flag - the FINAL file is what actually ships, so it needs this, not the discarded temp
++            }
++            argv[argc++] = "-shortest"; // safety net for a marginal (sub-frame-in-practice) tail-length mismatch between the two independently-captured streams, not a sync fix - see ce-task-5b-report.md's measured offset
++            argv[argc++] = resolvedfinal;
++            argv[argc++] = NULL;
++
++            if(!openprocesspipe(clipexportpipe, argv))
++            {
++                muxfailed = true;
++                muxexitcode = -1;
++            }
++            else
++            {
++                muxexitcode = closeprocesspipe(clipexportpipe);
++                wdfiredmux = clipexportwdfired;
++                if(muxexitcode != 0 || wdfiredmux) muxfailed = true;
++            }
++        }
++
++        clipexportstopwatchdog(); // NOW join - after every blocking wait this export will ever do (pass 1's close above, and pass 2's mux close if it ran)
++
++        clipexportremovetempfiles(); // the two small intermediates are never the deliverable - always cleaned up regardless of outcome
 +        clipexportrestoresettings();
 +
-+        if(exitcode == 0 && !clipexportwdfired)
++        bool ok = !pass1failed && (!clipexportsoundenabled || (muxattempted && !muxfailed));
++        if(ok)
 +        {
 +            conoutf("clip exported: %s", clipexportoutpath);
++        }
++        else if(muxattempted)
++        {
++            conoutf(CON_ERROR, "exportclip: audio mux failed (%d)%s - output removed", muxexitcode,
++                    wdfiredmux ? ", had to be force-stopped" : "");
++            clipexportremoveoutput();
 +        }
 +        else
 +        {
@@ -1910,7 +2276,31 @@
 +            static const char *const mp4crf[3]  = { "26", "20", "16" };
 +            static const char *const webmcrf[3] = { "38", "32", "26" };
 +            int qidx = clamp(clipexportquality, 0, 2); // defensive; the VARP's own range already guarantees this
-+            const char *resolvedout = findfile(clipexportoutpath, "w");
++            // Audio (this task): when sound is enabled for this export, pass 1's OUTPUT is the
++            // small video-only temp file, not the final path - clipexportonplaybackend() runs a
++            // second, fast mux pass once this one finishes cleanly (see its own doc comment).
++            // When sound is disabled, pass 1 writes straight to clipexportoutpath, exactly as
++            // before this task - the simple/common case is untouched.
++            // NOTE: findfile() returns a pointer into its OWN single static scratch buffer, so
++            // resolving a path and holding it while resolving another (needed here, unlike the
++            // original single-findfile()-call code this replaces) requires copying the result
++            // out immediately - otherwise a later findfile() call silently clobbers the earlier
++            // one's buffer (found by testing: ffmpeg's actual argv[argc-1] ended up pointing at
++            // the wav path instead of the video path until this was fixed).
++            const char *pass1target = clipexportsoundenabled ? clipexporttmpvideopath : clipexportoutpath;
++            string resolvedout;
++            copystring(resolvedout, findfile(pass1target, "w"));
++            // clipexporttmpwavpath is passed to recorder::startpipe() UNRESOLVED (deliberately
++            // NOT findfile()'d here, unlike resolvedout above): pipewriter's own openwav()
++            // reaches the engine's openfile(), which calls findfile() on it ITSELF internally
++            // (shared/stream.cpp's openrawfile()) - findfile()-ing it a second time here would
++            // prepend homedir twice, silently writing the wav to a bogus double-prefixed path
++            // (found by testing: pass 2 then failed with "No such file or directory" because the
++            // wav simply wasn't at the path it looked for). aviwriter's own file follows the
++            // identical single-resolution rule (its filename is handed to openfile() raw, never
++            // pre-findfile()'d) - this matches that existing precedent instead of inventing a
++            // second one. Only paths that reach ffmpeg's OWN argv (an external process with no
++            // notion of homedir) need findfile()'d here.
 +            const char *argv[32];
 +            int argc = 0;
 +            argv[argc++] = clipexportffmpegpath;
@@ -1948,10 +2338,10 @@
 +                clipexportabort("could not launch ffmpeg");
 +                return;
 +            }
-+            if(!recorder::startpipe(clipexportpipe, clipexportfps, clipexportwidth, clipexportheight))
++            if(!recorder::startpipe(clipexportpipe, clipexportfps, clipexportwidth, clipexportheight, clipexportsoundenabled, clipexporttmpwavpath))
 +            {
 +                killprocesspipe(clipexportpipe);
-+                clipexportabort("capture already active");
++                clipexportabort("could not start capture (already active, or the sound temp file could not be created)");
 +                return;
 +            }
 +
@@ -2060,6 +2450,16 @@
 +            conoutf(CON_ERROR, "exportclip: could not find a free output filename in %s", videodir);
 +            return;
 +        }
++        // Audio: snapshot clipexportsound (like width/height/fps/ext above) so a mid-export
++        // settings-page change never affects an export already in flight, and derive this
++        // export's two small temp-intermediate paths from the now-finalised, collision-free
++        // clipexportoutpath - see the declaration comment on clipexportsoundenabled above and
++        // engine/movie.cpp's pipewriter doc comment for why these exist. Computed unconditionally
++        // (cheap string formatting) regardless of the sound setting, so clipexportremovetempfiles()
++        // can always safely attempt to clean them up on every exit path.
++        clipexportsoundenabled = clipexportsound != 0;
++        formatstring(clipexporttmpvideopath, "%s.tmpvideo.%s", clipexportoutpath, clipexportext);
++        formatstring(clipexporttmpwavpath, "%s.tmpaudio.wav", clipexportoutpath);
 +
 +        clipexportwidth = *width;
 +        clipexportheight = *height;
@@ -2110,7 +2510,7 @@
      void c2sinfo(bool force) // send update to the server
      {
          static int lastupdate = -1000;
-@@ -2768,6 +3358,13 @@
+@@ -2768,6 +3518,13 @@
                  player1->clientnum = getint(p);
                  gamepaused = false;
                  execident(on ? "demostart" : "demoend");
@@ -2156,3 +2556,4 @@
  
          clearmovables();
          clearmonsters();
+
