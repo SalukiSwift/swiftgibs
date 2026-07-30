@@ -10,7 +10,7 @@
  	engine/rendermodel.o \
 --- a/engine/processpipe.h
 +++ b/engine/processpipe.h
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,211 @@
 +// engine/processpipe.h: controlled child-process launch with a writable
 +// pipe to the child's stdin.
 +//
@@ -196,12 +196,29 @@
 +// child that hangs after seeing EOF would freeze the main thread forever.
 +// Reaping first and joining last, twice over, trades that deterministic
 +// hang for an unsynchronised read/write race on a plain int/HANDLE: the
-+// realistic worst case is a redundant, harmless signal-to-a-pid-not-yet-
-+// overwritten, or (astronomically unlikely, since the OS cannot reissue a
-+// pid before this process's own waitpid()/GetExitCodeProcess() call has
-+// already collected it) a signal to an unrelated freshly-spawned process.
++// realistic worst case on POSIX is a redundant, harmless signal-to-a-pid-
++// not-yet-overwritten, or (astronomically unlikely, since the OS cannot
++// reissue a pid before this process's own waitpid() call has already
++// collected it) a signal to an unrelated freshly-spawned process.
 +// Both outcomes are accepted, documented risk, not a silently missed case -
 +// see clipexportonplaybackend()'s own comments for the exact sequencing.
++//
++// WINDOWS IS A STRICTLY WORSE VERSION OF THIS RACE, not just the same one
++// with different names: reapprocesspipe() (engine/processpipe.cpp) calls
++// CloseHandle((HANDLE)p.process) BEFORE it sets p.process = NULL, so the
++// window here is a read of a value whose handle has ALREADY BEEN CLOSED,
++// not merely a stale-but-still-open one - GetExitCodeProcess()'s own read
++// of that same handle has already happened by this point, so the handle
++// is genuinely dead, not just logically "ours to reap." Worse still, Win32
++// recycles handle values far more aggressively than POSIX recycles pids
++// (the very next CreateFile/CreateProcess/CreateThread/etc. anywhere in
++// this process can reuse that exact numeric value), and TerminateProcess()
++// on a reused value need not even hit another PROCESS handle - Windows
++// HANDLEs are one namespace across kernel object types, so the "unrelated
++// freshly-spawned process" framing above is the OPTIMISTIC Windows case,
++// not the realistic one. This is accepted here for the same reason as the
++// POSIX case (see above), but do not read the "astronomically unlikely"
++// characterisation above as applying to this platform too.
 +extern void requestchildkill(const processpipe &p);
 +
 +#endif
@@ -1786,7 +1803,7 @@
      }
  
      VARP(teamcolorchat, 0, 1, 1);
-@@ -1980,6 +1991,745 @@
+@@ -1980,6 +1991,795 @@
      }
      // === end SwiftGibs instant replay: recording modes =======================================
  
@@ -1909,7 +1926,10 @@
 +    // formatting) regardless of clipexportsoundenabled, so clipexportremovetempfiles() can always safely attempt
 +    // to remove them on every exit path - remove() on a path never actually created (the sound-disabled case,
 +    // where pass 1 writes straight to clipexportoutpath as it always has) is the same harmless no-op
-+    // clipexportremoveoutput() below already relies on.
++    // clipexportremoveoutput() below already relies on. Both live in videodir alongside the real
++    // output but dot-prefixed (see exportclip()'s construction of them) so a hard kill mid-export
++    // - the one exit path that can't clean up after itself - doesn't leave what looks like a
++    // finished, playable video sitting in the user-visible folder.
 +    static bool clipexportsoundenabled = false;
 +    static string clipexporttmpvideopath = "";
 +    static string clipexporttmpwavpath = "";
@@ -2433,7 +2453,25 @@
 +    void exportclip(char *name, int *width, int *height, int *fps, char *format)
 +    {
 +        if(clipexportphase != CLIPEXPORT_IDLE) { conoutf(CON_ERROR, "exportclip: an export is already in progress (cancelclipexport to stop it)"); return; }
-+        if(connected) { conoutf(CON_ERROR, "exportclip: disconnect first - clip export can't run during live play"); return; }
++        // Refuse only REAL live play, not a bare `connected`: a genuine remote match
++        // (remote==true, whatever gamemode happens to be) always refuses, but a local/offline
++        // session sitting in demo/clip-playback mode (gamemode==-1, fpsgame/game.h's
++        // gamemodes[] index STARTGAMEMODE+2, "demo") does not, even though `connected` is true
++        // there too. That last part matters: enddemoplayback() (fpsgame/server.cpp) re-sends
++        // sendwelcome() to the local client at the end of EVERY demo/clip playback - natural
++        // end, cancellation, or this very function's own stopdemo() call a few lines down to
++        // end whatever was already playing before this export's clip loads - which sets
++        // `connected` back to true via N_WELCOME (case N_WELCOME, above) even though nothing
++        // resembling live play is happening. A bare `if(connected)` therefore refuses every
++        // SECOND export attempted in a session PERMANENTLY, not briefly: nothing clears
++        // `connected` again afterwards short of an actual disconnect. `remote` does not have
++        // this problem - gameconnect()'s bool is set once, at the real connect (network for a
++        // remote server, false for localconnect()'s offline/single-player/demo path), and stays
++        // exactly that until an actual disconnect, regardless of how many demos/clips have
++        // played since - so it is the reliable "is this actually live play" signal here, with
++        // gamemode!=-1 catching the remaining case of a genuinely live LOCAL/offline game (SP,
++        // DMSP, coop edit - all also `remote==false` but very much not clip playback).
++        if(remote || (connected && gamemode != -1)) { conoutf(CON_ERROR, "exportclip: disconnect first - clip export can't run during live play"); return; }
 +        if(!name[0]) { conoutf(CON_ERROR, "exportclip: no clip name given"); return; }
 +        copystring(clipexportffmpegpath, clipexportffmpeg[0] ? clipexportffmpeg : clipexportdefaultffmpeg);
 +        if(!fileexists(clipexportffmpegpath, "r"))
@@ -2467,6 +2505,20 @@
 +        copystring(clipbase, name);
 +        size_t blen = strlen(clipbase);
 +        if(blen >= 4 && !strcasecmp(&clipbase[blen-4], ".dmo")) clipbase[blen-4] = '\0';
++        // Actually sanitise, matching clipexportuniquepath()'s own doc comment above (which
++        // already claimed this happens) and the same clipsanitize() idiom saveclip() uses for
++        // untrusted map/mode names - `name` can reach here straight from a console command, not
++        // just the pre-sanitised menu listing, so it must never be trusted verbatim as a
++        // filename component. Done AFTER stripping ".dmo" above, not before: clipsanitize()
++        // strips '.' along with everything else outside [A-Za-z0-9-_], so sanitising first would
++        // eat the extension's own dot and leave a stray "dmo" glued onto the base instead of
++        // removing it. Safe to sanitise in place (dst==src): clipsanitize() only ever writes at
++        // an index <= the number of source characters already read, so the write cursor never
++        // laps the read cursor. A legitimate saveclip()-written name (whose timestamp legally
++        // contains '.', e.g. "2026-07-29_23.47.05_map_mode") still sanitises to a valid,
++        // merely dot-stripped basename, not an empty one - clipsanitize()'s "clip" fallback below
++        // only matters for a name that is nothing BUT stripped characters.
++        clipsanitize(clipbase, sizeof(clipbase), clipbase, "clip");
 +        if(!clipexportuniquepath(clipbase, clipexportext, clipexportoutpath, sizeof(clipexportoutpath)))
 +        {
 +            conoutf(CON_ERROR, "exportclip: could not find a free output filename in %s", videodir);
@@ -2480,8 +2532,23 @@
 +        // (cheap string formatting) regardless of the sound setting, so clipexportremovetempfiles()
 +        // can always safely attempt to clean them up on every exit path.
 +        clipexportsoundenabled = clipexportsound != 0;
-+        formatstring(clipexporttmpvideopath, "%s.tmpvideo.%s", clipexportoutpath, clipexportext);
-+        formatstring(clipexporttmpwavpath, "%s.tmpaudio.wav", clipexportoutpath);
++        // Dot-prefix the two small ffmpeg-pass intermediates so a mid-export directory listing -
++        // or a hard kill, which leaves whatever's on disk exactly where every other exit path
++        // already cleans it up from, see clipexportremovetempfiles() above - doesn't show what
++        // looks like a playable, finished video sitting in the user-visible videos folder for
++        // the whole duration of every export. Same directory as the real output (kept
++        // collision-free by deriving from clipexportoutpath, already resolved above), just
++        // hidden: split clipexportoutpath at its LAST '/' - the literal separator
++        // clipexportuniquepath() itself builds paths with, not PATHDIV, since this is a
++        // virtual/relative path fed to findfile(), not a raw OS path - and insert the dot right
++        // before the filename component, not the directory. clipexportremovetempfiles() and the
++        // pass-2 mux argv build (below) both read these same two variables verbatim, so every
++        // consumer of them picks up the hidden path automatically; nothing else needs to change.
++        const char *tmpslash = strrchr(clipexportoutpath, '/');
++        const char *tmpbase = tmpslash ? tmpslash+1 : clipexportoutpath;
++        int tmpdirlen = (int)(tmpbase - clipexportoutpath);
++        formatstring(clipexporttmpvideopath, "%.*s.%s.tmpvideo.%s", tmpdirlen, clipexportoutpath, tmpbase, clipexportext);
++        formatstring(clipexporttmpwavpath, "%.*s.%s.tmpaudio.wav", tmpdirlen, clipexportoutpath, tmpbase);
 +
 +        clipexportwidth = *width;
 +        clipexportheight = *height;
@@ -2532,7 +2599,7 @@
      void c2sinfo(bool force) // send update to the server
      {
          static int lastupdate = -1000;
-@@ -2768,6 +3518,13 @@
+@@ -2768,6 +3568,13 @@
                  player1->clientnum = getint(p);
                  gamepaused = false;
                  execident(on ? "demostart" : "demoend");
