@@ -291,46 +291,33 @@
      }
  
      VARP(teamcolorchat, 0, 1, 1);
-@@ -1243,18 +1251,38 @@
+@@ -1241,6 +1249,25 @@
+         sendclientpacket(q.finalize(), 0);
+     }
  
++    // SwiftGibs clip fidelity: the 33ms c2sinfo cadence undersamples fast flicks, which is why
++    // a played-back kill could show the crosshair off the victim. Sample our own view every
++    // clipposinterval ms instead (records are local: ~40 bytes each, ~3KB/s at the default -
++    // nothing against the ring). Same gating as the c2sinfo-site tap this supersedes.
++    VARP(clipposinterval, 5, 12, 33);
++    void cliprecordownpos()
++    {
++        static int lastclipownpos = 0;
++        if(demoplayback) return;
++        if(!(clipactive() || clipanysinkactive())) return;
++        if(!(player1->state == CS_ALIVE || player1->state == CS_EDITING)) return;
++        if(player1->clientnum < 0) return;
++        if(totalmillis - lastclipownpos < clipposinterval) return;
++        lastclipownpos = totalmillis;
++        packetbuf q(100);
++        sendposition(player1, q);
++        cliprecord(0, q.buf, q.len);
++    }
++
      void sendpositions()
      {
-+        // SwiftGibs: gate the replay-clip capture - off, or during demo PLAYBACK (Task 3; see
-+        // localservertoclient() in engine/client.cpp for the raw-packet half of this same
-+        // suppression), = zero extra work. player1 is always CS_SPECTATOR during playback so
-+        // this branch would already skip in practice, but the explicit check documents intent
-+        // and costs one extra bool read.
-+        // Task 3b: also active while a manual or always-on recording is running, even with the
-+        // ring itself off (clips 0) - a recording needs the local player's own movement exactly
-+        // as much as the ring does, and "off is genuinely off" is a per-mode guarantee, not an
-+        // all-or-nothing one. clipanysinkactive() is one more cheap OR'd bool read.
-+        bool rc = (clipactive() || clipanysinkactive()) && !demoplayback;
          loopv(players)
-         {
-             fpsent *d = players[i];
-             if((d == player1 || d->ai) && (d->state == CS_ALIVE || d->state == CS_EDITING))
-             {
-                 packetbuf q(100);
-+                int qs = q.len;
-                 sendposition(d, q);
-+                // SwiftGibs: the server never echoes our own N_POS back - synthesise it here by
-+                // reusing the exact bytes sendposition() just packed (byte-identical to what
-+                // the server sends other clients for us on this same channel), at the same
-+                // cadence as the real broadcast (c2sinfo(), throttled to no faster than 33ms).
-+                if(rc && d == player1) cliprecord(0, &q.buf[qs], q.len - qs);
-                 for(int j = i+1; j < players.length(); j++)
-                 {
-                     fpsent *d = players[j];
-                     if((d == player1 || d->ai) && (d->state == CS_ALIVE || d->state == CS_EDITING))
-+                    {
-+                        int qs2 = q.len;
-                         sendposition(d, q);
-+                        if(rc && d == player1) cliprecord(0, &q.buf[qs2], q.len - qs2);
-+                    }
-                 }
-                 sendclientpacket(q.finalize(), 0);
-                 break;
-@@ -1262,6 +1290,26 @@
+@@ -1262,6 +1289,34 @@
          }
      }
  
@@ -344,6 +331,14 @@
 +        if(demoplayback) return;
 +        if(!(clipactive() || clipanysinkactive())) return;
 +        if(player1->clientnum < 0) return;
++        // Exact-aim snapshot at the fire tick: guarantees the timeline contains the aim that
++        // fired this shot (N_POS quantises yaw/pitch to whole integer degrees - 1-degree steps,
++        // truncated toward zero, packed together into a single 16-bit "dir" field, see
++        // cliprecordownpos() above and sendposition()/parsepositions() below; the SwiftGibs
++        // playback-side ray snap refines this to DMF precision - see clipaimsnap).
++        packetbuf ap(100);
++        sendposition(player1, ap);
++        cliprecord(0, ap.buf, ap.len);
 +        packetbuf q(48);
 +        putint(q, N_SHOTFX);
 +        putint(q, player1->clientnum);
@@ -357,7 +352,7 @@
      void sendmessages()
      {
          packetbuf p(MAXTRANS);
-@@ -1298,12 +1346,664 @@
+@@ -1298,12 +1353,664 @@
          sendclientpacket(p.finalize(), 1);
      }
  
@@ -1022,7 +1017,7 @@
          sendmessages();
          flushclient();
      }
-@@ -1803,6 +2503,26 @@
+@@ -1803,6 +2510,26 @@
                      if(killstreak > beststreak) beststreak = killstreak;
                      if(killstreak > matchbeststreak) matchbeststreak = killstreak;
                      if(killstreak % 5 == 0 && killstreak <= 20) killstreakmilestone(killstreak/5);
@@ -1091,7 +1086,7 @@
      extern fpsent *hudplayer();
      extern fpsent *followingplayer(fpsent *fallback = NULL);
      extern void stopfollowing();
-@@ -829,6 +830,18 @@
+@@ -829,6 +830,19 @@
      extern void getbestteams(vector<const char *> &best);
      extern void clearteaminfo();
      extern void setteaminfo(const char *team, int frags);
@@ -1100,6 +1095,7 @@
 +    // (startgame()/timeupdate()/gameplayhud() all live there), implemented in fpsgame/client.cpp
 +    // alongside the rest of the clip machinery - same cross-file pattern as getteaminfos() above.
 +    extern void cliprecordfinalizeall(const char *reason);   // finalise+save any in-progress recording(s)
++    extern void cliprecordownpos();   // SwiftGibs: dense own-view sampler for clips, called once per frame
 +    extern void cliprecordownshot(int id, int gun, const vec &from, const vec &to);   // SwiftGibs: own-shot record for clips
 +    extern void cliprecordarmmatchstart();                   // arm always-on to (maybe) start next tick
 +    extern bool cliprecordmanualactive();                    // for the on-screen indicator
@@ -1195,7 +1191,27 @@
      void setupcamera()
      {
          fpsent *target = followingplayer();
-@@ -672,6 +687,13 @@
+@@ -244,6 +259,19 @@
+         if(!maptime) { maptime = lastmillis; maprealtime = totalmillis; return; }
+         if(!curtime) { gets2c(); if(player1->clientnum>=0) c2sinfo(); return; }
+ 
++        // SwiftGibs clip fidelity: dense own-view sampling, once per real game-logic tick (see
++        // cliprecordownpos() in fpsgame/client.cpp for the internal rate-limit/gating - this
++        // call itself is cheap, a handful of int compares, whenever off or throttled). Placed
++        // right after the two early-return guards above rather than literally the first line of
++        // the function: patches/19-clip-export.patch's checkclipexport() already anchors its own
++        // hunk on that exact spot (immediately after the opening brace, before
++        // updatereloadmetronome()), and both of those guard branches skip frames where nothing
++        // about the local player's aim actually changes (no map yet, or curtime==0 - paused, or
++        // (rare) a genuinely zero-elapsed-time frame at very high fps) - so this position is
++        // functionally equivalent to "the top" for capture purposes while leaving patch 19's
++        // anchor context undisturbed.
++        cliprecordownpos();
++
+         physicsframe();
+         ai::navigate();
+         if(player1->state != CS_DEAD && !intermission)
+@@ -672,6 +700,13 @@
              {
                  case ID_VAR:   f->printf("%s %d\n", names[i], *id->storage.i); break;
                  case ID_FVAR:  f->printf("%s %s\n", names[i], floatstr(*id->storage.f)); break;
@@ -1209,7 +1225,7 @@
                  case ID_ALIAS: f->printf("%s = [%s]\n", names[i], id->getstr()); break;
              }
          }
-@@ -749,6 +771,16 @@
+@@ -749,6 +784,16 @@
          else
          {
              intermission = true;
@@ -1226,7 +1242,7 @@
              player1->attacking = false;
              if(cmode) cmode->gameover();
              conoutf(CON_GAMEINFO, "\f2intermission:");
-@@ -840,6 +872,24 @@
+@@ -840,6 +885,24 @@
  
      void startgame()
      {
@@ -1251,7 +1267,7 @@
          clearmovables();
          clearmonsters();
  
-@@ -995,10 +1045,10 @@
+@@ -995,10 +1058,10 @@
  
      const char *colorname(fpsent *d, const char *name, const char *prefix, const char *suffix, const char *alt)
      {
@@ -1264,7 +1280,7 @@
          {
              formatstring(hpre, "\fs\f%s%s", selfcolor, prefix);
              formatstring(hsuf, "%s\fr", suffix);
-@@ -1026,7 +1076,7 @@
+@@ -1026,7 +1089,7 @@
      const char *teamcolorname(fpsent *d, const char *alt)
      {
          if(!teamcolortext || !m_teammode || d->state==CS_SPECTATOR) return colorname(d, NULL, "", "", alt);
@@ -1273,7 +1289,7 @@
      }
  
      const char *teamcolor(const char *name, bool sameteam, const char *alt)
-@@ -1039,7 +1089,7 @@
+@@ -1039,7 +1102,7 @@
  
      const char *teamcolor(const char *name, const char *team, const char *alt)
      {
@@ -1282,7 +1298,7 @@
      }
  
      VARP(teamsounds, 0, 1, 1);
-@@ -1051,7 +1101,7 @@
+@@ -1051,7 +1114,7 @@
  
      void teamsound(fpsent *d, int n, const vec *loc)
      {
@@ -1291,7 +1307,7 @@
      }
  
      void suicide(physent *d)
-@@ -1874,6 +1924,27 @@
+@@ -1874,6 +1937,27 @@
          pophudmatrix();
      }
  
@@ -1319,7 +1335,7 @@
      void gameplayhud(int w, int h)
      {
          pushhudmatrix();
-@@ -1909,6 +1980,7 @@
+@@ -1909,6 +1993,7 @@
          drawexpandedmap(w, h);
          drawkillstreak(w, h);
          drawflagpopup(w, h);
