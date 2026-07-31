@@ -1191,7 +1191,7 @@
      void setupcamera()
      {
          fpsent *target = followingplayer();
-@@ -244,6 +259,19 @@
+@@ -244,6 +259,24 @@
          if(!maptime) { maptime = lastmillis; maprealtime = totalmillis; return; }
          if(!curtime) { gets2c(); if(player1->clientnum>=0) c2sinfo(); return; }
  
@@ -1201,17 +1201,22 @@
 +        // right after the two early-return guards above rather than literally the first line of
 +        // the function: patches/19-clip-export.patch's checkclipexport() already anchors its own
 +        // hunk on that exact spot (immediately after the opening brace, before
-+        // updatereloadmetronome()), and both of those guard branches skip frames where nothing
-+        // about the local player's aim actually changes (no map yet, or curtime==0 - paused, or
-+        // (rare) a genuinely zero-elapsed-time frame at very high fps) - so this position is
-+        // functionally equivalent to "the top" for capture purposes while leaving patch 19's
-+        // anchor context undisturbed.
++        // updatereloadmetronome()), so inserting there would break its context match on recapture.
++        // This site deliberately skips both early-return cases: no map yet (a single frame right
++        // after a map change) and curtime==0 (paused, or - rare - a genuinely zero-elapsed-time
++        // frame at very high fps). The paused case is not airtight: allowmouselook() returns true
++        // whenever !remote, even while gamepaused, so in a paused LOCAL match the view can still
++        // be swung with the mouse and this site will miss those swings (the old c2sinfo-site tap
++        // did not have this gap, since c2sinfo() is called from both early-return branches too).
++        // Accepted rather than relocated: the world itself is frozen while paused, so paused-camera
++        // swings are not meaningful highlight footage, and moving the hook earlier would collide
++        // with patch 19's anchor described above.
 +        cliprecordownpos();
 +
          physicsframe();
          ai::navigate();
          if(player1->state != CS_DEAD && !intermission)
-@@ -672,6 +700,13 @@
+@@ -672,6 +705,13 @@
              {
                  case ID_VAR:   f->printf("%s %d\n", names[i], *id->storage.i); break;
                  case ID_FVAR:  f->printf("%s %s\n", names[i], floatstr(*id->storage.f)); break;
@@ -1225,7 +1230,7 @@
                  case ID_ALIAS: f->printf("%s = [%s]\n", names[i], id->getstr()); break;
              }
          }
-@@ -749,6 +784,16 @@
+@@ -749,6 +789,16 @@
          else
          {
              intermission = true;
@@ -1242,7 +1247,7 @@
              player1->attacking = false;
              if(cmode) cmode->gameover();
              conoutf(CON_GAMEINFO, "\f2intermission:");
-@@ -840,6 +885,24 @@
+@@ -840,6 +890,24 @@
  
      void startgame()
      {
@@ -1267,7 +1272,7 @@
          clearmovables();
          clearmonsters();
  
-@@ -995,10 +1058,10 @@
+@@ -995,10 +1063,10 @@
  
      const char *colorname(fpsent *d, const char *name, const char *prefix, const char *suffix, const char *alt)
      {
@@ -1280,7 +1285,7 @@
          {
              formatstring(hpre, "\fs\f%s%s", selfcolor, prefix);
              formatstring(hsuf, "%s\fr", suffix);
-@@ -1026,7 +1089,7 @@
+@@ -1026,7 +1094,7 @@
      const char *teamcolorname(fpsent *d, const char *alt)
      {
          if(!teamcolortext || !m_teammode || d->state==CS_SPECTATOR) return colorname(d, NULL, "", "", alt);
@@ -1289,7 +1294,7 @@
      }
  
      const char *teamcolor(const char *name, bool sameteam, const char *alt)
-@@ -1039,7 +1102,7 @@
+@@ -1039,7 +1107,7 @@
  
      const char *teamcolor(const char *name, const char *team, const char *alt)
      {
@@ -1298,7 +1303,7 @@
      }
  
      VARP(teamsounds, 0, 1, 1);
-@@ -1051,7 +1114,7 @@
+@@ -1051,7 +1119,7 @@
  
      void teamsound(fpsent *d, int n, const vec *loc)
      {
@@ -1307,7 +1312,7 @@
      }
  
      void suicide(physent *d)
-@@ -1874,6 +1937,27 @@
+@@ -1874,6 +1942,27 @@
          pophudmatrix();
      }
  
@@ -1335,7 +1340,7 @@
      void gameplayhud(int w, int h)
      {
          pushhudmatrix();
-@@ -1909,6 +1993,7 @@
+@@ -1909,6 +1998,7 @@
          drawexpandedmap(w, h);
          drawkillstreak(w, h);
          drawflagpopup(w, h);
