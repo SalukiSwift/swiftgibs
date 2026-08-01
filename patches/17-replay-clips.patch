@@ -1,6 +1,6 @@
 --- a/engine/client.cpp
 +++ b/engine/client.cpp
-@@ -204,8 +204,255 @@
+@@ -204,8 +204,331 @@
      if(disc) disconnect();
  }
  
@@ -20,17 +20,57 @@
 +static uchar *clipbuf = NULL;
 +static int clipbufsize = 0;            // allocated bytes (0 when the feature is off)
 +static int clipwritepos = 0;           // next write offset
-+static bool clipfull = false;          // ring has wrapped at least once (oldest data starts at clipwritepos)
++static bool clipfull = false;          // ring has wrapped at least once (old-lap data, if any remains
++                                        // unclobbered, lives in [cliporigin, clipwraplimit) - see cliporigin)
 +static int clipwraplimit = 0;          // Task 2: dead-zone boundary from the most recent early wrap (see
 +                                        // cliprecord() below) - bytes [clipwraplimit, clipbufsize) are stale,
 +                                        // never-reharvested tail from an older lap and must never be parsed as
 +                                        // a record. Written only on the (already rare) wrap branches, so this
 +                                        // adds nothing to the steady-state per-record cost.
++static int cliporigin = 0;             // Task 2 fix (clip-round3): byte offset of the OLDEST record that is
++                                        // still fully intact. Invariant: once the ring has wrapped at least
++                                        // once (clipfull), cliporigin always points at the header of a real,
++                                        // unclobbered record; before that first wrap (or immediately after
++                                        // clipfree()/clipsync() resets everything), there is no old lap to
++                                        // track and cliporigin simply sits at 0, same as clipwritepos at that
++                                        // point. Advanced record-by-record in cliprecord() below using each
++                                        // old record's OWN header - still readable, since only bytes strictly
++                                        // before the current clipwritepos have been overwritten by the new lap
++                                        // so far - every time an incoming write is about to clobber it, and
++                                        // reset to 0 on every wrap (a fresh lap always starts writing at
++                                        // offset 0, so whatever the just-completed lap wrote AT offset 0 - its
++                                        // own first record - is the new oldest-intact record). Amortised O(1)
++                                        // per write: each byte is only ever skipped over by this advance once
++                                        // between one wrap and the next, never revisited.
 +
 +bool clipactive() { return clipbuf != NULL; }
 +
 +static void clipsinkappend(int slot, int chan, const void *data, int len);   // fwd decl - defined in the
 +                                                                              // recording-sinks block below
++
++// Task 2 fix (clip-round3): advances cliporigin past any old-lap record(s) that a write about to
++// land in [clipwritepos, clipwritepos+total) would clobber, walking forward one record at a time
++// using each old record's own still-intact header to find the next boundary. Called from every
++// cliprecord() write, before the memcpy - a no-op once the ring has never wrapped (clipfull false,
++// nothing old to protect yet) or once cliporigin has already caught up to clipwraplimit (the old
++// lap is fully consumed - nothing left to protect until the next wrap resets it). Amortised O(1)
++// per cliprecord() call: cliporigin only ever moves forward, and each byte in the old lap is only
++// ever stepped over once before the next wrap starts a fresh lap and resets it to 0.
++static void clipadvanceorigin(int clobberend)
++{
++    while(clipfull && cliporigin < clipwraplimit && cliporigin < clobberend)
++    {
++        clipheader h;
++        memcpy(&h, &clipbuf[cliporigin], CLIPHDRSIZE);
++        int reclen = CLIPHDRSIZE + h.len;
++        // Defensive only: mirrors clipscan()'s own fit-check (the real belt-and-braces validation
++        // lives on the read side, see clipscan() below) so a corrupt header here - which should
++        // never happen if the bookkeeping above is correct - stops the advance at the known-good
++        // clipwraplimit boundary instead of looping forever or reading past it.
++        if(h.len < 0 || cliporigin + reclen > clipwraplimit) { cliporigin = clipwraplimit; break; }
++        cliporigin += reclen;
++    }
++}
 +
 +// Writes one record, wrapping to the start of the buffer rather than tearing a record across
 +// the physical end (a partial record would be unreadable). A record that could never fit even
@@ -52,7 +92,10 @@
 +                clipwraplimit = clipwritepos;           // Task 2: everything from here to clipbufsize is now dead
 +                clipwritepos = 0;
 +                clipfull = true;
++                cliporigin = 0;      // Task 2 fix: the lap that just finished is now the whole old lap,
++                                     // fully intact from offset 0 - see cliporigin's declaration above.
 +            }
++            clipadvanceorigin(clipwritepos + total);   // Task 2 fix: clear old records this write clobbers
 +            clipheader h = { totalmillis, chan, len };
 +            memcpy(&clipbuf[clipwritepos], &h, CLIPHDRSIZE);
 +            if(len) memcpy(&clipbuf[clipwritepos + CLIPHDRSIZE], data, len);
@@ -62,6 +105,7 @@
 +                clipwritepos = 0;
 +                clipfull = true;
 +                clipwraplimit = clipbufsize;
++                cliporigin = 0;      // Task 2 fix: same reasoning as the other wrap branch above
 +            }
 +        }
 +    }
@@ -74,7 +118,7 @@
 +static void clipfree()
 +{
 +    DELETEA(clipbuf);
-+    clipbufsize = clipwritepos = clipwraplimit = 0;
++    clipbufsize = clipwritepos = clipwraplimit = cliporigin = 0;
 +    clipfull = false;
 +}
 +
@@ -135,6 +179,32 @@
 +        clipheader h;
 +        memcpy(&h, &src[pos], CLIPHDRSIZE);
 +        if(h.len < 0 || pos + CLIPHDRSIZE + h.len > to) break;   // dead zone / malformed - stop here
++        // Belt-and-braces (Task 2 fix, clip-round3): should never fire once cliporigin (above)
++        // tracks the true old-lap boundary correctly - every header this scan reaches is only
++        // ever reached by walking an intact record chain. If a future logic error ever DID desync
++        // cliporigin from a real boundary, this converts that into a clean truncation (a shorter
++        // clip) instead of emitting a garbage record that could poison stamp[0], the playback
++        // clock, or (via a bogus CLIPCHAN_KEYFRAME chan==3) saveclip()'s starti keyframe pick.
++        // Real wire channels are 0-2, CLIPCHAN_KEYFRAME (fpsgame/client.cpp) is 3 - [0,3] is the
++        // full legitimate range, never wider.
++        if(h.chan < 0 || h.chan > 3)
++        {
++            logoutf("clipscan: rejecting record with implausible chan %d at offset %d - stopping scan", h.chan, pos);
++            break;
++        }
++        // A record's ms can never legitimately be more than the ring's own promised time span
++        // (cliplength minutes) away from "now" - anything further out can only be a misread
++        // header. totalmillis stands in for "the newest record's ms": saveclip() (the only real
++        // caller, via clipindex()) runs synchronously with no engine tick in between, so by the
++        // time this scan runs, totalmillis is at most a few packets' worth of drift from whatever
++        // the last record captured. The 2x multiplier is slack, not precision - plausible drift
++        // near a lap boundary, never a tight bound this is trying to enforce exactly.
++        int window = max(cliplength, 1) * 60000 * 2;
++        if(h.ms < totalmillis - window || h.ms > totalmillis + window)
++        {
++            logoutf("clipscan: rejecting record with implausible ms %d (now %d) at offset %d - stopping scan", h.ms, totalmillis, pos);
++            break;
++        }
 +        clipentry &e = out.add();
 +        e.ms = h.ms; e.chan = h.chan; e.len = h.len; e.offset = pos + CLIPHDRSIZE;
 +        pos += CLIPHDRSIZE + h.len;
@@ -142,14 +212,20 @@
 +}
 +
 +// Builds an oldest -> newest index of every record currently in the ring. When the ring has
-+// wrapped, the true oldest data starts at clipwritepos and runs to clipwraplimit (the boundary
-+// recorded by the most recent wrap in cliprecord(), never the dead zone beyond it); the newest
-+// data is always [0, clipwritepos). Returns false (out left untouched) if the feature is off
++// wrapped, the true oldest INTACT data starts at cliporigin (Task 2 fix, clip-round3 - tracked
++// precisely by cliprecord()/clipadvanceorigin() above, never guessed) and runs to clipwraplimit
++// (the boundary recorded by the most recent wrap in cliprecord(), never the dead zone beyond it);
++// the newest data is always [0, clipwritepos). Scanning the old half from clipwritepos itself (the
++// previous design) was wrong: clipwritepos is just the CURRENT write head of the NEW lap, which
++// almost never lands on one of the OLD lap's own record boundaries (records are heterogeneous
++// sizes) - starting a scan there reads a stale mid-record byte as a fresh header, either breaking
++// immediately (silently truncating the clip to only the post-wrap span) or emitting one bogus
++// record with a garbage timestamp/chan. Returns false (out left untouched) if the feature is off
 +// or nothing has been captured yet.
 +bool clipindex(vector<clipentry> &out)
 +{
 +    if(!clipbuf) return false;
-+    if(clipfull) { clipscan(clipbuf, clipwritepos, clipwraplimit, out); clipscan(clipbuf, 0, clipwritepos, out); }
++    if(clipfull) { clipscan(clipbuf, cliporigin, clipwraplimit, out); clipscan(clipbuf, 0, clipwritepos, out); }
 +    else clipscan(clipbuf, 0, clipwritepos, out);
 +    return out.length() > 0;
 +}
