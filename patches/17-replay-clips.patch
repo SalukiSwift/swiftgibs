@@ -393,7 +393,7 @@
      void sendpositions()
      {
          loopv(players)
-@@ -1262,6 +1289,148 @@
+@@ -1262,6 +1289,235 @@
          }
      }
  
@@ -482,11 +482,49 @@
 +    static clippovsample clippovring[CLIPPOVRINGSIZE];
 +    static int clippovringlen = 0, clippovringnext = 0, clippovfollowing = -1;
 +
++    // SwiftGibs clip fidelity round 3 fix round 1 (residual pan jitter surviving the timeline
++    // interpolation above): task-2-report.md root-caused the remaining jitter to N_POS
++    // quantising yaw/pitch to whole degrees on the wire, not to batching - even a mathematically
++    // perfect reconstruction of WHEN to render each recorded sample still renders a piecewise-
++    // linear path whose per-segment slope wobbles with the rounding noise (measured as a "flat,
++    // flat, jump" texture, CV=0.667, against an unquantised live-capture control at CV=0.274).
++    //
++    // THE LICENCE this smoothing relies on: each whole-degree sample only ever constrained the
++    // true angle to within +/-0.5 degrees of itself, so ANY reconstruction that stays within
++    // +/-0.5 degrees of the piecewise-linear sample path (clippovinterp()'s own unsmoothed
++    // target, computed below) is EQUALLY truth-anchored - smoothing inside that same half-degree
++    // band fabricates nothing, it only picks a smoother point within the margin of error the
++    // recording already had.
++    //
++    // Design: a first-order (exponential) tracker chases the piecewise-linear target, hard-
++    // clamped every frame to within CLIPPOVSMOOTHCLAMP degrees of that SAME target - the clamp,
++    // not the tracker, is what actually enforces the half-degree bound. Rejected: a literal
++    // critically-damped (2nd-order spring/damper) tracker - needs an extra velocity state and two
++    // tuning constants, and buys nothing the clamp does not already guarantee, since the clamp
++    // (not the filter's order) is the truth-anchoring backstop. Rejected: de-dithered anchor
++    // averaging over a same-degree run - it degrades to nothing during a steady multi-degree pan
++    // (consecutive samples are rarely within 1 degree of each other at 20-40deg/s), which is
++    // exactly the harness's primary tested condition.
++    //
++    // tau (the tracker's time constant) is the ring's own measured sample interval (computed
++    // below as "interval"), never a hardcoded VARP - self-consistent with the render-behind
++    // offset above, so together the two spend at most ~1 extra sample interval of look-behind
++    // (the brief's "<=2 sample intervals total" latency budget). At this harness's tested pan
++    // rates (20-40deg/s) and measured interval range (~12-17ms), the tracker's own steady-state
++    // ramp-tracking error (speed * tau) stays at or below the clamp, so the clamp is a genuine
++    // backstop for abrupt motion, not the steady operating point during ordinary panning.
++    #define CLIPPOVSMOOTHCLAMP 0.5f
++    static float clippovsmoothyaw = 0, clippovsmoothpitch = 0;
++    static int clippovsmoothgamemillis = 0;
++    static bool clippovsmoothvalid = false;
++
 +    // Reset sites mirror clipaimholduntil's own (fpsgame/fps.cpp's follow()/nextfollow()/
 +    // stopfollowing(), plus demo start/end here in case N_DEMOPLAYBACK below) - a stale ring
 +    // from a previous follow target or a previous demo must never bleed into a new one's
-+    // reconstruction.
-+    void clippovreset() { clippovringlen = 0; clippovringnext = 0; clippovfollowing = -1; }
++    // reconstruction. clippovsmoothvalid resets alongside the ring for the same reason: a
++    // carried-over smoother state from a previous follow target/demo must never blend toward a
++    // new target across the discontinuity.
++    void clippovreset() { clippovringlen = 0; clippovringnext = 0; clippovfollowing = -1; clippovsmoothvalid = false; }
 +
 +    static void clippovpush(int cn, int time, float yaw, float pitch)
 +    {
@@ -522,27 +560,76 @@
 +        int interval = ordered[clippovringlen-1].time - ordered[clippovringlen-2].time;
 +        if(interval <= 0) interval = 1; // defensive: duplicate/out-of-order timestamps should not happen, never divide/extrapolate on a bad interval
 +        int evaltime = server::gamemillis - interval; // render ~one recorded sample behind the newest
-+        if(evaltime <= ordered[0].time) { yaw = ordered[0].yaw; pitch = ordered[0].pitch; return true; }
-+        if(evaltime >= ordered[clippovringlen-1].time) { yaw = ordered[clippovringlen-1].yaw; pitch = ordered[clippovringlen-1].pitch; return true; }
-+        for(int i = 0; i < clippovringlen-1; i++)
++        // targetyaw/targetpitch: the same piecewise-linear reconstruction this function always
++        // returned before this fix round - still computed in full below, now feeding the
++        // quantization-aware smoothing stage instead of being returned directly.
++        float targetyaw, targetpitch;
++        if(evaltime <= ordered[0].time) { targetyaw = ordered[0].yaw; targetpitch = ordered[0].pitch; }
++        else if(evaltime >= ordered[clippovringlen-1].time) { targetyaw = ordered[clippovringlen-1].yaw; targetpitch = ordered[clippovringlen-1].pitch; }
++        else
 +        {
-+            if(evaltime >= ordered[i].time && evaltime <= ordered[i+1].time)
++            targetyaw = ordered[clippovringlen-1].yaw; targetpitch = ordered[clippovringlen-1].pitch; // unreachable defensively
++            for(int i = 0; i < clippovringlen-1; i++)
 +            {
-+                float span = ordered[i+1].time - ordered[i].time;
-+                float t = span > 0 ? float(evaltime - ordered[i].time)/span : 1.0f;
-+                yaw = clippovlerpyaw(ordered[i].yaw, ordered[i+1].yaw, t);
-+                pitch = ordered[i].pitch + (ordered[i+1].pitch - ordered[i].pitch)*t;
-+                return true;
++                if(evaltime >= ordered[i].time && evaltime <= ordered[i+1].time)
++                {
++                    float span = ordered[i+1].time - ordered[i].time;
++                    float t = span > 0 ? float(evaltime - ordered[i].time)/span : 1.0f;
++                    targetyaw = clippovlerpyaw(ordered[i].yaw, ordered[i+1].yaw, t);
++                    targetpitch = ordered[i].pitch + (ordered[i+1].pitch - ordered[i].pitch)*t;
++                    break;
++                }
 +            }
 +        }
-+        yaw = ordered[clippovringlen-1].yaw; pitch = ordered[clippovringlen-1].pitch; // unreachable defensively
++        // Quantization-aware smoothing (see the design comment above clippovsmoothyaw): track
++        // targetyaw/targetpitch with a first-order filter driven by the demo-timeline clock
++        // (server::gamemillis, the same clock evaltime above is computed against - never
++        // lastmillis, so the tracker never mixes wall-clock and demo-timeline time), then hard-
++        // clamp to within CLIPPOVSMOOTHCLAMP degrees of that same target.
++        if(!clippovsmoothvalid)
++        {
++            // First sample since a reset: seed the tracker AT the target rather than ramping
++            // from zero, so a follow change/demo start never produces a fake initial sweep.
++            clippovsmoothyaw = targetyaw;
++            clippovsmoothpitch = targetpitch;
++            clippovsmoothgamemillis = server::gamemillis;
++            clippovsmoothvalid = true;
++        }
++        else
++        {
++            int dt = server::gamemillis - clippovsmoothgamemillis;
++            clippovsmoothgamemillis = server::gamemillis;
++            if(dt > 0)
++            {
++                float tau = float(interval);
++                float alpha = 1.0f - float(exp(-double(dt)/tau));
++                float dyaw = targetyaw - clippovsmoothyaw;
++                if(dyaw > 180) dyaw -= 360; else if(dyaw < -180) dyaw += 360;
++                clippovsmoothyaw += dyaw*alpha;
++                if(clippovsmoothyaw < 0) clippovsmoothyaw += 360; else if(clippovsmoothyaw >= 360) clippovsmoothyaw -= 360;
++                clippovsmoothpitch += (targetpitch - clippovsmoothpitch)*alpha;
++            }
++        }
++        // The clamp: whatever the filter (or a stale carry-over from before a reset) computed,
++        // pull it back to within CLIPPOVSMOOTHCLAMP degrees of targetyaw/targetpitch - this is the
++        // enforced bound the brief requires, independent of tau/alpha above.
++        float cyaw = clippovsmoothyaw - targetyaw;
++        if(cyaw > 180) cyaw -= 360; else if(cyaw < -180) cyaw += 360;
++        if(cyaw > CLIPPOVSMOOTHCLAMP) clippovsmoothyaw = targetyaw + CLIPPOVSMOOTHCLAMP;
++        else if(cyaw < -CLIPPOVSMOOTHCLAMP) clippovsmoothyaw = targetyaw - CLIPPOVSMOOTHCLAMP;
++        if(clippovsmoothyaw < 0) clippovsmoothyaw += 360; else if(clippovsmoothyaw >= 360) clippovsmoothyaw -= 360;
++        float cpitch = clippovsmoothpitch - targetpitch;
++        if(cpitch > CLIPPOVSMOOTHCLAMP) clippovsmoothpitch = targetpitch + CLIPPOVSMOOTHCLAMP;
++        else if(cpitch < -CLIPPOVSMOOTHCLAMP) clippovsmoothpitch = targetpitch - CLIPPOVSMOOTHCLAMP;
++        yaw = clippovsmoothyaw;
++        pitch = clippovsmoothpitch;
 +        return true;
 +    }
 +
      void sendmessages()
      {
          packetbuf p(MAXTRANS);
-@@ -1298,12 +1467,689 @@
+@@ -1298,12 +1554,689 @@
          sendclientpacket(p.finalize(), 1);
      }
  
@@ -1232,7 +1319,7 @@
          sendmessages();
          flushclient();
      }
-@@ -1400,6 +2246,14 @@
+@@ -1400,6 +2333,14 @@
                  int seqcolor = (physstate>>3)&1;
                  fpsent *d = getclient(cn);
                  if(!d || d->lifesequence < 0 || seqcolor!=(d->lifesequence&1) || d->state==CS_DEAD) continue;
@@ -1247,7 +1334,7 @@
                  float oldyaw = d->yaw, oldpitch = d->pitch, oldroll = d->roll;
                  d->yaw = yaw;
                  d->pitch = pitch;
-@@ -1743,6 +2597,27 @@
+@@ -1743,6 +2684,27 @@
                  loopk(3) to[k] = getint(p)/DMF;
                  fpsent *s = getclient(scn);
                  if(!s) break;
@@ -1275,7 +1362,7 @@
                  if(gun>GUN_FIST && gun<=GUN_PISTOL && s->ammo[gun]) s->ammo[gun]--;
                  s->gunselect = clamp(gun, (int)GUN_FIST, (int)GUN_PISTOL);
                  s->gunwait = guns[s->gunselect].attackdelay;
-@@ -1803,6 +2678,26 @@
+@@ -1803,6 +2765,26 @@
                      if(killstreak > beststreak) beststreak = killstreak;
                      if(killstreak > matchbeststreak) matchbeststreak = killstreak;
                      if(killstreak % 5 == 0 && killstreak <= 20) killstreakmilestone(killstreak/5);
@@ -1302,7 +1389,7 @@
                  }
                  // SwiftGibs: per-player streak for the scoreboard column (all players)
                  if(victim && victim != actor && (!m_teammode || !isteam(actor->team, victim->team)))
-@@ -2057,6 +2952,15 @@
+@@ -2057,6 +3039,15 @@
  
              case N_DEMOPLAYBACK:
              {
