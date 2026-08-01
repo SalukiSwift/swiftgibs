@@ -1868,7 +1868,7 @@
      }
  
      VARP(teamcolorchat, 0, 1, 1);
-@@ -2233,6 +2244,911 @@
+@@ -2233,6 +2244,919 @@
      }
      // === end SwiftGibs instant replay: recording modes =======================================
  
@@ -2439,11 +2439,19 @@
 +            //     picked over the many scattered, transient renderprogress()/renderbackground() call
 +            //     sites (map/lightmap/texture/pvs loading all have their own, none persistent) or a
 +            //     mapname/maptime check (already true well before the loading screen actually clears).
-+            //   - connected && gamemode != INT_MAX: exportclip() (below) only REQUESTS gamemode -1
-+            //     via setmode(-1) (nextmode); INT_MAX is this file's own "never applied" sentinel
-+            //     (this file, ~line 535) - seeing anything else proves changemapserv() has actually
-+            //     run for THIS clip's own map change and applied its mode, not merely that some
-+            //     earlier match's leftover gamemode value is still sitting there.
++            //   - connected && gamemode != INT_MAX: an early, coarse check only - it does NOT
++            //     by itself prove changemapserv() has run for THIS clip's own map change.
++            //     exportclip() (below) only ever REQUESTS gamemode -1 via setmode(-1)
++            //     (nextmode), but the export's own container map change goes through gamemode
++            //     m_demo FIRST (this file's changemapserv(), ~line 535, returns before
++            //     load_world() when m_demo is set) - so that outer m_demo handshake alone
++            //     already sets gamemode != INT_MAX and, via the accompanying N_WELCOME, connected
++            //     = true, BEFORE the clip's own embedded N_MAPCHANGE (the real map and mode) has
++            //     even been drained by demo playback. The two checks that actually do the work of
++            //     gating readiness are !mainmenu, just above (cleared only at the tail of a
++            //     successful load_world(), so it cannot go true from the early m_demo handshake
++            //     alone), and followlive, just below (a real applied N_POS already in the POV
++            //     ring); connected/gamemode here only rule out "never connected at all".
 +            //   - clippovringlen > 0 for clipexporttargetcn specifically: the POV sample ring
 +            //     (above) is pushed exactly once per real N_POS applied for the followed player
 +            //     (case N_POS, below) - a non-empty ring is direct, positive proof that at least one
@@ -2780,7 +2788,7 @@
      void c2sinfo(bool force) // send update to the server
      {
          static int lastupdate = -1000;
-@@ -3059,6 +3975,13 @@
+@@ -3059,6 +3983,13 @@
                  player1->clientnum = getint(p);
                  gamepaused = false;
                  execident(on ? "demostart" : "demoend");
