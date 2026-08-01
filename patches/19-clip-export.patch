@@ -1868,7 +1868,7 @@
      }
  
      VARP(teamcolorchat, 0, 1, 1);
-@@ -2233,6 +2244,919 @@
+@@ -2233,6 +2244,935 @@
      }
      // === end SwiftGibs instant replay: recording modes =======================================
  
@@ -2458,18 +2458,34 @@
 +            //     genuine position/orientation update for THIS clip's follow target has been
 +            //     received and applied, not merely that the player object exists with whatever
 +            //     default/leftover o/yaw/pitch it happens to still carry.
-+            // Same 8-second failsafe as before: a clip whose leading data never yields all three
-+            // still aborts cleanly instead of capturing whatever the screen happens to show.
++            // 8-second failsafe: if mainmenu/connected/gamemode - the map/game-state gates - are
++            // still not satisfied by the timeout, abort cleanly instead of capturing whatever the
++            // screen happens to show, exactly as before.
 +            bool followlive = clippovringlen > 0 && clippovfollowing == clipexporttargetcn;
 +            if(mainmenu || !connected || gamemode == INT_MAX || !followlive)
 +            {
-+                if(totalmillis - clipexportwaitstart > 8000)
++                if(totalmillis - clipexportwaitstart <= 8000) return;
++                if(mainmenu || !connected || gamemode == INT_MAX)
 +                {
-+                    clipexportabort(mainmenu ? "clip's map never finished loading"
-+                                  : (!connected || gamemode == INT_MAX) ? "clip's game state never applied"
-+                                  : "clip's follow target never received a real position");
++                    clipexportabort(mainmenu ? "clip's map never finished loading" : "clip's game state never applied");
++                    return;
 +                }
-+                return;
++                // I1 fix (clip-round3 final review): only followlive is still false at the 8s
++                // timeout - mainmenu/connected/gamemode all already hold, so the map has finished
++                // loading and the world is provably rendering; there is simply no live position
++                // sample yet for THIS clip's own follow target. This happens for a clip that opens
++                // with the recorder already dead: cliprecordownpos() (this file) only records the
++                // player's own position while ALIVE/EDITING, and the demo-playback N_POS handler's
++                // own push into the POV ring (case N_POS, below) sits AFTER the stock
++                // "d->state==CS_DEAD" continue - so a clip whose first 8s of real-time playback
++                // contain no live moment for the recorded player never fills the ring under the old
++                // all-or-nothing gate, which aborted a clip the pre-round-3 build would have
++                // exported fine (as a death-cam view). Degrade to capturing rather than aborting:
++                // this can never be worse than that pre-round-3 behaviour, since the world really is
++                // already rendering. logoutf, not conoutf - the established pattern elsewhere in
++                // this function (see the progress-logging call further below) for keeping a note out
++                // of the on-screen console feed the video itself captures.
++                logoutf("clip export: follow target never received a live position before an 8s timeout - capturing anyway (dead-opening clip)");
 +            }
 +
 +            string sizearg, fpsarg;
@@ -2788,7 +2804,7 @@
      void c2sinfo(bool force) // send update to the server
      {
          static int lastupdate = -1000;
-@@ -3059,6 +3983,13 @@
+@@ -3059,6 +3999,13 @@
                  player1->clientnum = getint(p);
                  gamepaused = false;
                  execident(on ? "demostart" : "demoend");

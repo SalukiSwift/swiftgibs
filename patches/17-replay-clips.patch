@@ -1,6 +1,6 @@
 --- a/engine/client.cpp
 +++ b/engine/client.cpp
-@@ -204,8 +204,331 @@
+@@ -204,8 +204,360 @@
      if(disc) disconnect();
  }
  
@@ -62,13 +62,19 @@
 +    {
 +        clipheader h;
 +        memcpy(&h, &clipbuf[cliporigin], CLIPHDRSIZE);
-+        int reclen = CLIPHDRSIZE + h.len;
 +        // Defensive only: mirrors clipscan()'s own fit-check (the real belt-and-braces validation
 +        // lives on the read side, see clipscan() below) so a corrupt header here - which should
 +        // never happen if the bookkeeping above is correct - stops the advance at the known-good
-+        // clipwraplimit boundary instead of looping forever or reading past it.
-+        if(h.len < 0 || cliporigin + reclen > clipwraplimit) { cliporigin = clipwraplimit; break; }
-+        cliporigin += reclen;
++        // clipwraplimit boundary instead of looping forever or reading past it. Overflow-safe form
++        // (clip-round3 final review, M1): rewritten so no intermediate expression can overflow even
++        // when h.len is corrupt and near INT_MAX - the old "reclen = CLIPHDRSIZE + h.len" then
++        // "cliporigin + reclen > clipwraplimit" form could overflow both additions, wrapping the
++        // comparison around to pass and driving cliporigin negative, which the next iteration would
++        // then read as an OOB memcpy offset. clipwraplimit and cliporigin are always small, bounded,
++        // correctly-computed values (never corruption-controlled), so this subtraction can never
++        // itself overflow; only h.len is untrusted.
++        if(h.len < 0 || h.len > clipwraplimit - cliporigin - CLIPHDRSIZE) { cliporigin = clipwraplimit; break; }
++        cliporigin += CLIPHDRSIZE + h.len;
 +    }
 +}
 +
@@ -174,11 +180,24 @@
 +static void clipscan(const uchar *src, int from, int to, vector<clipentry> &out)
 +{
 +    int pos = from;
++    // C1 fix (clip-round3 final review): monotonicity carries across a prior clipscan() call into
++    // the same out vector - clipindex()'s old-half-then-new-half scan (see clipindex() below) is
++    // chronologically nondecreasing by construction (every old-lap write happened before every
++    // new-lap write, in totalmillis terms - a wrap can only start a fresh, later lap), and
++    // clipsinkindex()'s single flat-buffer scan always starts with an empty out on each ~1s flush,
++    // so INT_MIN is the correct seed there too (see clipindex()/clipsinkindex(), engine/client.cpp).
++    int prevms = out.length() ? out.last().ms : INT_MIN;
 +    while(pos + CLIPHDRSIZE <= to)
 +    {
 +        clipheader h;
 +        memcpy(&h, &src[pos], CLIPHDRSIZE);
-+        if(h.len < 0 || pos + CLIPHDRSIZE + h.len > to) break;   // dead zone / malformed - stop here
++        // Overflow-safe fit check (clip-round3 final review, M1): rewritten in the same
++        // subtraction-first shape as clipadvanceorigin()'s mirrored check above - the old
++        // "pos + CLIPHDRSIZE + h.len > to" form could overflow when h.len is corrupt and near
++        // INT_MAX, wrapping the comparison around to pass. to and pos are always small, bounded,
++        // correctly-computed values, so this subtraction can never itself overflow; only h.len is
++        // untrusted.
++        if(h.len < 0 || h.len > to - pos - CLIPHDRSIZE) break;   // dead zone / malformed - stop here
 +        // Belt-and-braces (Task 2 fix, clip-round3): should never fire once cliporigin (above)
 +        // tracks the true old-lap boundary correctly - every header this scan reaches is only
 +        // ever reached by walking an intact record chain. If a future logic error ever DID desync
@@ -192,19 +211,29 @@
 +            logoutf("clipscan: rejecting record with implausible chan %d at offset %d - stopping scan", h.chan, pos);
 +            break;
 +        }
-+        // A record's ms can never legitimately be more than the ring's own promised time span
-+        // (cliplength minutes) away from "now" - anything further out can only be a misread
-+        // header. totalmillis stands in for "the newest record's ms": saveclip() (the only real
-+        // caller, via clipindex()) runs synchronously with no engine tick in between, so by the
-+        // time this scan runs, totalmillis is at most a few packets' worth of drift from whatever
-+        // the last record captured. The 2x multiplier is slack, not precision - plausible drift
-+        // near a lap boundary, never a tight bound this is trying to enforce exactly.
-+        int window = max(cliplength, 1) * 60000 * 2;
-+        if(h.ms < totalmillis - window || h.ms > totalmillis + window)
++        // C1 fix (clip-round3 final review): the invariant a record's ms must satisfy is
++        // MONOTONICITY, not proximity to a fixed time window. The prior symmetric window
++        // (+/- 2*cliplength minutes) assumed the ring holds at most ~2*cliplength minutes of data,
++        // but the ring is sized for a 32-player worst case (clipsync() above) while real measured
++        // fill rates are far slower (3.5-11.7 KB/s against a ring built for CLIP_EST_PLAYERS=32),
++        // so the oldest still-intact record is routinely 1.3-4.4x OLDER than that window long
++        // before the ring naturally ages it out. That regressed F10: pre-first-wrap it rejected
++        // genuinely old, still-good records from t=120s until the first wrap ("nothing recorded
++        // yet"); post-wrap it broke the old-half scan at cliporigin and reintroduced the sawtooth
++        // Task 2's cliporigin fix was meant to end. Two capacity-independent checks replace it,
++        // both still converting a corrupt/misread header into a clean truncation rather than a
++        // garbage record:
++        if(h.ms > totalmillis + 1000)   // not in the future (a little slack for in-flight totalmillis drift)
 +        {
 +            logoutf("clipscan: rejecting record with implausible ms %d (now %d) at offset %d - stopping scan", h.ms, totalmillis, pos);
 +            break;
 +        }
++        if(h.ms < prevms)   // a contiguous chain is appended in nondecreasing ms order - see prevms above
++        {
++            logoutf("clipscan: rejecting record with non-monotonic ms %d (prev %d) at offset %d - stopping scan", h.ms, prevms, pos);
++            break;
++        }
++        prevms = h.ms;
 +        clipentry &e = out.add();
 +        e.ms = h.ms; e.chan = h.chan; e.len = h.len; e.offset = pos + CLIPHDRSIZE;
 +        pos += CLIPHDRSIZE + h.len;
