@@ -1651,6 +1651,25 @@
          uint nextframe = (max(gettime() - starttime, 0)*file->videofps)/1000;
          if(!videobuffers.full() && (lastframe == ~0U || nextframe > lastframe))
          {
+@@ -1113,6 +1752,18 @@
+ 
+     void drawhud()
+     {
++        // SwiftGibs video export (fix round 2): this is the STOCK vanilla "movie" command's own
++        // on-screen readout ("recorded NNNMB NN%"), drawn unconditionally on every normal frame's
++        // swapbuffers(true) (engine/main.cpp) whenever ANY recorder session - the vanilla "movie"
++        // command AND clip export's own recorder::startpipe(), same shared namespace/state - is
++        // active, independent of hidehud (hidehud only gates fpsgame's OWN hud draws, never this
++        // one). Confirmed via a real harness export that it draws throughout an otherwise-healthy
++        // HUD-on capture, not just during the loading-screen window the WAITING->CAPTURING fix
++        // above closes - export machinery, not gameplay, so it is gated off the same way the
++        // SPECTATOR label is (fpsgame/fps.cpp): only while a clip export capture is the reason
++        // this frame is being recorded, never during a real interactive "movie" session.
++        if(game::clipexportcapturing()) return;
++
+         int w = screenw, h = screenh;
+         if(forceaspect) w = int(ceil(h*forceaspect));
+         gettextres(w, h);
 --- a/engine/engine.h
 +++ b/engine/engine.h
 @@ -600,11 +600,42 @@
@@ -1724,7 +1743,7 @@
      filter &= CON_FLAGS;
 --- a/shared/iengine.h
 +++ b/shared/iengine.h
-@@ -53,6 +53,48 @@
+@@ -53,6 +53,49 @@
  extern int thirdperson;
  extern bool isthirdperson();
  
@@ -1738,6 +1757,7 @@
 +extern int soundvol;
 +extern int fullconsole;   // engine/console.cpp - review fix: renderconsole()'s hidehud gate is "!hidehud || fullconsole", so fullconsole must be forced off too during export or console text bypasses the HUD suppression
 +extern void clearguis(int level);   // engine/menus.cpp (defined with a default there; NOT repeated here - engine/menus.cpp's own translation unit sees BOTH declarations via engine.h's #include of this file, and a default argument may only be specified once per scope, so callers outside engine/menus.cpp must pass level explicitly, e.g. clearguis(-1) for "clear everything") - review fix: gl_drawhud() calls g3d_render() (in-world menus) unconditionally, with no hidehud gate at all, so export must actively close any open menu rather than relying on hidehud
++extern int mainmenu;   // engine/menus.cpp - VAR(mainmenu, 1, 1, 0) (min>max: not console-settable). Starts 1 (loading/background/menu screen); clearmainmenu() sets it 0 exactly once, at the tail of a successful map load (engine/worldio.cpp/engine/world.cpp), never back to 1 short of a real disconnect. This is the SAME flag the real per-frame render loop itself branches on (engine/main.cpp: "mainmenu ? gl_drawmainmenu() : gl_drawframe()") to choose the loading/background screen over the real 3D world - this task's authoritative "genuinely rendering the world, not the mapshot/loading screen" signal, over the many scattered/transient renderprogress()/renderbackground() call sites or an early-true mapname/maptime check.
 +// SwiftGibs clip export (Task 5): the live SDL window handle, so progress feedback can be
 +// shown in the OS window title bar during capture - the one feedback channel that does NOT
 +// land in the captured framebuffer (unlike gui/hud/console text, all suppressed above for a
@@ -1773,7 +1793,7 @@
  extern bool settexture(const char *name, int clamp = 0);
  
  // octaedit
-@@ -203,6 +245,7 @@
+@@ -203,6 +246,7 @@
  extern void conoutf(int type, const char *s, ...) PRINTFARGS(2, 3);
  extern void conoutf(int type, int tag, const char *s, ...) PRINTFARGS(3, 4);
  extern void conoutfv(int type, const char *fmt, va_list args);
@@ -1781,6 +1801,16 @@
  
  extern FILE *getlogfile();
  extern void setlogfile(const char *fname);
+--- a/shared/igame.h
++++ b/shared/igame.h
+@@ -103,6 +103,7 @@
+     extern bool serverinfoentry(g3d_gui *g, int i, const char *name, int port, const char *desc, const char *map, int ping, const vector<int> &attr, int np);
+     extern bool needminimap();
+     extern bool demoplaying();   // SwiftGibs instant replay (Task 3): true while playing back a .dmo
++    extern bool clipexportcapturing();   // SwiftGibs video export (fix round 2): true only while a clip export capture is actively running - fpsgame/client.cpp; lets engine-side code (engine/movie.cpp's stock recorder HUD) gate itself off during export the same way fpsgame/fps.cpp's SPECTATOR label already does
+ }
+  
+ namespace server
 --- a/fpsgame/game.h
 +++ b/fpsgame/game.h
 @@ -733,6 +733,7 @@
@@ -1838,7 +1868,7 @@
      }
  
      VARP(teamcolorchat, 0, 1, 1);
-@@ -2000,6 +2011,859 @@
+@@ -2233,6 +2244,911 @@
      }
      // === end SwiftGibs instant replay: recording modes =======================================
  
@@ -2369,18 +2399,70 @@
 +
 +        if(clipexportphase == CLIPEXPORT_WAITING)
 +        {
-+            if(!demoplayback || players.length() < 2)
++            if(clipexporttargetcn < 0)
 +            {
-+                if(totalmillis - clipexportwaitstart > 8000)
-+                    clipexportabort(!demoplayback ? "clip could not be loaded" : "clip has no recorded player data");
-+                return;
++                // Not yet identified the recording player: need demoplayback active with the
++                // reconstructed client list populated (players[1], the convention this whole
++                // feature already uses for "who to follow").
++                if(!demoplayback || players.length() < 2)
++                {
++                    if(totalmillis - clipexportwaitstart > 8000)
++                        clipexportabort(!demoplayback ? "clip could not be loaded" : "clip has no recorded player data");
++                    return;
++                }
++
++                // Identify + lock onto the recording player - see the big design comment at the top
++                // of this section. Locking the target here, ONCE (guarded by clipexporttargetcn,
++                // reset to -1 only by exportclip(), below), is deliberate: follow() (fpsgame/fps.cpp)
++                // calls clippovreset() every time it actually reasserts a target, and player1 stays
++                // CS_SPECTATOR for the whole demo, so a repeat call on every WAITING poll below would
++                // forever wipe the very POV ring the readiness check just below needs to see fill up -
++                // guaranteeing the 8-second timeout on every single export instead of ever reaching
++                // CAPTURING.
++                clipexporttargetcn = players[1]->clientnum;
++                defformatstring(followarg, "%d", clipexporttargetcn);
++                follow(followarg);
 +            }
 +
-+            // Identify + lock onto the recording player - see the big design comment at the top
-+            // of this section.
-+            clipexporttargetcn = players[1]->clientnum;
-+            defformatstring(followarg, "%d", clipexporttargetcn);
-+            follow(followarg);
++            // SwiftGibs video export fix round 2: field evidence (a real exported clip's opening
++            // frames) showed the OLD condition above (demoplayback + a recorded player identified)
++            // passing while the screen was still the map-load/mapshot/"loading..." background,
++            // before the follow target's own position/view had ever actually been applied from the
++            // recording - the first captured frames were the loading screen, not gameplay. Three
++            // independent signals, ALL required, close that gap:
++            //   - !mainmenu: the engine's own authoritative "not on the loading/background/menu
++            //     screen" flag (engine/menus.cpp, extern'd in shared/iengine.h) - starts true,
++            //     cleared exactly once by clearmainmenu() at the tail of a successful map load
++            //     (engine/worldio.cpp/engine/world.cpp), and it is the SAME flag the real per-frame
++            //     render loop itself branches on (engine/main.cpp: "mainmenu ? gl_drawmainmenu() :
++            //     gl_drawframe()") to choose the loading/background screen over the real 3D world -
++            //     picked over the many scattered, transient renderprogress()/renderbackground() call
++            //     sites (map/lightmap/texture/pvs loading all have their own, none persistent) or a
++            //     mapname/maptime check (already true well before the loading screen actually clears).
++            //   - connected && gamemode != INT_MAX: exportclip() (below) only REQUESTS gamemode -1
++            //     via setmode(-1) (nextmode); INT_MAX is this file's own "never applied" sentinel
++            //     (this file, ~line 535) - seeing anything else proves changemapserv() has actually
++            //     run for THIS clip's own map change and applied its mode, not merely that some
++            //     earlier match's leftover gamemode value is still sitting there.
++            //   - clippovringlen > 0 for clipexporttargetcn specifically: the POV sample ring
++            //     (above) is pushed exactly once per real N_POS applied for the followed player
++            //     (case N_POS, below) - a non-empty ring is direct, positive proof that at least one
++            //     genuine position/orientation update for THIS clip's follow target has been
++            //     received and applied, not merely that the player object exists with whatever
++            //     default/leftover o/yaw/pitch it happens to still carry.
++            // Same 8-second failsafe as before: a clip whose leading data never yields all three
++            // still aborts cleanly instead of capturing whatever the screen happens to show.
++            bool followlive = clippovringlen > 0 && clippovfollowing == clipexporttargetcn;
++            if(mainmenu || !connected || gamemode == INT_MAX || !followlive)
++            {
++                if(totalmillis - clipexportwaitstart > 8000)
++                {
++                    clipexportabort(mainmenu ? "clip's map never finished loading"
++                                  : (!connected || gamemode == INT_MAX) ? "clip's game state never applied"
++                                  : "clip's follow target never received a real position");
++                }
++                return;
++            }
 +
 +            string sizearg, fpsarg;
 +            formatstring(sizearg, "%dx%d", clipexportwidth, clipexportheight);
@@ -2698,7 +2780,7 @@
      void c2sinfo(bool force) // send update to the server
      {
          static int lastupdate = -1000;
-@@ -2788,6 +3652,13 @@
+@@ -3059,6 +3975,13 @@
                  player1->clientnum = getint(p);
                  gamepaused = false;
                  execident(on ? "demostart" : "demoend");
