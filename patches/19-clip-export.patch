@@ -1997,7 +1997,7 @@
      }
  
      VARP(teamcolorchat, 0, 1, 1);
-@@ -2315,6 +2326,935 @@
+@@ -2325,6 +2336,935 @@
      }
      // === end SwiftGibs instant replay: recording modes =======================================
  
@@ -2933,7 +2933,7 @@
      void c2sinfo(bool force) // send update to the server
      {
          static int lastupdate = -1000;
-@@ -3145,6 +4085,13 @@
+@@ -3155,6 +4095,13 @@
                  player1->clientnum = getint(p);
                  gamepaused = false;
                  execident(on ? "demostart" : "demoend");
