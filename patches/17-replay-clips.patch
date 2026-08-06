@@ -422,7 +422,7 @@
      void sendpositions()
      {
          loopv(players)
-@@ -1262,6 +1289,235 @@
+@@ -1262,6 +1289,317 @@
          }
      }
  
@@ -503,13 +503,66 @@
 +    //
 +    // Ring holds up to 3 samples; "one sample interval" for the render-behind offset is derived
 +    // from the ring's own last two timestamps (not a hardcoded clipposinterval), so it stays
-+    // correct even if that VARP differed between recording and now. Position (o) is left on the
-+    // existing plag-window blend (fpsgame/fps.cpp) - this task is scoped to the reported PAN
-+    // jitter (yaw/pitch), the brief's own "(optionally o)" - so nothing here changes o.
-+    #define CLIPPOVRINGSIZE 3
-+    struct clippovsample { int time; float yaw, pitch; };
++    // correct even if that VARP differed between recording and now.
++    //
++    // SwiftGibs clip fidelity round 4 (April's playtest: exports "still quite jerky" on a clip
++    // recorded while MOVING): position (o) rides in this same ring now, for the same reason and
++    // on the same timeline. Rounds 2/3 reconstructed yaw/pitch only and left o on the
++    // plag-window blend over a dead-reckoned physics extrapolation (predictplayer(),
++    // fpsgame/fps.cpp) - so with the followed player's recorded path measurably smooth (harness:
++    // a scripted constant-speed strafe recorded at 100 units/s with per-sample speed CV ~0.01)
++    // the RENDERED camera position still drifted off it by up to 0.88 units, against a typical
++    // 60fps frame step of ~1.6 units, i.e. by more than half a frame's worth of motion. Two
++    // causes, both structural, neither fixable by resizing a blend window: engine/physics.cpp's
++    // moveplayer() advances a NON-local player only in whole PHYSFRAMETIME (5ms) quanta and
++    // gives it no interppos() sub-step interpolation at all (only local players get that), and
++    // the dead reckoning it integrates is a prediction, not the recording. Interpolating the
++    // recorded positions on the recorded timeline replaces both with the truth.
++    //
++    // Wire precision (verified in sendposition()/parsepositions(), this file): N_POS packs each
++    // axis as int(o[k]*DMF) with DMF 16.0f (fpsgame/game.h), i.e. 1/16 = 0.0625 world units -
++    // about 4% of that same ~1.6-unit frame step, and ~26x finer relative to the motion than the
++    // whole-degree angle quantisation is. So position needs NO dither/clamp trick: there is no
++    // quantisation staircase to hide, and plain truth-anchored linear interpolation between
++    // recorded samples is already at the noise floor. Position deliberately does NOT feed the
++    // clippovsmooth* tracker below - that tracker exists solely to smooth inside the angles'
++    // half-degree margin of error, and running position through it would only add lag and a
++    // second error source with nothing to buy back.
++    // Round 4, part 2 (measured while proving part 1): once position rides the timeline, the
++    // dominant remaining wobble is not WHERE the reconstruction lands but WHEN it is evaluated.
++    // Measured in the harness on a constant-speed recorded strafe (100 units/s, recorded-sample
++    // speed CV 0.031 at 60fps): the effective render-behind was 21.5ms with a 2.6ms standard
++    // deviation, and that 2.6ms of clock jitter alone reproduced a 0.2 CV in the rendered 60fps
++    // step length. Two independent causes, both removed here:
++    //
++    //  (a) STALE CLOCK. predictplayer() runs from game::updateworld(), which engine/main.cpp's
++    //      loop calls BEFORE serverslice(); serverupdate() (fpsgame/server.cpp) is what does
++    //      "gamemillis += curtime" and then drains readdemo(). So the gamemillis visible here is
++    //      always one frame stale, by exactly this frame's curtime - measured directly (5-10ms in
++    //      this harness, varying frame to frame). Evaluating at gamemillis + curtime instead is
++    //      the demo-timeline instant the frame about to be rendered actually corresponds to, so
++    //      the render-behind becomes exactly the lag below, with the frame-time jitter cancelled
++    //      rather than passed through. (Paused playback stays consistent: engine/main.cpp forces
++    //      curtime to 0 when game::ispaused(), the same condition that stops gamemillis.)
++    //  (b) JITTERY LAG. The lag itself used to be the ring's most recent gap, which is the
++    //      recorder's frame time, not a constant: cliprecordownpos() samples when at least
++    //      clipposinterval ms have passed, so real gaps ran 12-19ms in the same recording.
++    //      clippovinterval below is an EWMA of that gap, updated once per pushed sample (not per
++    //      render frame, so its time constant is in samples regardless of framerate).
++    //
++    // The lag is 2 measured intervals rather than 1. One is not enough once the clock is
++    // corrected: the newest sample can already be up to a full gap plus a frame old, and a lag
++    // shorter than that puts evaltime past the newest sample, where the reconstruction correctly
++    // refuses to extrapolate and holds instead - a stall, which is the artifact being fixed. Two
++    // intervals (~26ms at the 12ms default) covers that with margin while costing only ~5ms more
++    // than the round-3 code's own measured 21.5ms average render-behind. The ring grows to 6 so
++    // it spans 5 gaps (~65ms), comfortably more than the lag, keeping evaltime strictly inside
++    // the buffered range instead of clamped to an end.
++    #define CLIPPOVRINGSIZE 6
++    struct clippovsample { int time; float yaw, pitch; vec o; };
 +    static clippovsample clippovring[CLIPPOVRINGSIZE];
 +    static int clippovringlen = 0, clippovringnext = 0, clippovfollowing = -1;
++    static float clippovinterval = 0; // EWMA of the recorded inter-sample gap, ms; 0 = not seeded yet
 +
 +    // SwiftGibs clip fidelity round 3 fix round 1 (residual pan jitter surviving the timeline
 +    // interpolation above): task-2-report.md root-caused the remaining jitter to N_POS
@@ -553,14 +606,24 @@
 +    // reconstruction. clippovsmoothvalid resets alongside the ring for the same reason: a
 +    // carried-over smoother state from a previous follow target/demo must never blend toward a
 +    // new target across the discontinuity.
-+    void clippovreset() { clippovringlen = 0; clippovringnext = 0; clippovfollowing = -1; clippovsmoothvalid = false; }
++    void clippovreset() { clippovringlen = 0; clippovringnext = 0; clippovfollowing = -1; clippovsmoothvalid = false; clippovinterval = 0; }
 +
-+    static void clippovpush(int cn, int time, float yaw, float pitch)
++    static void clippovpush(int cn, int time, float yaw, float pitch, const vec &o)
 +    {
-+        if(cn != clippovfollowing) { clippovringlen = 0; clippovringnext = 0; clippovfollowing = cn; }
++        if(cn != clippovfollowing) { clippovringlen = 0; clippovringnext = 0; clippovfollowing = cn; clippovinterval = 0; }
++        if(clippovringlen > 0)
++        {
++            // Once per real sample, never per render frame (see the doc comment above the ring).
++            // Gaps outside 1..200ms are not a recording cadence - a demo restart, a follow the
++            // reset missed, a corrupt record - so they are ignored rather than allowed to poison
++            // the average; the reconstruction just keeps using the last good estimate.
++            int gap = time - clippovring[(clippovringnext - 1 + CLIPPOVRINGSIZE) % CLIPPOVRINGSIZE].time;
++            if(gap > 0 && gap <= 200) clippovinterval = clippovinterval > 0 ? clippovinterval*0.8f + gap*0.2f : float(gap);
++        }
 +        clippovring[clippovringnext].time = time;
 +        clippovring[clippovringnext].yaw = yaw;
 +        clippovring[clippovringnext].pitch = pitch;
++        clippovring[clippovringnext].o = o;
 +        clippovringnext = (clippovringnext+1) % CLIPPOVRINGSIZE;
 +        if(clippovringlen < CLIPPOVRINGSIZE) clippovringlen++;
 +    }
@@ -579,25 +642,38 @@
 +    // defensive re-check - push already gates on demoplayback && d==followingplayer(NULL), so
 +    // this should only ever mismatch transiently around a follow change, exactly when a stale
 +    // reconstruction would be wrong anyway).
-+    bool clippovinterp(fpsent *d, float &yaw, float &pitch)
++    bool clippovinterp(fpsent *d, float &yaw, float &pitch, vec &o)
 +    {
 +        if(clippovringlen < 2 || d->clientnum != clippovfollowing) return false;
 +        // Chronological order: ring is a circular buffer of the last clippovringlen pushes.
 +        int newest = (clippovringnext - 1 + CLIPPOVRINGSIZE) % CLIPPOVRINGSIZE;
 +        clippovsample ordered[CLIPPOVRINGSIZE];
 +        for(int i = 0; i < clippovringlen; i++) ordered[clippovringlen-1-i] = clippovring[(newest - i + CLIPPOVRINGSIZE) % CLIPPOVRINGSIZE];
-+        int interval = ordered[clippovringlen-1].time - ordered[clippovringlen-2].time;
++        // interval: the smoothed recorded cadence (clippovinterval, maintained in clippovpush()),
++        // falling back to the ring's raw last gap only before the EWMA has a value. It is both the
++        // unit of the render-behind lag below and tau for the angle smoother further down.
++        int interval = clippovinterval > 0 ? int(clippovinterval + 0.5f) : ordered[clippovringlen-1].time - ordered[clippovringlen-2].time;
 +        if(interval <= 0) interval = 1; // defensive: duplicate/out-of-order timestamps should not happen, never divide/extrapolate on a bad interval
-+        int evaltime = server::gamemillis - interval; // render ~one recorded sample behind the newest
++        // See the doc comment above the ring for why this is gamemillis + curtime (not gamemillis)
++        // and why the lag is two intervals. Together they make the render-behind a constant, which
++        // is what actually removes the judder: a reconstruction that is exactly right but sampled
++        // at a jittering instant still renders as uneven motion.
++        int evaltime = server::gamemillis + curtime - 2*interval;
 +        // targetyaw/targetpitch: the same piecewise-linear reconstruction this function always
 +        // returned before this fix round - still computed in full below, now feeding the
 +        // quantization-aware smoothing stage instead of being returned directly.
++        // Position (round 4) is reconstructed in the same three branches, from the same bracketing
++        // pair, and is written straight out below without passing through the angle smoother (see
++        // the wire-precision note above the ring). Clamping to an endpoint outside the buffered
++        // range is what keeps this honest: it NEVER extrapolates past the newest recorded sample,
++        // so nothing is ever invented, only held.
 +        float targetyaw, targetpitch;
-+        if(evaltime <= ordered[0].time) { targetyaw = ordered[0].yaw; targetpitch = ordered[0].pitch; }
-+        else if(evaltime >= ordered[clippovringlen-1].time) { targetyaw = ordered[clippovringlen-1].yaw; targetpitch = ordered[clippovringlen-1].pitch; }
++        vec targeto;
++        if(evaltime <= ordered[0].time) { targetyaw = ordered[0].yaw; targetpitch = ordered[0].pitch; targeto = ordered[0].o; }
++        else if(evaltime >= ordered[clippovringlen-1].time) { targetyaw = ordered[clippovringlen-1].yaw; targetpitch = ordered[clippovringlen-1].pitch; targeto = ordered[clippovringlen-1].o; }
 +        else
 +        {
-+            targetyaw = ordered[clippovringlen-1].yaw; targetpitch = ordered[clippovringlen-1].pitch; // unreachable defensively
++            targetyaw = ordered[clippovringlen-1].yaw; targetpitch = ordered[clippovringlen-1].pitch; targeto = ordered[clippovringlen-1].o; // unreachable defensively
 +            for(int i = 0; i < clippovringlen-1; i++)
 +            {
 +                if(evaltime >= ordered[i].time && evaltime <= ordered[i+1].time)
@@ -606,6 +682,11 @@
 +                    float t = span > 0 ? float(evaltime - ordered[i].time)/span : 1.0f;
 +                    targetyaw = clippovlerpyaw(ordered[i].yaw, ordered[i+1].yaw, t);
 +                    targetpitch = ordered[i].pitch + (ordered[i+1].pitch - ordered[i].pitch)*t;
++                    // Teleport/respawn guard, mirroring the vendor's own smoothdist test in
++                    // case N_POS below (oldpos.dist(d->o) < smoothdist): a jump longer than
++                    // smoothdist is a cut, not motion, so hold the newer end of the pair rather
++                    // than sliding the camera across the gap over one sample interval.
++                    targeto = ordered[i].o.dist(ordered[i+1].o) < smoothdist ? vec(ordered[i].o).lerp(ordered[i+1].o, t) : ordered[i+1].o;
 +                    break;
 +                }
 +            }
@@ -652,13 +733,14 @@
 +        else if(cpitch < -CLIPPOVSMOOTHCLAMP) clippovsmoothpitch = targetpitch - CLIPPOVSMOOTHCLAMP;
 +        yaw = clippovsmoothyaw;
 +        pitch = clippovsmoothpitch;
++        o = targeto;
 +        return true;
 +    }
 +
      void sendmessages()
      {
          packetbuf p(MAXTRANS);
-@@ -1298,12 +1554,689 @@
+@@ -1298,12 +1636,689 @@
          sendclientpacket(p.finalize(), 1);
      }
  
@@ -1348,7 +1430,7 @@
          sendmessages();
          flushclient();
      }
-@@ -1400,6 +2333,14 @@
+@@ -1400,6 +2415,18 @@
                  int seqcolor = (physstate>>3)&1;
                  fpsent *d = getclient(cn);
                  if(!d || d->lifesequence < 0 || seqcolor!=(d->lifesequence&1) || d->state==CS_DEAD) continue;
@@ -1359,11 +1441,15 @@
 +                // decides for d->yaw/pitch itself - every recorded sample is a genuine
 +                // reconstructed timeline point regardless of how many land in this same real
 +                // render frame.
-+                if(demoplayback && d == followingplayer(NULL)) clippovpush(cn, server::nextplayback, yaw, pitch);
++                // Round 4: the buffered position is eye-height corrected here, exactly as the
++                // assignment a few lines below does it (d->o = o; d->o.z += d->eyeheight), so what
++                // clippovinterp() hands back is directly assignable to d->o with no second
++                // correction anywhere.
++                if(demoplayback && d == followingplayer(NULL)) clippovpush(cn, server::nextplayback, yaw, pitch, vec(o.x, o.y, o.z + d->eyeheight));
                  float oldyaw = d->yaw, oldpitch = d->pitch, oldroll = d->roll;
                  d->yaw = yaw;
                  d->pitch = pitch;
-@@ -1743,6 +2684,27 @@
+@@ -1743,6 +2770,27 @@
                  loopk(3) to[k] = getint(p)/DMF;
                  fpsent *s = getclient(scn);
                  if(!s) break;
@@ -1391,7 +1477,7 @@
                  if(gun>GUN_FIST && gun<=GUN_PISTOL && s->ammo[gun]) s->ammo[gun]--;
                  s->gunselect = clamp(gun, (int)GUN_FIST, (int)GUN_PISTOL);
                  s->gunwait = guns[s->gunselect].attackdelay;
-@@ -1803,6 +2765,26 @@
+@@ -1803,6 +2851,26 @@
                      if(killstreak > beststreak) beststreak = killstreak;
                      if(killstreak > matchbeststreak) matchbeststreak = killstreak;
                      if(killstreak % 5 == 0 && killstreak <= 20) killstreakmilestone(killstreak/5);
@@ -1418,7 +1504,7 @@
                  }
                  // SwiftGibs: per-player streak for the scoreboard column (all players)
                  if(victim && victim != actor && (!m_teammode || !isteam(actor->team, victim->team)))
-@@ -2057,6 +3039,15 @@
+@@ -2057,6 +3125,15 @@
  
              case N_DEMOPLAYBACK:
              {
@@ -1483,7 +1569,7 @@
 +    // here (predictplayer()'s own follow()/nextfollow()/stopfollowing()) on any follow-target
 +    // change, mirroring clipaimholduntil's own reset sites.
 +    extern void clippovreset();
-+    extern bool clippovinterp(fpsent *d, float &yaw, float &pitch);
++    extern bool clippovinterp(fpsent *d, float &yaw, float &pitch, vec &o);
  
      extern bool clientoption(const char *arg);
      extern fpsent *getclient(int cn);
@@ -1652,7 +1738,7 @@
      void setupcamera()
      {
          fpsent *target = followingplayer();
-@@ -181,16 +210,71 @@
+@@ -181,16 +210,86 @@
              moveplayer(d, 1, false);
              d->newpos = d->o;
          }
@@ -1686,20 +1772,35 @@
 +        // recorded timeline instead (clippovinterp(), fpsgame/client.cpp) - true first-order
 +        // interpolation at the RECORDED cadence, immune to how many samples a batch collapsed.
 +        // Degrades to the existing window blend below whenever fewer than 2 samples are buffered
-+        // (just-started playback/follow, or not demo playback at all). Position (o) and roll are
-+        // untouched here - this fix is scoped to the reported PAN jitter, same as
-+        // clippovinterp()'s own doc comment.
++        // (just-started playback/follow, or not demo playback at all).
++        // Round 4 (April's playtest: exports of clips recorded while MOVING are "still quite
++        // jerky"): position (o) is reconstructed on the recorded timeline too, symmetrically with
++        // yaw/pitch. See clippovinterp()'s own doc comment (fpsgame/client.cpp) for the measured
++        // defect and the wire-precision reasoning; the short version is that the lines below only
++        // ever fed o a dead-reckoned physics extrapolation that moveplayer() advances in whole
++        // 5ms PHYSFRAMETIME quanta with no sub-step interpolation for a non-local player, so the
++        // rendered camera stepped off a measurably smooth recorded path. The blend's positional
++        // correction (d->deltapos) is skipped in the same way the yaw/pitch increment already is:
++        // it exists to hide the gap between a PREDICTED position and a newly received one, and
++        // there is no such gap left to hide once the recorded position itself is what renders.
++        // moveplayer() above still runs untouched, so physics state, the dynent cache other
++        // players collide against, water/landing triggers and d->newpos all keep advancing
++        // exactly as before: this override is presentational, applied after physics, and
++        // d->newpos (not d->o) is what the next frame's physics continues from. roll stays on the
++        // blend.
 +        float clippovyaw = 0, clippovpitch = 0;
-+        bool haveclippov = clipholdview && clippovinterp(d, clippovyaw, clippovpitch);
++        vec clippovo(0, 0, 0);
++        bool haveclippov = clipholdview && clippovinterp(d, clippovyaw, clippovpitch, clippovo);
 +        float window = clipholdview ? clamp(float(d->plag), 5, 40) : float(smoothmove);
 +        float k = 1.0f - float(lastmillis - d->smoothmillis)/window;
          if(k>0)
          {
-             d->o.add(vec(d->deltapos).mul(k));
+-            d->o.add(vec(d->deltapos).mul(k));
 -            d->yaw += d->deltayaw*k;
 -            if(d->yaw<0) d->yaw += 360;
 -            else if(d->yaw>=360) d->yaw -= 360;
 -            d->pitch += d->deltapitch*k;
++            if(!haveclippov) d->o.add(vec(d->deltapos).mul(k));
 +            if(!haveclippov)
 +            {
 +                d->yaw += d->deltayaw*k;
@@ -1711,6 +1812,7 @@
          }
 +        if(haveclippov)
 +        {
++            d->o = clippovo;
 +            d->yaw = clippovyaw;
 +            d->pitch = clippovpitch;
 +        }
@@ -1729,7 +1831,7 @@
      }
  
      void otherplayers(int curtime)
-@@ -244,6 +328,24 @@
+@@ -244,6 +343,24 @@
          if(!maptime) { maptime = lastmillis; maprealtime = totalmillis; return; }
          if(!curtime) { gets2c(); if(player1->clientnum>=0) c2sinfo(); return; }
  
@@ -1754,7 +1856,7 @@
          physicsframe();
          ai::navigate();
          if(player1->state != CS_DEAD && !intermission)
-@@ -672,6 +774,13 @@
+@@ -672,6 +789,13 @@
              {
                  case ID_VAR:   f->printf("%s %d\n", names[i], *id->storage.i); break;
                  case ID_FVAR:  f->printf("%s %s\n", names[i], floatstr(*id->storage.f)); break;
@@ -1768,7 +1870,7 @@
                  case ID_ALIAS: f->printf("%s = [%s]\n", names[i], id->getstr()); break;
              }
          }
-@@ -749,6 +858,16 @@
+@@ -749,6 +873,16 @@
          else
          {
              intermission = true;
@@ -1785,7 +1887,7 @@
              player1->attacking = false;
              if(cmode) cmode->gameover();
              conoutf(CON_GAMEINFO, "\f2intermission:");
-@@ -840,6 +959,24 @@
+@@ -840,6 +974,24 @@
  
      void startgame()
      {
@@ -1810,7 +1912,7 @@
          clearmovables();
          clearmonsters();
  
-@@ -995,10 +1132,10 @@
+@@ -995,10 +1147,10 @@
  
      const char *colorname(fpsent *d, const char *name, const char *prefix, const char *suffix, const char *alt)
      {
@@ -1823,7 +1925,7 @@
          {
              formatstring(hpre, "\fs\f%s%s", selfcolor, prefix);
              formatstring(hsuf, "%s\fr", suffix);
-@@ -1026,7 +1163,7 @@
+@@ -1026,7 +1178,7 @@
      const char *teamcolorname(fpsent *d, const char *alt)
      {
          if(!teamcolortext || !m_teammode || d->state==CS_SPECTATOR) return colorname(d, NULL, "", "", alt);
@@ -1832,7 +1934,7 @@
      }
  
      const char *teamcolor(const char *name, bool sameteam, const char *alt)
-@@ -1039,7 +1176,7 @@
+@@ -1039,7 +1191,7 @@
  
      const char *teamcolor(const char *name, const char *team, const char *alt)
      {
@@ -1841,7 +1943,7 @@
      }
  
      VARP(teamsounds, 0, 1, 1);
-@@ -1051,7 +1188,7 @@
+@@ -1051,7 +1203,7 @@
  
      void teamsound(fpsent *d, int n, const vec *loc)
      {
@@ -1850,7 +1952,7 @@
      }
  
      void suicide(physent *d)
-@@ -1874,6 +2011,27 @@
+@@ -1874,6 +2026,27 @@
          pophudmatrix();
      }
  
@@ -1878,7 +1980,7 @@
      void gameplayhud(int w, int h)
      {
          pushhudmatrix();
-@@ -1909,6 +2067,7 @@
+@@ -1909,6 +2082,7 @@
          drawexpandedmap(w, h);
          drawkillstreak(w, h);
          drawflagpopup(w, h);
