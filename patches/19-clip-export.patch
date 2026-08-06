@@ -1407,7 +1407,85 @@
      float calcquality()
      {
          return 1.0f - float(dps)/float(dps+file->videofps); // strictly speaking should lock to read dps - 1.0=perfect, 0.5=half of frames are beingdropped
-@@ -865,6 +1399,7 @@
+@@ -831,6 +1365,77 @@
+         return inbetweenframes ? getclockmillis() : totalmillis;
+     }
+ 
++    // ---- Deterministic export capture (SwiftGibs round 4) ----
++    //
++    // The stock recorder picks output frames off the WALL clock (readbuffer()'s nextframe,
++    // below) and grabs whatever frame the render loop happens to be on at that instant. The
++    // render loop advances the game clock by its own uneven frame time, so successive captured
++    // frames are NOT evenly spaced in GAME time even when every one of them is a distinct
++    // render: measured over a real 60fps export, 12-23ms apart with a 2.75ms standard deviation
++    // against the ideal 16.67 (relative CV 0.162). That unevenness is baked into every exported
++    // video no matter how exactly the camera is reconstructed, and it is the dominant remaining
++    // source of judder in exports.
++    //
++    // While - and only while - a clip export capture is running, the loop is inverted. The frame
++    // that is about to be rendered is given its output frame number FIRST, the game clock is then
++    // advanced by exactly that frame's share of a second, and the render loop is paced so that
++    // happens once per output-frame interval of real time. Every rendered frame is then captured
++    // exactly once, on an exact game-time boundary.
++    //
++    // Why the game clock is forced rather than the capture DECISION simply being moved onto the
++    // game clock: the render loop's own game-time step (curtime) IS the jitter. Choosing capture
++    // instants off lastmillis instead of totalmillis measures the same unevenness with a
++    // different ruler - the grabbed frame still lands wherever the loop happened to get to,
++    // overshooting each boundary by a varying amount.
++    //
++    // Why the wall clock still has the last word: an export's audio is captured LIVE off the
++    // mixer (soundencoder(), above) at real-time rate and muxed in afterwards, so game time must
++    // keep the same average rate as wall time or the two streams drift apart.
++    // deterministicframestep() below is therefore a servo, not a free-running clock. It sleeps
++    // until the wall-clock instant this output frame is due - an ABSOLUTE schedule anchored on
++    // starttime, so one slow frame is paid back out of the next frame's sleep instead of pushing
++    // the whole schedule permanently later, which is what a "sleep 1000/fps since the last frame"
++    // pacer does and which would let the game clock outrun the wall clock without bound. If the
++    // machine cannot render and encode that fast, it advances the output frame number - and the
++    // game clock with it, in whole output-frame units - to wherever the wall clock has actually
++    // got to. Falling behind therefore costs DUPLICATED OUTPUT FRAMES, exactly what the stock
++    // recorder already does and already reports through the same "N duplicated/skipped to hold
++    // timing" accounting, rather than costing A/V sync or a non-uniform game-time step.
++    //
++    // The game clock is an integer millisecond count, so an exact 1000/fps step is not
++    // representable at most frame rates. detacc carries the remainder so the clock lands on
++    // round(n*1000/fps) rather than drifting: at 60fps the step sequence is 16,17,17,16,17,17,...
++    // - a residual of +/-0.33ms against the ideal 16.67, which is the floor an integer clock
++    // allows.
++    static uint detframe = 0; // output frame number of the frame currently being rendered
++    static int detacc = 0;    // remainder of the exact 1000/fps game-time step, in units of 1/fps ms
++
++    // True only while a clip export capture is actually running. The stock "movie" command is
++    // deliberately NOT included: it records live play, where forcing the game clock would change
++    // the game being played. Live play and ordinary clip watching never reach any of this either,
++    // for the same reason - no recorder file, no export phase.
++    bool deterministiccapture() { return file != NULL && game::clipexportcapturing(); }
++
++    int deterministicframestep(int &millis)
++    {
++        if(!deterministiccapture()) return 0;
++        const int fps = max((int)file->videofps, 1);
++        int target = starttime + int((((ullong)detframe + 1)*1000)/(uint)fps);
++        if(target > millis) { SDL_Delay(target - millis); millis = getclockmillis(); }
++        uint wallframe = uint((max(millis - starttime, 0)*(ullong)fps)/1000);
++        uint next = detframe + 1;
++        // Behind real time: skip forward to where the wall clock actually is, capped at the same
++        // 200ms single-frame step limit the engine's own singleplayer clamp uses
++        // (engine/main.cpp), so one long stall cannot hand the world a multi-second step.
++        if(wallframe > next) next = min(wallframe, detframe + uint(max((200*fps)/1000, 1)));
++        int steps = int(next - detframe);
++        detframe = next;
++        detacc += 1000*steps;
++        int step = detacc/fps;
++        detacc -= step*fps;
++        return step;
++    }
++
+     int videoencoder(void *data) // runs on a separate thread
+     {
+         for(int numvid = 0, numsound = 0;;)
+@@ -865,6 +1470,7 @@
              int duplicates = m.frame - (int)file->videoframes + 1;
              if(duplicates > 0) // determine how many frames have been dropped over the sample window
              {
@@ -1415,7 +1493,7 @@
                  dps -= stats[statsindex];
                  stats[statsindex] = duplicates-1;
                  dps += stats[statsindex];
-@@ -896,37 +1431,22 @@
+@@ -896,38 +1502,25 @@
          SDL_UnlockMutex(soundlock);
      }
      
@@ -1461,9 +1539,12 @@
 +        totalduplicates = 0;
 +
          lastframe = ~0U;
++        detframe = 0;
++        detacc = 0;
          videobuffers.clear();
          loopi(MAXVIDEOBUFFERS)
-@@ -935,17 +1455,135 @@
+         {
+@@ -935,17 +1528,135 @@
              videobuffers.data[i].init(w, h, 4);
              videobuffers.data[i].frame = ~0U;
          }
@@ -1603,7 +1684,7 @@
      void cleanup()
      {
          if(scalefb) { glDeleteFramebuffers_(1, &scalefb); scalefb = 0; }
-@@ -982,8 +1620,9 @@
+@@ -982,8 +1693,9 @@
          thread = NULL;
   
          static const char * const mesgs[] = { "ok", "stopped", "computer too slow", "file error"};
@@ -1615,7 +1696,7 @@
          DELETEP(file);
          state = REC_OK;
      }
-@@ -995,7 +1634,7 @@
+@@ -995,7 +1707,7 @@
          uint w = screenw, h = screenh;
          if(usefbo) { w = file->videow; h = file->videoh; }
          if(w != m.w || h != m.h) m.init(w, h, 4);
@@ -1624,7 +1705,7 @@
          m.frame = nextframe;
  
          glPixelStorei(GL_PACK_ALIGNMENT, texalign(m.video, m.w, 4));
-@@ -1050,7 +1689,7 @@
+@@ -1050,7 +1762,7 @@
                      glFramebufferTexture2D_(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, scaletex[1], 0);
                      glViewport(0, 0, dw, dh);
                      glBindTexture(GL_TEXTURE_2D, scaletex[0]);
@@ -1633,7 +1714,7 @@
                      else SETSHADER(moviergb);
                      screenquad(tw/float(scalew), th/float(scaleh));
                      tw = dw;
-@@ -1072,7 +1711,7 @@
+@@ -1072,7 +1784,7 @@
                  glReadPixels(m.w/4, 0, m.w/8, m.h/2, GL_BGRA, GL_UNSIGNED_BYTE, &m.video[planesize]);
                  glPixelStorei(GL_PACK_ALIGNMENT, texalign(&m.video[planesize + planesize/4], m.w/8, 4));
                  glReadPixels(m.w/4, m.h/2, m.w/8, m.h/2, GL_BGRA, GL_UNSIGNED_BYTE, &m.video[planesize + planesize/4]);
@@ -1642,16 +1723,27 @@
              }
              else
              {
-@@ -1095,7 +1734,7 @@
+@@ -1095,8 +1807,17 @@
              return false;
          }
          SDL_LockMutex(videolock);
 -        if(moviesync && videobuffers.full()) SDL_CondWait(shouldread, videolock);
+-        uint nextframe = (max(gettime() - starttime, 0)*file->videofps)/1000;
 +        if(moviesync && file->blockwhenfull() && videobuffers.full()) SDL_CondWait(shouldread, videolock);
-         uint nextframe = (max(gettime() - starttime, 0)*file->videofps)/1000;
++        // Deterministic export capture: this frame's output number was fixed before it was
++        // rendered (deterministicframestep() above), so every rendered frame is captured exactly
++        // once on an exact game-time boundary, instead of "whatever frame the loop was on when
++        // the wall clock crossed a boundary". The nextframe > lastframe test below still does the
++        // right thing for both numbering schemes: it grabs once per new output frame number, so a
++        // second swapbuffers() within the same rendered frame (renderprogress()/renderbackground()
++        // take that path) cannot grab twice, and a frame that could not be queued because the
++        // encoder was busy simply leaves its slot to the writer's existing duplicate padding.
++        // Outside an export capture this is the stock wall-clock numbering, unchanged.
++        uint nextframe = deterministiccapture() ? detframe : (uint)((max(gettime() - starttime, 0)*file->videofps)/1000);
          if(!videobuffers.full() && (lastframe == ~0U || nextframe > lastframe))
          {
-@@ -1113,6 +1752,18 @@
+             videobuffer &m = videobuffers.adding();
+@@ -1113,6 +1834,18 @@
  
      void drawhud()
      {
@@ -1672,7 +1764,7 @@
          gettextres(w, h);
 --- a/engine/engine.h
 +++ b/engine/engine.h
-@@ -600,11 +600,42 @@
+@@ -600,11 +600,53 @@
  
  // recorder
  
@@ -1712,6 +1804,17 @@
 +    extern void requestpipecancel();   // out-of-band "please give up" signal for the padding-loop cap; does NOT by itself unstick an already-blocked write
 +    extern uint exportframessofar();   // live progress / watchdog heartbeat
 +    extern uint skippedpadframes();    // frames fast-forwarded past (not physically written) after a padding-loop cap hit
++
++    // Deterministic export capture (round 4): called exactly once per main-loop iteration from
++    // engine/main.cpp's frame clock, BEFORE the world is updated and the frame is rendered.
++    // Paces the loop to the export's own frame rate and returns the game-time step (ms) this
++    // frame must advance by, so the frame about to be rendered lands on an exact output-frame
++    // boundary in game time. Returns 0 - and does nothing whatsoever - unless a clip export
++    // capture is actually running, so live play, ordinary clip watching and the stock "movie"
++    // recorder are all completely unaffected. Takes the loop's freshly-read wall clock by
++    // reference because it may sleep, and the caller must see the post-sleep value. Full
++    // contract in engine/movie.cpp.
++    extern int deterministicframestep(int &millis);
  }
  
  #endif
@@ -1741,6 +1844,32 @@
  int drawconlines(int conskip, int confade, int conwidth, int conheight, int conoff, int filter, int y = 0, int dir = 1)
  {
      filter &= CON_FLAGS;
+--- a/engine/main.cpp
++++ b/engine/main.cpp
+@@ -1378,6 +1378,15 @@
+     {
+         static int frames = 0;
+         int millis = getclockmillis();
++        // SwiftGibs deterministic export capture: while (and only while) a clip export is
++        // capturing, this paces the loop to the export's own frame rate and returns the exact
++        // game-time step this frame must advance by, so every captured frame lands on an exact
++        // output-frame boundary in GAME time rather than wherever an unevenly-paced render loop
++        // happened to be. Returns 0, and does nothing at all, in every other situation. limitfps
++        // still runs afterwards and is a no-op at any maxfps at or above the export's frame rate
++        // (the delay it computes is already used up); a maxfps BELOW it still wins, and costs the
++        // export duplicated frames exactly as it did before this existed.
++        int exportframestep = recorder::deterministicframestep(millis);
+         limitfps(millis, totalmillis);
+         elapsedtime = millis - totalmillis;
+         static int timeerr = 0;
+@@ -1385,6 +1394,7 @@
+         curtime = scaledtime/100;
+         timeerr = scaledtime%100;
+         if(!multiplayer(false) && curtime>200) curtime = 200;
++        if(exportframestep > 0) curtime = exportframestep;   // deterministic export capture: an exact whole number of output-frame intervals, already bounded by the same 200ms step limit as the clamp above
+         if(game::ispaused()) curtime = 0;
+ 		lastmillis += curtime;
+         totalmillis = millis;
 --- a/shared/iengine.h
 +++ b/shared/iengine.h
 @@ -53,6 +53,49 @@
@@ -1813,7 +1942,7 @@
  namespace server
 --- a/fpsgame/game.h
 +++ b/fpsgame/game.h
-@@ -733,6 +733,7 @@
+@@ -745,6 +745,7 @@
      extern fpsent *hudplayer();
      extern fpsent *followingplayer(fpsent *fallback = NULL);
      extern void stopfollowing();
@@ -1821,7 +1950,7 @@
      extern void clientdisconnected(int cn, bool notify = true);
      extern void clearclients(bool notify = true);
      extern void startgame();
-@@ -842,6 +843,14 @@
+@@ -855,6 +856,14 @@
      extern bool cliprecordwasactivematch();                   // SwiftGibs fps stats (patches/18): was a
                                                                  // recording sink active at any point this
                                                                  // match - read once at match end, never per-frame
@@ -1868,7 +1997,7 @@
      }
  
      VARP(teamcolorchat, 0, 1, 1);
-@@ -2233,6 +2244,935 @@
+@@ -2315,6 +2326,935 @@
      }
      // === end SwiftGibs instant replay: recording modes =======================================
  
@@ -2804,7 +2933,7 @@
      void c2sinfo(bool force) // send update to the server
      {
          static int lastupdate = -1000;
-@@ -3059,6 +3999,13 @@
+@@ -3145,6 +4085,13 @@
                  player1->clientnum = getint(p);
                  gamepaused = false;
                  execident(on ? "demostart" : "demoend");
@@ -2820,7 +2949,7 @@
  
 --- a/fpsgame/fps.cpp
 +++ b/fpsgame/fps.cpp
-@@ -255,6 +255,15 @@
+@@ -339,6 +339,15 @@
      void checkautorespawn();   // SwiftGibs Task 7: defined below, after the cue-demo helpers it checks
      void updateworld()        // main game update loop
      {
@@ -2836,7 +2965,7 @@
          updatereloadmetronome();
          if(!maptime) { maptime = lastmillis; maprealtime = totalmillis; return; }
          if(!curtime) { gets2c(); if(player1->clientnum>=0) c2sinfo(); return; }
-@@ -1121,6 +1130,13 @@
+@@ -1223,6 +1232,13 @@
          // returns) would still be stale/empty.
          cliprecordfinalizeall("map change");
          cliprecordarmmatchstart();
@@ -2850,7 +2979,7 @@
  
          clearmovables();
          clearmonsters();
-@@ -2185,7 +2201,7 @@
+@@ -2287,7 +2303,7 @@
          hudmatrix.scale(h/1800.0f, h/1800.0f, 1);
          flushhudmatrix();
  
