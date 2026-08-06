@@ -11,13 +11,15 @@
          if(!maptime) { maptime = lastmillis; maprealtime = totalmillis; return; }
          if(!curtime) { gets2c(); if(player1->clientnum>=0) c2sinfo(); return; }
  
-@@ -1333,6 +1335,37 @@
-         }
+@@ -1439,6 +1441,42 @@
+         reloadoverlaypass = false;
      }
  
 +    // === SwiftGibs reload metronome (audio tick/ding over the rifle reload) ===
 +    VARP(reloadmetronome, 0, 0, 2);      // 0=off, 1=flat, 2=rising
 +    VARP(reloadmetrovol, 0, 200, 255);   // playsound volume (0..255; 255=full)
++    VARP(reloadmetroready, 0, 1, 1);     // gates ONLY the final ready ding, not the three ticks (0=off, 1=on, default);
++                                          // the visual ready flash is the separate reloadflash cvar (patch 05), untouched here
 +    void updatereloadmetronome()
 +    {
 +        static int mact = -1, mticks = 0; static bool mding = false;
@@ -41,7 +43,10 @@
 +        }
 +        if(!mding && e >= DUR)
 +        {
-+            if(vol > 0) playsoundname("swiftgibs/ding", NULL, vol);
++            // mding is set regardless of reloadmetroready so the state machine's "have we
++            // passed the ding moment" bookkeeping stays correct whether or not the ping plays;
++            // only the actual sound is gated, so turning the ping off never re-fires or stalls it.
++            if(reloadmetroready && vol > 0) playsoundname("swiftgibs/ding", NULL, vol);
 +            mding = true;
 +        }
 +    }
