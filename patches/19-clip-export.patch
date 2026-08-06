@@ -1363,7 +1363,7 @@
  VAR(movieaccelblit, 0, 0, 1);
  VAR(movieaccelyuv, 0, 1, 1);
  VARP(movieaccel, 0, 1, 1);
-@@ -750,13 +1267,19 @@
+@@ -750,13 +1267,20 @@
  namespace recorder
  {
      static enum { REC_OK = 0, REC_USERHALT, REC_TOOSLOW, REC_FILERROR } state = REC_OK;
@@ -1383,10 +1383,11 @@
      static int statsindex = 0;
      static uint dps = 0; // dropped frames per sample
 +    static uint totalduplicates = 0; // cumulative duplicate/padding frames this recording, for the end-of-recording report (dps above is only a rolling per-second window, not a final total)
++    static uint totalshortfall = 0; // cumulative output frames of catch-up shortfall the 200ms-per-iteration cap could not repay this recording (see deterministicframestep() below) - zero unless deterministiccapture() is true
      
      enum { MAXSOUNDBUFFERS = 128 }; // sounds queue up until there is a video frame, so at low fps you'll need a bigger queue
      struct soundbuffer
-@@ -819,8 +1342,19 @@
+@@ -819,8 +1343,19 @@
      static SDL_mutex *videolock = NULL;
      static SDL_cond *shouldencode = NULL, *shouldread = NULL;
  
@@ -1407,7 +1408,7 @@
      float calcquality()
      {
          return 1.0f - float(dps)/float(dps+file->videofps); // strictly speaking should lock to read dps - 1.0=perfect, 0.5=half of frames are beingdropped
-@@ -831,6 +1365,77 @@
+@@ -831,6 +1366,96 @@
          return inbetweenframes ? getclockmillis() : totalmillis;
      }
  
@@ -1444,9 +1445,19 @@
 +    // pacer does and which would let the game clock outrun the wall clock without bound. If the
 +    // machine cannot render and encode that fast, it advances the output frame number - and the
 +    // game clock with it, in whole output-frame units - to wherever the wall clock has actually
-+    // got to. Falling behind therefore costs DUPLICATED OUTPUT FRAMES, exactly what the stock
-+    // recorder already does and already reports through the same "N duplicated/skipped to hold
-+    // timing" accounting, rather than costing A/V sync or a non-uniform game-time step.
++    // got to, capped at 200ms of output per iteration (the same singleplayer step limit as the
++    // clamp above) so one long stall cannot hand the world a multi-second step.
++    //
++    // The real invariant is narrower than it looks: falling behind costs only DUPLICATED OUTPUT
++    // FRAMES, reported through the existing "N duplicated/skipped to hold timing" accounting,
++    // never A/V sync or a non-uniform game-time step - PROVIDED the main loop completes at least
++    // one iteration every 200ms (faster than 5Hz). A one-off hitch recovers fully, because the cap
++    // is per iteration and a catch-up iteration does not sleep. A SUSTAINED slower loop cannot
++    // repay more than 200ms per iteration either, so the frame counter falls permanently behind
++    // the wall clock: the exported video ends shorter than the live-captured audio, and nothing in
++    // the duplicated/skipped accounting says so. That unrecovered shortfall is accumulated in
++    // totalshortfall below and reported through the same channels as duplicatedframes()/
++    // skippedpadframes() - see exportshortfallframes().
 +    //
 +    // The game clock is an integer millisecond count, so an exact 1000/fps step is not
 +    // representable at most frame rates. detacc carries the remainder so the clock lands on
@@ -1472,8 +1483,17 @@
 +        uint next = detframe + 1;
 +        // Behind real time: skip forward to where the wall clock actually is, capped at the same
 +        // 200ms single-frame step limit the engine's own singleplayer clamp uses
-+        // (engine/main.cpp), so one long stall cannot hand the world a multi-second step.
-+        if(wallframe > next) next = min(wallframe, detframe + uint(max((200*fps)/1000, 1)));
++        // (engine/main.cpp), so one long stall cannot hand the world a multi-second step. When the
++        // cap actually bites - the wall clock is further ahead than one iteration can repay - the
++        // remainder is owed and, unless the loop speeds back up, never gets paid back later either
++        // (every iteration is capped the same way): count it so a sustained slow loop is visible
++        // rather than silently falling behind the audio.
++        uint capped = detframe + uint(max((200*fps)/1000, 1));
++        if(wallframe > next)
++        {
++            next = min(wallframe, capped);
++            if(wallframe > capped) totalshortfall += wallframe - capped;
++        }
 +        int steps = int(next - detframe);
 +        detframe = next;
 +        detacc += 1000*steps;
@@ -1485,7 +1505,7 @@
      int videoencoder(void *data) // runs on a separate thread
      {
          for(int numvid = 0, numsound = 0;;)
-@@ -865,6 +1470,7 @@
+@@ -865,6 +1490,7 @@
              int duplicates = m.frame - (int)file->videoframes + 1;
              if(duplicates > 0) // determine how many frames have been dropped over the sample window
              {
@@ -1493,7 +1513,7 @@
                  dps -= stats[statsindex];
                  stats[statsindex] = duplicates-1;
                  dps += stats[statsindex];
-@@ -896,38 +1502,25 @@
+@@ -896,38 +1522,26 @@
          SDL_UnlockMutex(soundlock);
      }
      
@@ -1537,6 +1557,7 @@
          dps = 0;
 -        
 +        totalduplicates = 0;
++        totalshortfall = 0;
 +
          lastframe = ~0U;
 +        detframe = 0;
@@ -1544,7 +1565,7 @@
          videobuffers.clear();
          loopi(MAXVIDEOBUFFERS)
          {
-@@ -935,17 +1528,135 @@
+@@ -935,17 +1549,142 @@
              videobuffers.data[i].init(w, h, 4);
              videobuffers.data[i].frame = ~0U;
          }
@@ -1681,22 +1702,31 @@
 +    // can poll it for on-screen export progress.
 +    uint duplicatedframes() { return totalduplicates; }
 +
++    // Cumulative output frames of catch-up shortfall the deterministic export pacer's 200ms-per-
++    // iteration cap could not repay (see deterministicframestep() above) over the current/most
++    // recent export. Always 0 outside a clip export capture. Reported alongside
++    // duplicatedframes()/skippedpadframes() wherever those are - see stop() below and the
++    // clip-export progress line in fpsgame/client.cpp.
++    uint exportshortfallframes() { return totalshortfall; }
++
      void cleanup()
      {
          if(scalefb) { glDeleteFramebuffers_(1, &scalefb); scalefb = 0; }
-@@ -982,8 +1693,9 @@
+@@ -982,8 +1721,11 @@
          thread = NULL;
   
          static const char * const mesgs[] = { "ok", "stopped", "computer too slow", "file error"};
 -        conoutf("movie recording halted: %s, %d frames", mesgs[state], file->videoframes);
 -        
-+        if(totalduplicates) conoutf("movie recording halted: %s, %d frames (%d duplicated to hold timing)", mesgs[state], file->videoframes, totalduplicates);
++        if(totalduplicates && totalshortfall) conoutf("movie recording halted: %s, %d frames (%d duplicated to hold timing, %d frame shortfall)", mesgs[state], file->videoframes, totalduplicates, totalshortfall);
++        else if(totalduplicates) conoutf("movie recording halted: %s, %d frames (%d duplicated to hold timing)", mesgs[state], file->videoframes, totalduplicates);
++        else if(totalshortfall) conoutf("movie recording halted: %s, %d frames (%d frame shortfall)", mesgs[state], file->videoframes, totalshortfall);
 +        else conoutf("movie recording halted: %s, %d frames", mesgs[state], file->videoframes);
 +
          DELETEP(file);
          state = REC_OK;
      }
-@@ -995,7 +1707,7 @@
+@@ -995,7 +1737,7 @@
          uint w = screenw, h = screenh;
          if(usefbo) { w = file->videow; h = file->videoh; }
          if(w != m.w || h != m.h) m.init(w, h, 4);
@@ -1705,7 +1735,7 @@
          m.frame = nextframe;
  
          glPixelStorei(GL_PACK_ALIGNMENT, texalign(m.video, m.w, 4));
-@@ -1050,7 +1762,7 @@
+@@ -1050,7 +1792,7 @@
                      glFramebufferTexture2D_(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, scaletex[1], 0);
                      glViewport(0, 0, dw, dh);
                      glBindTexture(GL_TEXTURE_2D, scaletex[0]);
@@ -1714,7 +1744,7 @@
                      else SETSHADER(moviergb);
                      screenquad(tw/float(scalew), th/float(scaleh));
                      tw = dw;
-@@ -1072,7 +1784,7 @@
+@@ -1072,7 +1814,7 @@
                  glReadPixels(m.w/4, 0, m.w/8, m.h/2, GL_BGRA, GL_UNSIGNED_BYTE, &m.video[planesize]);
                  glPixelStorei(GL_PACK_ALIGNMENT, texalign(&m.video[planesize + planesize/4], m.w/8, 4));
                  glReadPixels(m.w/4, m.h/2, m.w/8, m.h/2, GL_BGRA, GL_UNSIGNED_BYTE, &m.video[planesize + planesize/4]);
@@ -1723,7 +1753,7 @@
              }
              else
              {
-@@ -1095,8 +1807,17 @@
+@@ -1095,8 +1837,17 @@
              return false;
          }
          SDL_LockMutex(videolock);
@@ -1743,7 +1773,7 @@
          if(!videobuffers.full() && (lastframe == ~0U || nextframe > lastframe))
          {
              videobuffer &m = videobuffers.adding();
-@@ -1113,6 +1834,18 @@
+@@ -1113,6 +1864,18 @@
  
      void drawhud()
      {
@@ -1764,7 +1794,7 @@
          gettextres(w, h);
 --- a/engine/engine.h
 +++ b/engine/engine.h
-@@ -600,11 +600,53 @@
+@@ -600,11 +600,54 @@
  
  // recorder
  
@@ -1804,6 +1834,7 @@
 +    extern void requestpipecancel();   // out-of-band "please give up" signal for the padding-loop cap; does NOT by itself unstick an already-blocked write
 +    extern uint exportframessofar();   // live progress / watchdog heartbeat
 +    extern uint skippedpadframes();    // frames fast-forwarded past (not physically written) after a padding-loop cap hit
++    extern uint exportshortfallframes(); // catch-up shortfall the deterministic export pacer's cap could not repay; always 0 outside a clip export capture
 +
 +    // Deterministic export capture (round 4): called exactly once per main-loop iteration from
 +    // engine/main.cpp's frame clock, BEFORE the world is updated and the frame is rendered.
@@ -1872,7 +1903,7 @@
          totalmillis = millis;
 --- a/shared/iengine.h
 +++ b/shared/iengine.h
-@@ -53,6 +53,49 @@
+@@ -53,6 +53,50 @@
  extern int thirdperson;
  extern bool isthirdperson();
  
@@ -1916,13 +1947,14 @@
 +    extern void requestpipecancel();
 +    extern uint exportframessofar();
 +    extern uint skippedpadframes();
++    extern uint exportshortfallframes();
 +    extern bool isrecording();
 +}
 +
  extern bool settexture(const char *name, int clamp = 0);
  
  // octaedit
-@@ -203,6 +246,7 @@
+@@ -203,6 +247,7 @@
  extern void conoutf(int type, const char *s, ...) PRINTFARGS(2, 3);
  extern void conoutf(int type, int tag, const char *s, ...) PRINTFARGS(3, 4);
  extern void conoutfv(int type, const char *fmt, va_list args);
@@ -1997,7 +2029,7 @@
      }
  
      VARP(teamcolorchat, 0, 1, 1);
-@@ -2325,6 +2336,935 @@
+@@ -2325,6 +2336,936 @@
      }
      // === end SwiftGibs instant replay: recording modes =======================================
  
@@ -2749,16 +2781,17 @@
 +            clipexportlasttitleupdate = totalmillis;
 +            int frames = (int)recorder::exportframessofar();
 +            int dropped = (int)(recorder::duplicatedframes() + recorder::skippedpadframes());
++            int shortfall = (int)recorder::exportshortfallframes(); // sustained sub-5Hz loop: catch-up cap could not repay this many output frames, see deterministicframestep() in engine/movie.cpp
 +            int secs = clipexportfps > 0 ? frames/clipexportfps : 0;
 +            if(screen)
 +            {
-+                defformatstring(titlebuf, "SwiftGibs - exporting clip... %ds captured (%d frames%s) - not hung, this plays in real time, press ESC to cancel", secs, frames, dropped ? ", some duplicated" : "");
++                defformatstring(titlebuf, "SwiftGibs - exporting clip... %ds captured (%d frames%s%s) - not hung, this plays in real time, press ESC to cancel", secs, frames, dropped ? ", some duplicated" : "", shortfall ? ", falling behind" : "");
 +                SDL_SetWindowTitle(screen, titlebuf);
 +            }
 +            if(secs > 0 && secs%10 == 0)
 +            {
 +                static int lastlogsecs = -1;
-+                if(secs != lastlogsecs) { lastlogsecs = secs; logoutf("clip export progress: %ds captured (%d frames, %d duplicated/skipped to hold timing)", secs, frames, dropped); }   // fix round 1: logoutf, not conoutf - getlogfile() falls back to stdout with no log file set (engine/server.cpp), so a Linux terminal still sees progress, but it never reaches the on-screen console feed (conlines) captured into the video
++                if(secs != lastlogsecs) { lastlogsecs = secs; logoutf("clip export progress: %ds captured (%d frames, %d duplicated/skipped to hold timing, %d frame shortfall)", secs, frames, dropped, shortfall); }   // fix round 1: logoutf, not conoutf - getlogfile() falls back to stdout with no log file set (engine/server.cpp), so a Linux terminal still sees progress, but it never reaches the on-screen console feed (conlines) captured into the video
 +            }
 +        }
 +        if(!recorder::isrecording()) { clipexportabort("ffmpeg failed or capture stopped unexpectedly"); return; }
@@ -2803,7 +2836,7 @@
 +            return;
 +        }
 +        if(*width < 2 || *height < 2 || *width > 10000 || *height > 10000) { conoutf(CON_ERROR, "exportclip: bad resolution"); return; }
-+        if(*fps < 1 || *fps > 1000) { conoutf(CON_ERROR, "exportclip: bad fps"); return; }
++        if(*fps < 15 || *fps > 1000) { conoutf(CON_ERROR, "exportclip: fps must be 15-1000"); return; }
 +
 +        bool webm = format[0] && !strcasecmp(format, "webm");
 +        if(format[0] && !webm && strcasecmp(format, "mp4"))
@@ -2933,7 +2966,7 @@
      void c2sinfo(bool force) // send update to the server
      {
          static int lastupdate = -1000;
-@@ -3155,6 +4095,13 @@
+@@ -3155,6 +4096,13 @@
                  player1->clientnum = getint(p);
                  gamepaused = false;
                  execident(on ? "demostart" : "demoend");
