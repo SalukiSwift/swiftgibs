@@ -1,22 +1,19 @@
-# SwiftGibs v1.1.9
+# SwiftGibs v1.1.10
 
-One-click updates on every platform.
+Keep the reload ticks, drop the ready ping.
 
 ## New
 
-- **Update commands for macOS and Linux.** Windows has had `update-swiftgibs.bat`
-  for a while; now macOS gets `update-swiftgibs.command` (double-click it, it sits
-  right next to `SwiftGibs.app`) and Linux gets `update-swiftgibs.sh` (run it in the
-  game folder, next to `swiftgibs.sh`). Each one fetches the latest release, verifies
-  the download before touching anything, and keeps your settings, friends and stats.
-  If a download is incomplete or something goes wrong, your existing install is left
-  exactly as it was.
-- **macOS bonus:** updating this way skips the right-click-Open dance. The updater
-  fetches the app directly rather than through a browser, so macOS does not
-  quarantine it and future launches just work.
+- **Separate toggle for the final ready ping.** The reload metronome counts your
+  rifle back in with three ticks and then plays one last ping the moment you can
+  fire again. That final ping is now its own setting, so you can keep the ticks
+  and switch just the ping off. Find it under **Esc, options, Cues**, right below
+  the metronome volume slider, and it is saved with your preference profiles.
+  Nothing changes unless you turn it off: the ping stays on by default.
+  The on-screen ready flash is unaffected and stays on its own setting.
 
 ## Download
 
 - **Windows:** `swiftgibs-win64.zip` - or run `update-swiftgibs.bat` in your existing folder
-- **macOS (Apple Silicon):** `SwiftGibs-mac.zip` - first launch: right-click, **Open**, **Open**
-- **Linux (x86-64):** `SwiftGibs-linux-x86_64.tar.gz`
+- **macOS (Apple Silicon):** `SwiftGibs-mac.zip` - or double-click `update-swiftgibs.command` next to the app
+- **Linux (x86-64):** `SwiftGibs-linux-x86_64.tar.gz` - or run `update-swiftgibs.sh` in the game folder
