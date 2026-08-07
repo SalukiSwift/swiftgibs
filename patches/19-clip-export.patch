@@ -2102,7 +2102,7 @@
      // saveclip: writes <clipdir>/<timestamp>_<map>_<mode>.dmo, gzipped in the stock demo
      // format (24-byte demoheader, then lilswapped {ms,chan,len} stamps + raw payload,
      // mirroring writedemo()/setupdemorecord() in fpsgame/server.cpp field-for-field), reading
-@@ -2625,6 +2662,1044 @@
+@@ -2625,6 +2662,1099 @@
      }
      // === end SwiftGibs instant replay: recording modes =======================================
  
@@ -2170,6 +2170,17 @@
 +    VARP(clipexportresmode, 0, 1, 3);     // 0=480p 1=720p (default - April's requested default preset) 2=1080p 3=match my resolution (read live via clipexportscreenw/h() below, not snapshotted at menu time, so it tracks a resized window)
 +    VARP(clipexportfpspref, 15, 60, 120); // the player's chosen export fps; HARD CAPPED at 120 by the VARP's own range - no script or console input can push it higher
 +    VARP(clipexportformatpref, 0, 0, 1);  // 0=mp4 (H.264, default - plays everywhere) 1=webm (VP9)
++    // QoL batch (lossless export): overrides BOTH the format radio above and the quality radio
++    // below - checked, this export ignores clipexportformatpref/clipexportquality entirely and
++    // always produces FFV1-in-Matroska instead (see checkclipexport()'s WAITING->CAPTURING
++    // transition and clipexportonplaybackend()'s pass-2 mux, further down, for where
++    // clipexportext/the actual video codec/the pass-2 audio codec all key off this). FFV1 (a
++    // genuinely lossless intra codec) and the matroska (.mkv) muxer are both confirmed present in
++    // the bundled Linux ffmpeg via its own -encoders/-muxers listing (see
++    // docs/ffmpeg-provenance.md and this task's own report - not assumed). Default off: a
++    // lossless export can be enormous (see sgExportRatioLossless and the settings page's own
++    // honest GB/min estimate line, overlay/menus_settings.cfg) and most exports don't need it.
++    VARP(clipexportlossless, 0, 0, 1);
 +    VARP(clipexportquality, 0, 1, 2);     // 0=smaller file 1=normal (default - the exact crf values Task 3 originally hardcoded, unchanged) 2=best quality/largest file; selects the -crf argument in checkclipexport() below, per format
 +    // clipexportsound now means exactly what its label says: 0=export without audio (silent video) 1=include
 +    // the game's own audio in the exported video (DEFAULT - April's mandate: exports must carry sound, not ship
@@ -2246,6 +2257,10 @@
 +    // - the one exit path that can't clean up after itself - doesn't leave what looks like a
 +    // finished, playable video sitting in the user-visible folder.
 +    static bool clipexportsoundenabled = false;
++    // QoL batch (lossless export): this export's own snapshot of clipexportlossless, taken once
++    // at exportclip() time - same reasoning as clipexportsoundenabled just above (a mid-export
++    // settings-page change must never affect an export already in flight).
++    static bool clipexportlosslessenabled = false;
 +    static string clipexporttmpvideopath = "";
 +    static string clipexporttmpwavpath = "";
 +
@@ -2520,8 +2535,14 @@
 +            copystring(resolvedfinal, findfile(clipexportoutpath, "w"));
 +            copystring(resolvedtmpvideo, findfile(clipexporttmpvideopath, "w"));
 +            copystring(resolvedtmpwav, findfile(clipexporttmpwavpath, "w"));
-+            bool webm = !strcmp(clipexportext, "webm");
-+            const char *argv[24]; // needs 21 slots at most (non-webm branch: 18 fixed + -shortest + output + NULL) - sized with headroom, matching pass 1's own argv[32] convention
++            // QoL batch (lossless export): clipexportlosslessenabled (snapshotted at exportclip()
++            // time, like the sound flag itself) takes priority over the webm/mp4 format choice -
++            // a lossless export's container is always matroska (clipexportext was set to "mkv" by
++            // exportclip() whenever this is true), so webm here is forced false rather than ever
++            // re-deriving it from clipexportext, keeping the two mutually exclusive.
++            bool lossless = clipexportlosslessenabled;
++            bool webm = !lossless && !strcmp(clipexportext, "webm");
++            const char *argv[24]; // needs 21 slots at most (mp4 branch: 18 fixed + -shortest + output + NULL; the lossless branch below is smaller still) - sized with headroom, matching pass 1's own argv[32] convention
 +            int argc = 0;
 +            argv[argc++] = clipexportffmpegpath;
 +            argv[argc++] = "-y";
@@ -2531,14 +2552,22 @@
 +            argv[argc++] = "-i"; argv[argc++] = resolvedtmpvideo;
 +            argv[argc++] = "-i"; argv[argc++] = resolvedtmpwav;
 +            argv[argc++] = "-c:v"; argv[argc++] = "copy"; // pass 1 already encoded the video - never re-encode it here, this pass only adds audio
-+            if(webm)
++            if(lossless)
++            {
++                // flac: matroska's own native lossless audio codec - matches the video codec's
++                // own honesty (a "lossless export" whose audio pass silently reached for a lossy
++                // codec would undercut the label), confirmed present in the bundled ffmpeg's own
++                // -encoders listing alongside ffv1 (see this task's own report).
++                argv[argc++] = "-c:a"; argv[argc++] = "flac";
++            }
++            else if(webm)
 +            {
 +                argv[argc++] = "-c:a"; argv[argc++] = "libopus"; // royalty-free, matching the design doc's own reasoning for offering WebM/VP9 at all
 +            }
 +            else
 +            {
 +                argv[argc++] = "-c:a"; argv[argc++] = "aac"; argv[argc++] = "-b:a"; argv[argc++] = "160k";
-+                argv[argc++] = "-movflags"; argv[argc++] = "+faststart"; // matches pass 1's own mp4 flag - the FINAL file is what actually ships, so it needs this, not the discarded temp
++                argv[argc++] = "-movflags"; argv[argc++] = "+faststart"; // mov/mp4-muxer-only option - matches pass 1's own mp4 flag; deliberately NOT reached for the matroska (lossless) branch above, which has no use for it
 +            }
 +            argv[argc++] = "-shortest"; // safety net for a marginal (sub-frame-in-practice) tail-length mismatch between the two independently-captured streams, not a sync fix - see ce-task-5b-report.md's measured offset
 +            argv[argc++] = resolvedfinal;
@@ -2819,13 +2848,19 @@
 +            string sizearg, fpsarg;
 +            formatstring(sizearg, "%dx%d", clipexportwidth, clipexportheight);
 +            formatstring(fpsarg, "%d", clipexportfps);
-+            bool webm = !strcmp(clipexportext, "webm");
++            // QoL batch (lossless export): overrides the webm/mp4 format choice entirely - see
++            // clipexportlosslessenabled's own doc comment (declared alongside
++            // clipexportsoundenabled, above) and exportclip()'s snapshot of it, below.
++            bool lossless = clipexportlosslessenabled;
++            bool webm = !lossless && !strcmp(clipexportext, "webm");
 +            // clipexportquality (Task 5 VARP, above) selects the -crf value per format. Index
 +            // 1 (normal) is exactly the crf Task 3 originally hardcoded for each codec - 0/2
 +            // are a documented +/-6 crf step either side, the standard x264/vpx rule-of-thumb
 +            // for "roughly half/double the bitrate at the same resolution" (also used as the
 +            // basis for the size-estimate ratios on the export settings page - see
-+            // overlay/menus_settings.cfg's "swiftexport" gui and ce-task-5-report.md).
++            // overlay/menus_settings.cfg's "swiftexport" gui and ce-task-5-report.md). Not
++            // consulted at all for a lossless export (below) - ffv1 has no quality/crf dial, it
++            // is lossless by definition regardless of this setting.
 +            static const char *const mp4crf[3]  = { "26", "20", "16" };
 +            static const char *const webmcrf[3] = { "38", "32", "26" };
 +            int qidx = clamp(clipexportquality, 0, 2); // defensive; the VARP's own range already guarantees this
@@ -2867,7 +2902,19 @@
 +            argv[argc++] = "-r"; argv[argc++] = fpsarg;
 +            argv[argc++] = "-i"; argv[argc++] = "-";
 +            argv[argc++] = "-an";
-+            if(webm)
++            if(lossless)
++            {
++                // ffv1: a genuinely lossless intra codec, confirmed present in the bundled Linux
++                // ffmpeg via its own -encoders listing (see docs/ffmpeg-provenance.md and this
++                // task's own report - not assumed). No -crf/-preset dial: losslessness does not
++                // depend on any of ffv1's own tuning options, only on picking it at all, so none
++                // of qidx/mp4crf/webmcrf apply here. Container is matroska (.mkv, via
++                // clipexportext, set by exportclip() below) - inferred from resolvedout's own
++                // extension exactly like the mp4/webm branches already rely on, no explicit -f.
++                argv[argc++] = "-c:v"; argv[argc++] = "ffv1";
++                argv[argc++] = "-pix_fmt"; argv[argc++] = "yuv420p";
++            }
++            else if(webm)
 +            {
 +                argv[argc++] = "-c:v"; argv[argc++] = "libvpx-vp9";
 +                argv[argc++] = "-pix_fmt"; argv[argc++] = "yuv420p";
@@ -3015,7 +3062,14 @@
 +        bool webm = format[0] && !strcasecmp(format, "webm");
 +        if(format[0] && !webm && strcasecmp(format, "mp4"))
 +            conoutf(CON_WARN, "exportclip: unrecognised format \"%s\", using mp4", format);
-+        copystring(clipexportext, webm ? "webm" : "mp4");
++        // QoL batch (lossless export): clipexportlossless overrides the format radio entirely -
++        // checked, this export always lands in matroska regardless of what "format" (the
++        // mp4/webm radio's own resolved string, above) says. Snapshotted into
++        // clipexportlosslessenabled a few lines down (with width/height/fps/ext) so a mid-export
++        // settings-page change can never affect an export already in flight, matching
++        // clipexportsoundenabled's own precedent.
++        bool lossless = clipexportlossless != 0;
++        copystring(clipexportext, lossless ? "mkv" : (webm ? "webm" : "mp4"));
 +
 +        // Resolve the clip source the same tolerant way playclip does (with or without ".dmo"),
 +        // and refuse up front if it plainly doesn't exist - a clear message beats discovering
@@ -3074,6 +3128,7 @@
 +        // (cheap string formatting) regardless of the sound setting, so clipexportremovetempfiles()
 +        // can always safely attempt to clean them up on every exit path.
 +        clipexportsoundenabled = clipexportsound != 0;
++        clipexportlosslessenabled = lossless;
 +        // Dot-prefix the two small ffmpeg-pass intermediates so a mid-export directory listing -
 +        // or a hard kill, which leaves whatever's on disk exactly where every other exit path
 +        // already cleans it up from, see clipexportremovetempfiles() above - doesn't show what
@@ -3147,7 +3202,7 @@
      void c2sinfo(bool force) // send update to the server
      {
          static int lastupdate = -1000;
-@@ -3476,6 +4551,13 @@
+@@ -3476,6 +4606,13 @@
                  player1->clientnum = getint(p);
                  gamepaused = false;
                  execident(on ? "demostart" : "demoend");
