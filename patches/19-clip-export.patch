@@ -1926,7 +1926,7 @@
          totalmillis = millis;
 --- a/shared/iengine.h
 +++ b/shared/iengine.h
-@@ -53,6 +53,50 @@
+@@ -53,6 +53,55 @@
  extern int thirdperson;
  extern bool isthirdperson();
  
@@ -1947,8 +1947,13 @@
 +// clean capture). Declared here (engine/main.cpp, pre-existing) rather than pulling in the
 +// much larger engine/engine.h just for this one pointer, same reasoning as the rest of this
 +// block. shared/cube.h already #includes SDL.h before this header, so SDL_Window is a
-+// complete type by the time fpsgame/client.cpp parses this declaration.
++// complete type by the time fpsgame/client.cpp parses this declaration. Guarded like
++// shared/cube.h's own SDL.h #include: under STANDALONE (make server), SDL.h is never
++// pulled in and SDL_Window is not a complete type - fpsgame/client.cpp, the only consumer
++// of screen, is never part of SERVER_OBJS, so nothing under STANDALONE needs this extern.
++#ifndef STANDALONE
 +extern SDL_Window *screen;
++#endif
 +
 +// SwiftGibs clip export (Task 3): the subset of engine/engine.h's
 +// `namespace recorder` declarations that game-side export orchestration
@@ -1977,7 +1982,7 @@
  extern bool settexture(const char *name, int clamp = 0);
  
  // octaedit
-@@ -203,6 +247,7 @@
+@@ -203,6 +252,7 @@
  extern void conoutf(int type, const char *s, ...) PRINTFARGS(2, 3);
  extern void conoutf(int type, int tag, const char *s, ...) PRINTFARGS(3, 4);
  extern void conoutfv(int type, const char *fmt, va_list args);
@@ -1985,7 +1990,7 @@
  
  extern FILE *getlogfile();
  extern void setlogfile(const char *fname);
-@@ -483,6 +528,16 @@
+@@ -483,6 +533,16 @@
  extern void sendclientpacket(ENetPacket *packet, int chan);
  extern void flushclient();
  extern void disconnect(bool async = false, bool cleanup = true);
