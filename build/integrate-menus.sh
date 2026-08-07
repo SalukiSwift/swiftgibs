@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Attach the SwiftGibs / Cues / Audio / Friends tabs to the stock Esc->options gui by splicing four literal lines
+# Attach the SwiftGibs / Cues / Audio / Clips / Friends tabs to the stock Esc->options gui by splicing five literal lines
 # (which call aliases defined in overlay/menus_settings.cfg) into the staged data/menus.cfg, right
 # before the options gui's closing `] "game"`. Also performs build-time surgery on six stock options
 # rows that clash with settings SwiftGibs manages itself (player brightness, forced player models,
@@ -58,9 +58,10 @@ assert close >= 0, "integrate-menus: options closing `] \"game\"` not found afte
 ins = (b'    guitab "SwiftGibs"' + nl + b'    sgSwiftgibsTab' + nl +
        b'    guitab "Cues"' + nl + b'    sgCuesTab' + nl +
        b'    guitab "Audio"' + nl + b'    sgAudioTab' + nl +
+       b'    guitab "Clips"' + nl + b'    sgClipsTab' + nl +
        b'    guitab "Friends"' + nl + b'    sgFriendsTab' + nl)
 open(p, "wb").write(b[:close] + ins + b[close:])
-print("integrate-menus: attached SwiftGibs + Friends tabs to", p)
+print("integrate-menus: attached SwiftGibs + Cues + Audio + Clips + Friends tabs to", p)
 PY
 fi
 
@@ -185,7 +186,7 @@ for keep in (b'guicheckbox "always use team skins" teamskins',
              b'guicheckbox "teammates" teamcrosshair',
              b'guicheckbox "trilinear filtering (mipmaps)" trilinear',
              b'guitext "crosshair size"',
-             b'guitab "SwiftGibs"', b'guitab "Cues"', b'guitab "Audio"', b'guitab "Friends"'):
+             b'guitab "SwiftGibs"', b'guitab "Cues"', b'guitab "Audio"', b'guitab "Clips"', b'guitab "Friends"'):
     assert b.count(keep) >= 1, "integrate-menus: expected row/tab missing after surgery: %r" % keep
 
 after_crosshairsize_count = b.count(b"guislider crosshairsize")
