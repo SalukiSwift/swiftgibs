@@ -1050,7 +1050,7 @@
      void sendmessages()
      {
          packetbuf p(MAXTRANS);
-@@ -1298,12 +1946,689 @@
+@@ -1298,12 +1946,867 @@
          sendclientpacket(p.finalize(), 1);
      }
  
@@ -1337,6 +1337,184 @@
 +    }
 +    COMMAND(saveclip, "");
 +    // === end SwiftGibs instant replay: keyframes + clip writing =============================
++
++    // === SwiftGibs clip POV scan (QoL batch: export from another player's POV) ==============
++    //
++    // Bounded, read-only scan of a clip/recording's opening keyframe (writeclipwelcome(),
++    // above) to list every player name that clip actually knows about, WITHOUT touching
++    // demoplayback/players[]/any live game state - this runs from the clips/export menu,
++    // before any playback has started, purely to populate the export page's POV selector.
++    // Mirrors, just for the fields it needs to skip past, the exact same top-level
++    // "while(remaining) switch(getint)" dispatch parsemessages() (far below) uses for a real
++    // packet - walking N_WELCOME/N_MAPCHANGE/N_TIMEUP/N_ITEMLIST/the optional N_CURRENTMASTER/
++    // N_PAUSEGAME/N_GAMESPEED/N_TEAMINFO blocks/N_RESUME in exactly the order writeclipwelcome()
++    // emits them, so it lands on the trailing N_INITCLIENT/N_INITAI run - ALWAYS recorder-first,
++    // the same file-order guarantee the export target-locking code (below) already relies on.
++    // Any opcode this function does not recognise means the payload has diverged from that
++    // known layout (corrupt file, or a future format change) - it stops there rather than guess
++    // at a field count it doesn't actually know, returning whatever names it collected so far.
++    //
++    // Bounded by construction so a corrupt or hand-edited file can never hang this: the
++    // keyframe payload length is refused outright once it exceeds MAXTRANS (a real keyframe is
++    // always built into a packetbuf(MAXTRANS) - see checkclipkeyframe()/startcliprecorder()
++    // above - so anything bigger already proves this isn't one), every getint()/getstring()
++    // call below is itself bounded to that same fixed-size buffer (shared/tools.cpp: reading
++    // past the end sets an overread flag and returns 0/"" rather than reading further), and the
++    // outer opcode loop is ALSO capped at a fixed iteration count (comfortably above any real
++    // match's player count) so a payload that lies about a section's own terminator can degrade
++    // to "list truncated here", never spin.
++    static vector<char *> clippovnamecache;
++    enum { CLIPPOVMAXNAMES = 64, CLIPPOVMAXOPCODES = 128 };
++
++    static void clippovcollectname(const char *name)
++    {
++        if(!name[0] || clippovnamecache.length() >= CLIPPOVMAXNAMES) return;
++        clippovnamecache.add(newstring(name));
++    }
++
++    static bool clippovscanfile(const char *clipname)
++    {
++        // Same tolerant resolution exportclip()/playclip both use: <clipdir>/<name>[.dmo].
++        string clipfile;
++        copystring(clipfile, clipname);
++        size_t namelen = strlen(clipfile);
++        if(namelen < 4 || strcasecmp(&clipfile[namelen-4], ".dmo")) concatstring(clipfile, ".dmo");
++        defformatstring(relpath, "%s%s%s", clipdir, clipdir[0] ? "/" : "", clipfile);
++
++        // opengzfile()/openfile()/openrawfile() already resolve a plain relative path via
++        // findfile() internally (shared/stream.cpp) - the same tolerant lookup
++        // setupdemoplayback() (fpsgame/server.cpp) relies on for its own opengzfile(file, "rb")
++        // call, so no separate findfile() wrapping is needed here.
++        stream *f = opengzfile(relpath, "rb");
++        if(!f) return false;
++
++        demoheader hdr;
++        bool ok = f->read(&hdr, sizeof(demoheader)) == sizeof(demoheader) && !memcmp(hdr.magic, DEMO_MAGIC, sizeof(hdr.magic));
++
++        int stamp[3] = { 0, 0, 0 };   // ms, chan, len - the opening keyframe's own record header (saveclip()/startcliprecorder(), above: always written first)
++        if(ok) ok = f->read(stamp, sizeof(stamp)) == sizeof(stamp);
++        if(ok) lilswap(stamp, 3);
++        int len = stamp[2];
++        // A real keyframe is always built into a packetbuf(MAXTRANS) - see the doc comment
++        // above - so anything outside this range already proves it is not one; refuse rather
++        // than attempt a huge or negative read.
++        if(ok && (len <= 0 || len > MAXTRANS)) ok = false;
++
++        uchar *rawbuf = NULL;
++        if(ok)
++        {
++            rawbuf = new uchar[len];
++            ok = f->read(rawbuf, len) == size_t(len);
++        }
++        delete f;
++        if(!ok) { if(rawbuf) delete[] rawbuf; return false; }
++
++        ucharbuf p(rawbuf, len);
++        int opcodes = 0;
++        while(p.remaining() && opcodes++ < CLIPPOVMAXOPCODES)
++        {
++            int type = getint(p);
++            if(p.overread()) break;
++            bool desynced = false;
++            switch(type)
++            {
++                case N_WELCOME: break;
++                case N_MAPCHANGE:
++                {
++                    string skiptext; getstring(skiptext, p);
++                    getint(p); getint(p);                  // gamemode, notgotitems
++                    break;
++                }
++                case N_TIMEUP: getint(p); break;
++                case N_ITEMLIST:
++                {
++                    int n; while((n = getint(p)) >= 0 && !p.overread()) getint(p);
++                    break;
++                }
++                case N_CURRENTMASTER:
++                {
++                    getint(p);                              // mastermode
++                    int cn; while((cn = getint(p)) >= 0 && !p.overread()) getint(p); // cn, priv pairs
++                    break;
++                }
++                case N_PAUSEGAME: getint(p); getint(p); break;      // val, cn
++                case N_GAMESPEED: getint(p); getint(p); break;      // val, cn
++                case N_TEAMINFO:
++                    for(;;)
++                    {
++                        string skiptext; getstring(skiptext, p);
++                        if(p.overread() || !skiptext[0]) break;
++                        getint(p);                          // frags
++                    }
++                    break;
++                case N_RESUME:
++                    for(;;)
++                    {
++                        int cn = getint(p);
++                        if(p.overread() || cn < 0) break;
++                        // 11 fixed fields + the ammo block - exactly putclipresume()'s own
++                        // field order, above (state/frags/flags/deaths/quadmillis/
++                        // lifesequence/health/maxhealth/armour/armourtype/gunselect).
++                        loopi(11) getint(p);
++                        loopi(GUN_PISTOL-GUN_SG+1) getint(p);
++                    }
++                    break;
++                case N_INITCLIENT:
++                {
++                    getint(p);                              // cn
++                    string name, skipteam;
++                    getstring(name, p);
++                    filtertext(name, name, false, false, MAXNAMELEN);
++                    if(!name[0]) copystring(name, "unnamed");   // matches case N_INITCLIENT's own fallback, below
++                    getstring(skipteam, p);
++                    getint(p);                              // playermodel
++                    clippovcollectname(name);
++                    break;
++                }
++                case N_INITAI:
++                {
++                    getint(p); getint(p); getint(p); getint(p); getint(p);   // bn, on, at, sk, pm
++                    string rawname, name, skipteam;
++                    getstring(rawname, p);
++                    filtertext(name, rawname, false, false, MAXNAMELEN);
++                    getstring(skipteam, p);
++                    clippovcollectname(name);
++                    break;
++                }
++                default:
++                    // Diverged from writeclipwelcome()'s own emission order (corrupt file, or a
++                    // future format change) - stop rather than guess at a field layout we don't
++                    // actually know.
++                    desynced = true;
++                    break;
++            }
++            if(desynced || p.overread()) break;
++        }
++
++        delete[] rawbuf;
++        return true;
++    }
++
++    // CubeScript-facing pair, mirroring the exact clipfilecount()/clipfilename() division of
++    // labour (above): clipplayers(file) refreshes the cache for THIS clip and returns the
++    // count; clipplayername(i) only ever reads it back, never rescans. The export settings
++    // page (overlay/menus_settings.cfg) calls clipplayers once when it opens, then loops
++    // clipplayername for its quick-pick POV buttons - see that page's own comment for why each
++    // button bakes the NAME via an assignment, never via a concatword-built executed action
++    // (player names are untrusted network/file data, unlike a pre-sanitised clip filename).
++    ICOMMAND(clipplayers, "s", (char *clipname),
++    {
++        clippovnamecache.deletearrays();
++        clippovscanfile(clipname);
++        intret(clippovnamecache.length());
++    });
++
++    ICOMMAND(clipplayername, "i", (int *i),
++    {
++        if(*i < 0 || *i >= clippovnamecache.length()) { result(""); return; }
++        result(clippovnamecache[*i]);
++    });
++    // === end SwiftGibs clip POV scan =========================================================
 +
 +    // === SwiftGibs instant replay: recording modes (Task 3b) ================================
 +    // Two more consumers of the same recorder core (Tasks 1-2): a manual start/stop recording
@@ -1740,7 +1918,7 @@
          sendmessages();
          flushclient();
      }
-@@ -1400,6 +2725,22 @@
+@@ -1400,6 +2903,22 @@
                  int seqcolor = (physstate>>3)&1;
                  fpsent *d = getclient(cn);
                  if(!d || d->lifesequence < 0 || seqcolor!=(d->lifesequence&1) || d->state==CS_DEAD) continue;
@@ -1763,7 +1941,7 @@
                  float oldyaw = d->yaw, oldpitch = d->pitch, oldroll = d->roll;
                  d->yaw = yaw;
                  d->pitch = pitch;
-@@ -1743,6 +3084,44 @@
+@@ -1743,6 +3262,44 @@
                  loopk(3) to[k] = getint(p)/DMF;
                  fpsent *s = getclient(scn);
                  if(!s) break;
@@ -1808,7 +1986,7 @@
                  if(gun>GUN_FIST && gun<=GUN_PISTOL && s->ammo[gun]) s->ammo[gun]--;
                  s->gunselect = clamp(gun, (int)GUN_FIST, (int)GUN_PISTOL);
                  s->gunwait = guns[s->gunselect].attackdelay;
-@@ -1803,6 +3182,26 @@
+@@ -1803,6 +3360,26 @@
                      if(killstreak > beststreak) beststreak = killstreak;
                      if(killstreak > matchbeststreak) matchbeststreak = killstreak;
                      if(killstreak % 5 == 0 && killstreak <= 20) killstreakmilestone(killstreak/5);
@@ -1835,7 +2013,7 @@
                  }
                  // SwiftGibs: per-player streak for the scoreboard column (all players)
                  if(victim && victim != actor && (!m_teammode || !isteam(actor->team, victim->team)))
-@@ -2057,6 +3456,15 @@
+@@ -2057,6 +3634,15 @@
  
              case N_DEMOPLAYBACK:
              {
@@ -2056,29 +2234,39 @@
          conoutf("follow off");
      }
  
-@@ -133,6 +147,21 @@
+@@ -133,6 +147,31 @@
          return followingplayer(player1);
      }
  
 +    // SwiftGibs: the player that team-relative VISUALS (flat model colours, kill-feed name
 +    // colours, radar blips, team-score HUD) are judged from. Live play: yourself. Spectating
-+    // with follow: the player you are watching. Clip/demo playback with a free camera: the
-+    // recording player - players[1] is reliably the recorder (players[0] is always the local
-+    // player1; the first remote client created during playback is the recorder, see the POV
-+    // note in the clip-export code in fpsgame/client.cpp). Never used for game logic, only
-+    // presentation.
++    // with follow: the player you are watching. Clip/demo playback with an ACTIVE follow lock
++    // (POV export locked onto a chosen player, or a manual `follow <cn>` while free-watching a
++    // demo): whoever that lock targets, even in the rare frame followingplayer() itself
++    // returns NULL for (the target is momentarily CS_SPECTATOR, or not yet reconstructed) -
++    // QoL batch (export from another player's POV) generalised this from a previous hardcoded
++    // "always players[1]" fallback, which silently flipped team-relative colours back to the
++    // RECORDER whenever that edge case hit, even while a different player's POV was locked in.
++    // Free-camera playback with NO follow lock at all (following<0): falls back to the
++    // recorder - players[1] is reliably the recorder (players[0] is always the local player1;
++    // the first remote client created during playback is the recorder, see the POV note in the
++    // clip-export code in fpsgame/client.cpp). Never used for game logic, only presentation.
 +    fpsent *teamviewplayer()
 +    {
 +        fpsent *f = followingplayer();
 +        if(f) return f;
-+        if(demoplayback && players.length() > 1 && players[1]) return players[1];
++        if(demoplayback)
++        {
++            if(following >= 0) { fpsent *t = getclient(following); if(t) return t; }
++            else if(players.length() > 1 && players[1]) return players[1];
++        }
 +        return player1;
 +    }
 +
      void setupcamera()
      {
          fpsent *target = followingplayer();
-@@ -181,16 +210,92 @@
+@@ -181,16 +220,92 @@
              moveplayer(d, 1, false);
              d->newpos = d->o;
          }
@@ -2177,7 +2365,7 @@
      }
  
      void otherplayers(int curtime)
-@@ -244,6 +349,24 @@
+@@ -244,6 +359,24 @@
          if(!maptime) { maptime = lastmillis; maprealtime = totalmillis; return; }
          if(!curtime) { gets2c(); if(player1->clientnum>=0) c2sinfo(); return; }
  
@@ -2202,7 +2390,7 @@
          physicsframe();
          ai::navigate();
          if(player1->state != CS_DEAD && !intermission)
-@@ -672,6 +795,13 @@
+@@ -672,6 +805,13 @@
              {
                  case ID_VAR:   f->printf("%s %d\n", names[i], *id->storage.i); break;
                  case ID_FVAR:  f->printf("%s %s\n", names[i], floatstr(*id->storage.f)); break;
@@ -2216,7 +2404,7 @@
                  case ID_ALIAS: f->printf("%s = [%s]\n", names[i], id->getstr()); break;
              }
          }
-@@ -749,6 +879,16 @@
+@@ -749,6 +889,16 @@
          else
          {
              intermission = true;
@@ -2233,7 +2421,7 @@
              player1->attacking = false;
              if(cmode) cmode->gameover();
              conoutf(CON_GAMEINFO, "\f2intermission:");
-@@ -840,6 +980,24 @@
+@@ -840,6 +990,24 @@
  
      void startgame()
      {
@@ -2258,7 +2446,7 @@
          clearmovables();
          clearmonsters();
  
-@@ -995,10 +1153,10 @@
+@@ -995,10 +1163,10 @@
  
      const char *colorname(fpsent *d, const char *name, const char *prefix, const char *suffix, const char *alt)
      {
@@ -2271,7 +2459,7 @@
          {
              formatstring(hpre, "\fs\f%s%s", selfcolor, prefix);
              formatstring(hsuf, "%s\fr", suffix);
-@@ -1026,7 +1184,7 @@
+@@ -1026,7 +1194,7 @@
      const char *teamcolorname(fpsent *d, const char *alt)
      {
          if(!teamcolortext || !m_teammode || d->state==CS_SPECTATOR) return colorname(d, NULL, "", "", alt);
@@ -2280,7 +2468,7 @@
      }
  
      const char *teamcolor(const char *name, bool sameteam, const char *alt)
-@@ -1039,7 +1197,7 @@
+@@ -1039,7 +1207,7 @@
  
      const char *teamcolor(const char *name, const char *team, const char *alt)
      {
@@ -2289,7 +2477,7 @@
      }
  
      VARP(teamsounds, 0, 1, 1);
-@@ -1051,7 +1209,7 @@
+@@ -1051,7 +1219,7 @@
  
      void teamsound(fpsent *d, int n, const vec *loc)
      {
@@ -2298,7 +2486,7 @@
      }
  
      void suicide(physent *d)
-@@ -1879,6 +2037,27 @@
+@@ -1879,6 +2047,27 @@
          pophudmatrix();
      }
  
@@ -2326,7 +2514,7 @@
      void gameplayhud(int w, int h)
      {
          pushhudmatrix();
-@@ -1914,6 +2093,7 @@
+@@ -1914,6 +2103,7 @@
          drawexpandedmap(w, h);
          drawkillstreak(w, h);
          drawflagpopup(w, h);

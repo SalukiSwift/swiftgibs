@@ -2102,7 +2102,7 @@
      // saveclip: writes <clipdir>/<timestamp>_<map>_<mode>.dmo, gzipped in the stock demo
      // format (24-byte demoheader, then lilswapped {ms,chan,len} stamps + raw payload,
      // mirroring writedemo()/setupdemorecord() in fpsgame/server.cpp field-for-field), reading
-@@ -2625,6 +2662,1099 @@
+@@ -2803,6 +2840,1164 @@
      }
      // === end SwiftGibs instant replay: recording modes =======================================
  
@@ -2229,6 +2229,29 @@
 +    static string clipexportext = "mp4";
 +    static int clipexportwaitstart = 0;
 +    static int clipexporttargetcn = -1;
++    // QoL batch (export from another player's POV): true once the locked target (below) turns
++    // out to be a bot (aitype != AI_NONE), not a real network client. Bots in this engine are
++    // simulated CLIENT-SIDE (fpsgame/ai.cpp's ai::update()) and never send/receive an N_POS of
++    // their own - sendpositions() (fpsgame/server.cpp) only ever relays a REAL client's position
++    // buffer, which case N_POS's server-side handler is the only thing that ever fills; nothing
++    // in ai.cpp ever touches a bot's own .position buffer. So a recorded clip can genuinely
++    // never carry a bot's position over the "network" layer this whole POV-reconstruction
++    // pipeline is built on, which means followlive (below) can never legitimately become true
++    // for a bot target no matter how long checkclipexport() waits. Recorded independently by a
++    // direct decode of a real .dmo (zero N_POS records for any AI-type clientnum, in a clip
++    // where that same bot fragged the recorder repeatedly - i.e. genuinely active the whole
++    // time) - see the task's own report for the walkthrough. Used only to skip the pointless
++    // 8-second followlive wait below for an AI target - never to change what actually gets
++    // captured (still whatever the existing degraded/non-tracking camera path already shows).
++    static bool clipexporttargetisai = false;
++    // QoL batch (export from another player's POV): the name typed or clicked on the export
++    // settings page, snapshotted once in exportclip() (below) like every other per-export
++    // setting - empty means "no choice made, follow the recorder" (this feature's previous and
++    // still-default behaviour). Resolved to a clientnum exactly once, at the same WAITING->
++    // CAPTURING transition that used to hardcode players[1] outright (checkclipexport(),
++    // below) - resolution failure (name typed does not match anyone in THIS clip) falls back
++    // to the recorder with a console note, never an abort, per the design doc.
++    static string clipexportpovname = "";
 +    // Auto-return (Task: auto-return after export): set by clipexportabort() for any reason
 +    // OTHER than "cancelled" (ESC/cancelclipexport keeps its own existing behaviour - see
 +    // overlay/autoexec.cfg's sgCancelExport, deliberately untouched by this task), and
@@ -2753,9 +2776,10 @@
 +        {
 +            if(clipexporttargetcn < 0)
 +            {
-+                // Not yet identified the recording player: need demoplayback active with the
++                // Not yet identified a follow target: need demoplayback active with the
 +                // reconstructed client list populated (players[1], the convention this whole
-+                // feature already uses for "who to follow").
++                // feature already uses for "the recorder, and everyone else this clip knows
++                // about").
 +                if(!demoplayback || players.length() < 2)
 +                {
 +                    if(totalmillis - clipexportwaitstart > 8000)
@@ -2763,7 +2787,27 @@
 +                    return;
 +                }
 +
-+                // Identify + lock onto the recording player - see the big design comment at the top
++                // QoL batch (export from another player's POV): an empty clipexportpovname
++                // keeps the exact previous behaviour (recorder, players[1]). A non-empty one is
++                // resolved by NAME against every RECONSTRUCTED player this clip knows about -
++                // players[1..], deliberately never players[0] itself (the local viewer's own
++                // fresh player1, not a real recorded identity - see the big design comment at
++                // the top of this section) - case-insensitively, since this can come from the
++                // free-text fallback field as well as a quick-pick button, and a player typing
++                // a name by hand should not have to match its exact recorded case. No match
++                // (typo, or a name that genuinely isn't in this clip) falls back to the
++                // recorder with a console note, per the design doc - never an abort.
++                fpsent *target = NULL;
++                if(clipexportpovname[0])
++                {
++                    for(int i = 1; i < players.length(); i++)
++                        if(players[i] && !strcasecmp(players[i]->name, clipexportpovname)) { target = players[i]; break; }
++                    if(!target)
++                        conoutf(CON_WARN, "clip export: POV player \"%s\" not found in this clip - following the recorder instead", clipexportpovname);
++                }
++                if(!target) target = players[1];
++
++                // Identify + lock onto the chosen target - see the big design comment at the top
 +                // of this section. Locking the target here, ONCE (guarded by clipexporttargetcn,
 +                // reset to -1 only by exportclip(), below), is deliberate: follow() (fpsgame/fps.cpp)
 +                // calls clippovreset() every time it actually reasserts a target, and player1 stays
@@ -2771,7 +2815,14 @@
 +                // forever wipe the very POV ring the readiness check just below needs to see fill up -
 +                // guaranteeing the 8-second timeout on every single export instead of ever reaching
 +                // CAPTURING.
-+                clipexporttargetcn = players[1]->clientnum;
++                clipexporttargetcn = target->clientnum;
++                clipexporttargetisai = target->aitype != AI_NONE;
++                if(clipexporttargetisai)
++                    // logoutf, not conoutf - same reasoning as the "dead-opening clip" note
++                    // just below: keep this out of the on-screen console feed the video itself
++                    // captures, since it can land while capture is already under way for a
++                    // resolved-by-name bot target the WAITING phase locks onto instantly.
++                    logoutf("clip export: POV target \"%s\" is a bot - bots are simulated client-side and never send a position of their own, so their view cannot be reconstructed from the recording; capturing from the existing degraded (non-tracking) camera instead", target->name);
 +                defformatstring(followarg, "%d", clipexporttargetcn);
 +                follow(followarg);
 +            }
@@ -2819,7 +2870,14 @@
 +            // still not satisfied by the timeout, abort cleanly instead of capturing whatever the
 +            // screen happens to show, exactly as before.
 +            bool followlive = clippovringlen > 0 && clippovfollowing == clipexporttargetcn && clippovappliedcn == clipexporttargetcn;
-+            if(mainmenu || !connected || gamemode == INT_MAX || !followlive)
++            // QoL batch (export from another player's POV): a bot target (clipexporttargetisai,
++            // above) can never legitimately satisfy followlive - skip that half of the gate for
++            // it entirely once the world itself is actually ready, rather than burning the same
++            // 8-second timeout on a signal that will never arrive. mainmenu/connected/gamemode
++            // (the world-readiness gates) are NOT skipped - still needed to avoid capturing the
++            // loading screen, exactly as for any other target.
++            bool needfollowlive = !followlive && !clipexporttargetisai;
++            if(mainmenu || !connected || gamemode == INT_MAX || needfollowlive)
 +            {
 +                if(totalmillis - clipexportwaitstart <= 8000) return;
 +                if(mainmenu || !connected || gamemode == INT_MAX)
@@ -3027,7 +3085,7 @@
 +    // instead", i.e. exactly what this function always did before this parameter existed. See
 +    // clipexportautobase()/clipexportautoname(), above, for the shared derivation and the
 +    // settings page's own prefill of the same value.
-+    void exportclip(char *name, int *width, int *height, int *fps, char *format, char *customname)
++    void exportclip(char *name, int *width, int *height, int *fps, char *format, char *customname, char *povname)
 +    {
 +        if(clipexportphase != CLIPEXPORT_IDLE) { conoutf(CON_ERROR, "exportclip: an export is already in progress (cancelclipexport to stop it)"); return; }
 +        // Refuse only REAL live play, not a bare `connected`: a genuine remote match
@@ -3151,6 +3209,13 @@
 +        clipexportheight = *height;
 +        clipexportfps = *fps;
 +        clipexporttargetcn = -1;
++        clipexporttargetisai = false;
++        // QoL batch (export from another player's POV): snapshotted like every other
++        // per-export setting (clipexportsoundenabled/clipexportlosslessenabled, above) - taken
++        // once here so a mid-export edit to the settings page's POV field can never affect an
++        // export already in flight. Resolved to an actual clientnum later, at the WAITING->
++        // CAPTURING transition (checkclipexport(), below) - players[] does not exist yet here.
++        copystring(clipexportpovname, povname);
 +
 +        clipexportapplysettings();
 +
@@ -3169,7 +3234,7 @@
 +        clipexportphase = CLIPEXPORT_WAITING;
 +        clipexportwaitstart = totalmillis;
 +    }
-+    COMMAND(exportclip, "siiiss");
++    COMMAND(exportclip, "siiisss");
 +
 +    void cancelclipexport()
 +    {
@@ -3202,7 +3267,7 @@
      void c2sinfo(bool force) // send update to the server
      {
          static int lastupdate = -1000;
-@@ -3476,6 +4606,13 @@
+@@ -3654,6 +4849,13 @@
                  player1->clientnum = getint(p);
                  gamepaused = false;
                  execident(on ? "demostart" : "demoend");
