@@ -1792,6 +1792,29 @@
          int w = screenw, h = screenh;
          if(forceaspect) w = int(ceil(h*forceaspect));
          gettextres(w, h);
+@@ -1137,6 +1900,22 @@
+ 
+     void capture(bool overlay)
+     {
++        // SwiftGibs clip export field fix (2026-08-07): loading and background screens reach
++        // here through swapbuffers(false) - engine/main.cpp's renderbackground() and
++        // renderprogress() are its only two callers - while the real rendered frame always
++        // arrives through swapbuffers()'s default overlay=true. Under a clip export the output
++        // frame number is fixed ONCE per main-loop iteration (deterministicframestep(), above),
++        // so whichever of the two grabs first owns that frame outright. When a clip changes map
++        // partway through (fpsgame/client.cpp clipexportonmapchange(), which no longer aborts on
++        // that), the map load's own progress screen runs inside the same iteration and grabbed
++        // first, putting one splash frame into the finished video at the cut - measured as
++        // exactly one frame in a real export of April's nucleus clip, since the second and later
++        // grabs of an iteration are already refused by readbuffer()'s nextframe > lastframe
++        // test. Declining the non-overlay path under an export leaves the slot to that
++        // iteration's real frame, which is the freshly loaded world. Outside an export nothing
++        // changes: the vanilla "movie" command still records loading screens exactly as before,
++        // and readbuffer()'s REC_OK self-heal still runs every real frame.
++        if(!overlay && deterministiccapture()) return;
+         if(readbuffer() && overlay) drawhud();
+     }
+ }
 --- a/engine/engine.h
 +++ b/engine/engine.h
 @@ -600,11 +600,54 @@
@@ -2029,7 +2052,7 @@
      }
  
      VARP(teamcolorchat, 0, 1, 1);
-@@ -2618,6 +2629,941 @@
+@@ -2625,6 +2636,973 @@
      }
      // === end SwiftGibs instant replay: recording modes =======================================
  
@@ -2487,9 +2510,41 @@
 +    // exported also arrives here via changemapserv() like any other map change, but that
 +    // happens while phase is still WAITING (before capture starts), so it is correctly ignored;
 +    // this only fires for a map change that has no business happening mid-capture.
++    //
++    // FIELD FIX (April's nucleus clip, 2026-08-07 - the export that produced no video at all):
++    // a map change that arrives DURING demo playback IS the clip's own recorded content, and it
++    // has every business happening. A clip is a slice of a real recorded session, and a real
++    // session changes map inside that slice whenever the server rotates or restarts a match, or
++    // whenever the player reconnects to it. Her clip caught exactly that: a genuine
++    // N_WELCOME + N_MAPCHANGE 29.97s into a 76.9s clip, with the entire 47s of actual gameplay
++    // AFTER it. Aborting there threw the whole export away - no output file, both temp
++    // intermediates created and then deleted - which is what she saw. The same clip exports end
++    // to end once this stops aborting; capture simply continues through the reload.
++    //
++    // Two things that could have made continuing wrong are already handled, and were confirmed
++    // on a real export of that clip rather than assumed:
++    //   - No loading-screen frame can leak into the video. Under an export the output frame
++    //     number comes from detframe, which only ever advances in the main loop's own frame step
++    //     (engine/movie.cpp deterministicframestep()/readbuffer()), so the extra swapbuffers()
++    //     calls renderprogress() makes while the map loads cannot claim a new output frame. The
++    //     gap is filled by the writer's existing duplicate padding instead - measured as 64
++    //     duplicated frames across the reload, and the frames either side of it are real world.
++    //   - Audio and video stay in step. The pacer's per-iteration catch-up repays the blocked
++    //     load quickly (measured: 76.550s of video against 76.579s of live-captured audio, 29ms
++    //     apart over a clip with a full map reload in the middle).
++    // The pre-round-5 build (67249e3) aborts on this same clip at the same instant, so this is a
++    // long-standing limit of the export rather than anything the round-5 playback rework did.
++    //
++    // The guard is KEPT for what it was actually written to catch: a map change with no demo
++    // playback behind it, i.e. something outside the clip moved the world mid-capture. That
++    // still aborts exactly as before.
 +    void clipexportonmapchange()
 +    {
-+        if(clipexportphase == CLIPEXPORT_CAPTURING) clipexportabort("map changed during export");
++        if(clipexportphase != CLIPEXPORT_CAPTURING) return;
++        // logoutf, not conoutf - the established pattern in this feature for a note that must
++        // not reach the on-screen console feed the video itself captures.
++        if(demoplayback) { logoutf("clip export: the clip changes map partway through - continuing the capture across it"); return; }
++        clipexportabort("map changed during export");
 +    }
 +
 +    // Ensure `dir` (a virtual/relative directory path in the same "/"-joined convention as
@@ -2971,7 +3026,7 @@
      void c2sinfo(bool force) // send update to the server
      {
          static int lastupdate = -1000;
-@@ -3469,6 +4415,13 @@
+@@ -3476,6 +4454,13 @@
                  player1->clientnum = getint(p);
                  gamepaused = false;
                  execident(on ? "demostart" : "demoend");
