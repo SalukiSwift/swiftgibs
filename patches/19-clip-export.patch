@@ -1974,7 +1974,7 @@
  namespace server
 --- a/fpsgame/game.h
 +++ b/fpsgame/game.h
-@@ -745,6 +745,7 @@
+@@ -749,6 +749,7 @@
      extern fpsent *hudplayer();
      extern fpsent *followingplayer(fpsent *fallback = NULL);
      extern void stopfollowing();
@@ -1982,7 +1982,7 @@
      extern void clientdisconnected(int cn, bool notify = true);
      extern void clearclients(bool notify = true);
      extern void startgame();
-@@ -855,6 +856,14 @@
+@@ -859,6 +860,14 @@
      extern bool cliprecordwasactivematch();                   // SwiftGibs fps stats (patches/18): was a
                                                                  // recording sink active at any point this
                                                                  // match - read once at match end, never per-frame
@@ -2029,7 +2029,7 @@
      }
  
      VARP(teamcolorchat, 0, 1, 1);
-@@ -2325,6 +2336,936 @@
+@@ -2618,6 +2629,941 @@
      }
      // === end SwiftGibs instant replay: recording modes =======================================
  
@@ -2613,16 +2613,21 @@
 +            //     successful load_world(), so it cannot go true from the early m_demo handshake
 +            //     alone), and followlive, just below (a real applied N_POS already in the POV
 +            //     ring); connected/gamemode here only rule out "never connected at all".
-+            //   - clippovringlen > 0 for clipexporttargetcn specifically: the POV sample ring
-+            //     (above) is pushed exactly once per real N_POS applied for the followed player
-+            //     (case N_POS, below) - a non-empty ring is direct, positive proof that at least one
++            //   - clippovappliedcn == clipexporttargetcn: direct, positive proof that at least one
 +            //     genuine position/orientation update for THIS clip's follow target has been
-+            //     received and applied, not merely that the player object exists with whatever
-+            //     default/leftover o/yaw/pitch it happens to still carry.
++            //     received AND APPLIED, not merely that the player object exists with whatever
++            //     default/leftover o/yaw/pitch it happens to still carry. This needed its own flag
++            //     from round 5 on. The POV sample ring is now filled by clippovpeek() at the moment
++            //     readdemo() READS a record, one presentation delay before case N_POS applies it,
++            //     so "the ring is not empty" stopped proving the followed player had actually been
++            //     moved: it would have let capture start up to a presentation delay early, with the
++            //     opening frames still showing everyone at their spawn pose. clippovappliedcn is
++            //     written only on the applied path (case N_POS) and is cleared with the ring, so it
++            //     carries exactly the meaning the ring used to.
 +            // 8-second failsafe: if mainmenu/connected/gamemode - the map/game-state gates - are
 +            // still not satisfied by the timeout, abort cleanly instead of capturing whatever the
 +            // screen happens to show, exactly as before.
-+            bool followlive = clippovringlen > 0 && clippovfollowing == clipexporttargetcn;
++            bool followlive = clippovringlen > 0 && clippovfollowing == clipexporttargetcn && clippovappliedcn == clipexporttargetcn;
 +            if(mainmenu || !connected || gamemode == INT_MAX || !followlive)
 +            {
 +                if(totalmillis - clipexportwaitstart <= 8000) return;
@@ -2966,7 +2971,7 @@
      void c2sinfo(bool force) // send update to the server
      {
          static int lastupdate = -1000;
-@@ -3155,6 +4096,13 @@
+@@ -3469,6 +4415,13 @@
                  player1->clientnum = getint(p);
                  gamepaused = false;
                  execident(on ? "demostart" : "demoend");
@@ -2982,7 +2987,7 @@
  
 --- a/fpsgame/fps.cpp
 +++ b/fpsgame/fps.cpp
-@@ -339,6 +339,15 @@
+@@ -345,6 +345,15 @@
      void checkautorespawn();   // SwiftGibs Task 7: defined below, after the cue-demo helpers it checks
      void updateworld()        // main game update loop
      {
@@ -2998,7 +3003,7 @@
          updatereloadmetronome();
          if(!maptime) { maptime = lastmillis; maprealtime = totalmillis; return; }
          if(!curtime) { gets2c(); if(player1->clientnum>=0) c2sinfo(); return; }
-@@ -1223,6 +1232,13 @@
+@@ -1229,6 +1238,13 @@
          // returns) would still be stale/empty.
          cliprecordfinalizeall("map change");
          cliprecordarmmatchstart();
@@ -3012,7 +3017,7 @@
  
          clearmovables();
          clearmonsters();
-@@ -2287,7 +2303,7 @@
+@@ -2298,7 +2314,7 @@
          hudmatrix.scale(h/1800.0f, h/1800.0f, 1);
          flushhudmatrix();
  

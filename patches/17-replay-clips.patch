@@ -422,7 +422,7 @@
      void sendpositions()
      {
          loopv(players)
-@@ -1262,6 +1289,564 @@
+@@ -1262,6 +1289,627 @@
          }
      }
  
@@ -465,7 +465,7 @@
 +    // fps.cpp's predictplayer() (the per-frame yaw/pitch update for the followed player) -
 +    // externed in game.h, same cross-file pattern as smoothmove/smoothdist there.
 +    VARP(clipaimsnap, 0, 1, 1);    // snap the followed player's view to the exact shot ray during playback
-+    VARP(clipaimhold, 0, 40, 120); // ms to hold the snapped view before normal blending resumes
++    VARP(clipaimhold, 0, 40, 120); // ms the FALLBACK pin holds the snapped view. Round 5 took this off the normal path entirely: whenever the timeline reconstruction is running (which is whenever a clip has any buffered own-view samples, i.e. always in practice) the ray is crossfaded in by clippovinterp() instead and predictplayer() skips the pin - see clippovaimtime below. It still applies on the degraded path, where there is no reconstruction to crossfade with, so it is kept rather than removed
 +    int clipaimholduntil = 0;        // lastmillis the hold plateau ends; in the past/0 = inactive
 +    float clipaimyaw = 0, clipaimpitch = 0; // exact ray angles to hold during the plateau
 +
@@ -654,20 +654,52 @@
 +    #define CLIPPOVNEAR 2              // recorded samples either side of evaltime the band is tested at
 +    #define CLIPPOVSOFT 0.15f          // degrees of band overshoot that halves a width's weight
 +    #define CLIPPOVPREF 8.0f           // preference multiplier per step up in width
-+    #define CLIPPOVAIMW 33.0f          // ms either side of an own shot the exact ray is blended in
++    #define CLIPPOVAIMW 45.0f          // ms either side of an own shot the recorded aim is blended over
 +
-+    // The own-shot ray anchor. Recorded at DMF precision by cliprecordownshot() (above), i.e.
-+    // ~26x finer than the whole-degree N_POS angles, so at the shot instant it is simply better
-+    // truth than anything the samples can say. Round 4 and earlier honoured it by PINNING the
-+    // view to it for clipaimhold ms and then releasing - two velocity discontinuities per shot.
-+    // Round 5 keeps the exactness and drops the pin: within CLIPPOVAIMW either side of the shot,
-+    // the reconstruction crossfades (raised cosine, so value and slope both land smoothly) into a
-+    // fit that is CONSTRAINED to pass through the ray at the shot instant. The crossfade weight
-+    // is exactly 1 at that instant, so the rendered aim there is the ray itself, bit for bit -
-+    // measured 0.00000 degrees of error at all three of April's own shots on the destiny clip,
-+    // against 2.3-3.4 degrees if the same reconstruction is run without the anchor.
++    // The own-shot anchor. cliprecordownshot() (above) records the shot's from/to at DMF
++    // precision, ~26x finer than the whole-degree N_POS angles, so at the shot instant it is
++    // simply better truth than anything the position samples can say. Round 4 and earlier honoured
++    // it by PINNING the view to the ray for clipaimhold ms and then releasing - two velocity
++    // discontinuities per shot, measured as a 127px jump in a single frame.
++    //
++    // Round 5 blends instead of pinning, and anchors on the recorded IMPACT POINT rather than the
++    // ray direction: both are recorded truth, but the impact point stays geometrically exact as
++    // the camera moves, and "the crosshair is on the victim" is a statement about where the beam
++    // ENDS. At the shot instant, where the camera is standing at from, the two are identical.
++    //
++    // The blend weight is a raised cosine, full weight at the recorded shot instant and easing to
++    // zero at CLIPPOVAIMW with zero slope at both ends, so it is C1 throughout. Note what that
++    // does and does NOT say: the weight is exactly 1 at the shot INSTANT, but frames do not land
++    // on instants - at 60fps the frame that first draws the beam sits somewhere in the first
++    // 16.7ms after it, where the weight is 0.83-1.0. So the crossfade alone does not guarantee an
++    // exactly-on-target beam frame; the direct write in case N_SHOTFX (below) is what does, and it
++    // is kept for exactly that reason. (An earlier round-5 comment claimed the weight was
++    // "exactly 1 at the shot instant, bit for bit" as though that settled the rendered frame too.
++    // It did not.)
++    //
++    // Rejected, measured: giving the weight a FLAT TOP wide enough that the beam frame always
++    // lands inside it (so the direct write becomes redundant). It does make the frame before the
++    // beam exactly on target rather than 0.9px off, but it holds the view on the impact point for
++    // a whole extra frame and then leaves in a bigger step - measured 7.6px at +1 frame followed
++    // by a 160px jump, against 113px then 86px for the plain cosine, i.e. a LESS smooth departure -
++    // and it costs jerk everywhere (destiny export 0.346 against 0.334, interactive 0.343 against
++    // 0.326). Sub-pixel at the approach is not worth a frame of held aim at the departure.
++    //
++    // clippovaimtime is the record's OWN recorded timestamp, taken when readdemo() reads the
++    // record - one presentation delay before the beam is drawn (clippovpeek(), below). That is
++    // what makes the leading half of the crossfade real: the camera eases into the recorded aim
++    // over the frames approaching the shot instead of jolting onto it at the beam frame. Before
++    // the shot record was peeked, the anchor only existed from the presentation frame onward, so
++    // the frame before the beam was still on the unanchored fit - measured at 176-199px off on a
++    // fast flick, and then corrected in one frame.
 +    static int clippovaimtime = 0;
 +    static bool clippovaimvalid = false;
++    // The follow target an N_POS has actually been APPLIED for (case N_POS, below), as opposed to
++    // merely read. The two stopped being the same thing when clippovpeek() started filling the ring
++    // at read time: the ring now runs a presentation delay ahead of the world, so a non-empty ring
++    // no longer proves the followed player's position has been set on the fpsent. The export's
++    // capture-start gate needs the stronger statement - see followlive in checkclipexport().
++    static int clippovappliedcn = -1;
 +    static vec clippovaimto(0, 0, 0);   // the shot's recorded impact point, DMF precision
 +
 +    // THE ONE SOURCE OF TRUTH for how far behind the demo stream the POV camera renders, and
@@ -693,7 +725,7 @@
 +    // reconstruction. clippovaimvalid resets alongside the ring for the same reason: an own-shot
 +    // ray anchor belongs to the player and the demo it was recorded in, and must never be blended
 +    // into a different one's view across the discontinuity.
-+    void clippovreset() { clippovringlen = 0; clippovringnext = 0; clippovfollowing = -1; clippovaimvalid = false; clippovinterval = 0; }
++    void clippovreset() { clippovringlen = 0; clippovringnext = 0; clippovfollowing = -1; clippovaimvalid = false; clippovappliedcn = -1; clippovinterval = 0; }
 +
 +    static void clippovpush(int cn, int time, float yaw, float pitch, const vec &o)
 +    {
@@ -733,10 +765,36 @@
 +    // this always sees them.
 +    void clippovpeek(int chan, const uchar *data, int len, int time)
 +    {
-+        if(chan != 0 || len <= 0 || !demoplayback) return;
++        if(len <= 0 || !demoplayback) return;
 +        fpsent *target = followingplayer(NULL);
 +        if(!target) return;
 +        ucharbuf p((uchar *)data, len);
++        if(chan == 1)
++        {
++            // The own-shot record. cliprecordownshot() (above) writes it as a packet holding
++            // exactly one N_SHOTFX on the reliable channel, so a LEADING N_SHOTFX is the only
++            // thing worth reading here; anything else on channel 1 is left entirely to
++            // parsemessages() at presentation time, since walking a general reliable-message
++            // stream would mean duplicating that whole switch to know each message's length.
++            // Nothing is applied from here - only the aim anchor is armed, one presentation delay
++            // before the beam is drawn, which is what lets the crossfade ease IN rather than jolt.
++            int type = getint(p);
++            if(p.overread() || type != N_SHOTFX || !clipaimsnap) return;
++            int scn = getint(p);
++            getint(p); getint(p);                       // gun, id - not needed for the anchor
++            vec from, to;
++            loopk(3) from[k] = getint(p)/DMF;
++            loopk(3) to[k] = getint(p)/DMF;
++            if(p.overread() || scn != target->clientnum) return;
++            vec dir = vec(to).sub(from);
++            if(dir.magnitude() <= 1e-3f) return;
++            vectoyawpitch(dir, clipaimyaw, clipaimpitch);   // ray angles, for the degraded pin path
++            clippovaimto = to;
++            clippovaimtime = time;
++            clippovaimvalid = true;
++            return;
++        }
++        if(chan != 0) return;
 +        while(p.remaining())
 +        {
 +            int type = getint(p);
@@ -961,12 +1019,17 @@
 +        // per shot, measured as a 103-127px jump in a single frame.
 +        if(clipaimsnap && clippovaimvalid)
 +        {
-+            float dt = float(evaltime - clippovaimtime);
-+            if(fabs(dt) < CLIPPOVAIMW)
++            float dt = fabs(float(evaltime - clippovaimtime));
++            if(dt < CLIPPOVAIMW)
 +            {
 +                vec aimdir = vec(clippovaimto).sub(targeto);
 +                if(aimdir.magnitude() > 1e-3f)
 +                {
++                    // Raised cosine: full weight at the recorded shot instant, zero at
++                    // CLIPPOVAIMW, zero slope at both ends, so no velocity step anywhere. dt is
++                    // already |evaltime - shot instant|, so this is symmetric by construction and
++                    // the approach side is real - clippovpeek() armed the anchor a presentation
++                    // delay ago, before the beam is drawn.
 +                    float beta = 0.5f*(1.0f + cosf(PI*dt/CLIPPOVAIMW));
 +                    float aimyaw, aimpitch;
 +                    vectoyawpitch(aimdir, aimyaw, aimpitch);
@@ -987,7 +1050,7 @@
      void sendmessages()
      {
          packetbuf p(MAXTRANS);
-@@ -1298,12 +1883,689 @@
+@@ -1298,12 +1946,689 @@
          sendclientpacket(p.finalize(), 1);
      }
  
@@ -1677,12 +1740,12 @@
          sendmessages();
          flushclient();
      }
-@@ -1400,6 +2662,18 @@
+@@ -1400,6 +2725,22 @@
                  int seqcolor = (physstate>>3)&1;
                  fpsent *d = getclient(cn);
                  if(!d || d->lifesequence < 0 || seqcolor!=(d->lifesequence&1) || d->state==CS_DEAD) continue;
 +                // SwiftGibs clip fidelity round 3: push this record's true recorded demo-timeline
-+                // timestamp (server::nextplayback - see clippovpush()'s own doc comment above for
++                // timestamp (server::curplaybacktime - see clippovpush()'s own doc comment above for
 +                // why this specific value, not totalmillis/lastmillis) into the followed player's
 +                // POV ring, independent of whatever the existing old/new smoothing logic below
 +                // decides for d->yaw/pitch itself - every recorded sample is a genuine
@@ -1692,11 +1755,15 @@
 +                // assignment a few lines below does it (d->o = o; d->o.z += d->eyeheight), so what
 +                // clippovinterp() hands back is directly assignable to d->o with no second
 +                // correction anywhere.
-+                if(demoplayback && d == followingplayer(NULL)) clippovpush(cn, server::curplaybacktime, yaw, pitch, vec(o.x, o.y, o.z + d->eyeheight));
++                if(demoplayback && d == followingplayer(NULL))
++                {
++                    clippovpush(cn, server::curplaybacktime, yaw, pitch, vec(o.x, o.y, o.z + d->eyeheight));
++                    clippovappliedcn = cn;   // this record has been APPLIED, not just read - see clippovappliedcn
++                }
                  float oldyaw = d->yaw, oldpitch = d->pitch, oldroll = d->roll;
                  d->yaw = yaw;
                  d->pitch = pitch;
-@@ -1743,6 +3017,42 @@
+@@ -1743,6 +3084,44 @@
                  loopk(3) to[k] = getint(p)/DMF;
                  fpsent *s = getclient(scn);
                  if(!s) break;
@@ -1716,18 +1783,20 @@
 +                    {
 +                        vectoyawpitch(dir, clipaimyaw, clipaimpitch);
 +                        clipaimholduntil = lastmillis + clipaimhold;
-+                        // Round 5: the impact point is kept for clippovinterp()'s crossfade, dated
-+                        // by the demo-timeline instant THIS frame's camera was evaluated at.
-+                        // readdemo() now holds every record back by exactly that same look-behind
-+                        // (clippovpresentdelay()), so this record arriving is the camera reaching
-+                        // the moment of the shot, to within one frame - which is what makes a
-+                        // crossfade centred here honest rather than a pin applied early.
++                        // Normally a no-op: clippovpeek() (above) armed this exact anchor, from
++                        // this exact record, one presentation delay ago, and curplaybacktime is
++                        // the same recorded timestamp it used there. Kept because the peek is
++                        // deliberately conservative - it only reads a LEADING N_SHOTFX on the
++                        // reliable channel - so a record it declined to parse still gets its
++                        // anchor here, just without the crossfade's leading half.
 +                        clippovaimto = to;
-+                        clippovaimtime = server::gamemillis + curtime - clippovpresentdelay();
++                        clippovaimtime = server::curplaybacktime;
 +                        clippovaimvalid = true;
-+                        // This frame's own view was already computed, before this record existed,
-+                        // so put it on the impact point directly; from the next frame the
-+                        // crossfade continues from exactly this value with no step.
++                        // Belt and braces on the exactness: the crossfade's plateau already has
++                        // this frame's view on the impact point, but frame timing is not ours to
++                        // assume (a machine rendering slower than the plateau is wide could land
++                        // outside it), so write it directly too. At 60fps this writes the value
++                        // the crossfade already produced, so it introduces no step.
 +                        vec aimdir = vec(to).sub(s->o);
 +                        if(aimdir.magnitude() > 1e-3f) vectoyawpitch(aimdir, s->yaw, s->pitch);
 +                        else { s->yaw = clipaimyaw; s->pitch = clipaimpitch; }
@@ -1739,7 +1808,7 @@
                  if(gun>GUN_FIST && gun<=GUN_PISTOL && s->ammo[gun]) s->ammo[gun]--;
                  s->gunselect = clamp(gun, (int)GUN_FIST, (int)GUN_PISTOL);
                  s->gunwait = guns[s->gunselect].attackdelay;
-@@ -1803,6 +3113,26 @@
+@@ -1803,6 +3182,26 @@
                      if(killstreak > beststreak) beststreak = killstreak;
                      if(killstreak > matchbeststreak) matchbeststreak = killstreak;
                      if(killstreak % 5 == 0 && killstreak <= 20) killstreakmilestone(killstreak/5);
@@ -1766,7 +1835,7 @@
                  }
                  // SwiftGibs: per-player streak for the scoreboard column (all players)
                  if(victim && victim != actor && (!m_teammode || !isteam(actor->team, victim->team)))
-@@ -2057,6 +3387,15 @@
+@@ -2057,6 +3456,15 @@
  
              case N_DEMOPLAYBACK:
              {
