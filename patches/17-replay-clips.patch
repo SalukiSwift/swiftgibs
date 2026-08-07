@@ -422,7 +422,7 @@
      void sendpositions()
      {
          loopv(players)
-@@ -1262,6 +1289,468 @@
+@@ -1262,6 +1289,564 @@
          }
      }
  
@@ -668,6 +668,24 @@
 +    // against 2.3-3.4 degrees if the same reconstruction is run without the anchor.
 +    static int clippovaimtime = 0;
 +    static bool clippovaimvalid = false;
++    static vec clippovaimto(0, 0, 0);   // the shot's recorded impact point, DMF precision
++
++    // THE ONE SOURCE OF TRUTH for how far behind the demo stream the POV camera renders, and
++    // therefore also for how long fpsgame/server.cpp's readdemo() holds each record before
++    // presenting it. They MUST be the same number. A symmetric fit needs recorded samples on both
++    // sides of the instant it renders, so the camera is necessarily behind the newest record read
++    // out of the file; if the world were still presented at the read position, an own shot's beam
++    // and hit sound would land while the camera was still that far short of the aim that fired it.
++    // Measured before this delay existed: one frame before the beam appeared the reconstruction
++    // sat 200px off the recorded ray, and the only thing hiding it at the beam frame itself was a
++    // one-frame hard write of the ray into the followed player's angles - which then snapped back
++    // out on the very next frame, 103px in one frame on a fast flick.
++    //
++    // Holding the stream is legitimate here in a way it never would be live: a demo is a file, its
++    // records carry their own timestamps, and delaying every one of them by the same constant is
++    // an invisible shift of when playback starts rather than a change to anything inside it.
++    // Beams, sounds, deaths, gibs, other players and our own view all move together.
++    int clippovpresentdelay() { return int(CLIPPOVFITMS); }
 +
 +    // Reset sites mirror clipaimholduntil's own (fpsgame/fps.cpp's follow()/nextfollow()/
 +    // stopfollowing(), plus demo start/end here in case N_DEMOPLAYBACK below) - a stale ring
@@ -680,6 +698,14 @@
 +    static void clippovpush(int cn, int time, float yaw, float pitch, const vec &o)
 +    {
 +        if(cn != clippovfollowing) { clippovringlen = 0; clippovringnext = 0; clippovfollowing = cn; clippovinterval = 0; }
++        // The ring is fed twice for the same record: once by clippovpeek() when readdemo() reads
++        // it, and again by case N_POS when the delayed presentation finally dispatches it. Keeping
++        // both call sites means the peek is an optimisation rather than a dependency - if it ever
++        // fails to recognise a packet, the ring still fills the old way and the reconstruction
++        // just loses its look-ahead for that sample instead of breaking. Non-increasing timestamps
++        // are therefore dropped here, which also protects the fit from a duplicate or out-of-order
++        // record in a corrupt file.
++        if(clippovringlen > 0 && time <= clippovring[(clippovringnext - 1 + CLIPPOVRINGSIZE) % CLIPPOVRINGSIZE].time) return;
 +        if(clippovringlen > 0)
 +        {
 +            // Once per real sample, never per render frame (see the doc comment above the ring).
@@ -695,6 +721,54 @@
 +        clippovring[clippovringnext].o = o;
 +        clippovringnext = (clippovringnext+1) % CLIPPOVRINGSIZE;
 +        if(clippovringlen < CLIPPOVRINGSIZE) clippovringlen++;
++    }
++
++    // Called by readdemo() (fpsgame/server.cpp) at the moment a record is READ from the file,
++    // before it is queued for presentation. This is what lets the ring run ahead of the world: the
++    // camera's look-ahead comes from records that have been read but not yet presented, so no lag
++    // is spent getting it. Mirrors parsepositions()' own walk (below) exactly - N_DEMOPACKET is a
++    // no-op prefix, N_POS is decoded field for field the same way case N_POS does it - and stops
++    // at the first message it does not recognise rather than guessing at the layout. Our own
++    // recorded view samples are single-N_POS channel-0 packets (cliprecordownpos(), above), so
++    // this always sees them.
++    void clippovpeek(int chan, const uchar *data, int len, int time)
++    {
++        if(chan != 0 || len <= 0 || !demoplayback) return;
++        fpsent *target = followingplayer(NULL);
++        if(!target) return;
++        ucharbuf p((uchar *)data, len);
++        while(p.remaining())
++        {
++            int type = getint(p);
++            if(p.overread()) return;
++            if(type == N_DEMOPACKET) continue;
++            if(type != N_POS) return;
++            int cn = getuint(p), physstate = p.get(), flags = getuint(p);
++            vec o;
++            loopk(3)
++            {
++                int n = p.get(); n |= p.get()<<8; if(flags&(1<<k)) { n |= p.get()<<16; if(n&0x800000) n |= ~0U<<24; }
++                o[k] = n/DMF;
++            }
++            int dir = p.get(); dir |= p.get()<<8;
++            float yaw = dir%360, pitch = clamp(dir/360, 0, 180)-90;
++            p.get();                                     // roll
++            int mag = p.get(); if(flags&(1<<3)) mag |= p.get()<<8;
++            p.get(); p.get();                            // velocity direction
++            if(flags&(1<<4))
++            {
++                mag = p.get(); if(flags&(1<<5)) mag |= p.get()<<8;
++                if(flags&(1<<6)) { p.get(); p.get(); }
++            }
++            if(p.overread()) return;
++            int seqcolor = (physstate>>3)&1;
++            // Same liveness gate case N_POS applies before it trusts a record, so a sample from a
++            // dead or respawning life sequence never reaches the ring through this path either.
++            // continue rather than return: a channel-0 packet recorded off a live server carries
++            // several players' N_POS back to back, and ours is not necessarily the first one.
++            if(cn != target->clientnum || target->lifesequence < 0 || seqcolor != (target->lifesequence&1) || target->state == CS_DEAD) continue;
++            clippovpush(cn, time, yaw, pitch, vec(o.x, o.y, o.z + target->eyeheight));
++        }
 +    }
 +
 +    static float clippovlerpyaw(float a, float b, float t)
@@ -729,11 +803,21 @@
 +        // line needs. Round 5 widens the look-behind from two intervals (~25ms) to this (50ms):
 +        // playback is not interactive, and a symmetric window is what buys the smoothing for free
 +        // instead of paying for it in lag.
++        // The fit half-window. The interval floor only matters on a coarsely sampled recording
++        // (clipposinterval up to 33ms), where a window narrower than a couple of gaps could not
++        // hold the three samples a line needs; there the widest window reaches a few ms past the
++        // newest read sample, where there is simply no data, so the fit quietly becomes one-sided
++        // rather than extrapolating.
 +        float hmax = max(CLIPPOVFITMS, 1.6f*interval);
 +        // See the doc comment above the ring for why this is gamemillis + curtime (not gamemillis).
 +        // Together with a constant look-behind that makes the render-behind constant, which is
 +        // what removes the judder a jittering evaluation instant would otherwise add on top.
-+        int evaltime = server::gamemillis + curtime - int(hmax + 0.5f);
++        // The look-behind is the shared constant, NOT hmax: readdemo() holds the world back by
++        // exactly this much (clippovpresentdelay(), above), and the two only stay in step if they
++        // read the same number. gamemillis + curtime rather than bare gamemillis because
++        // predictplayer() runs from game::updateworld(), which engine/main.cpp calls before
++        // serverslice(), so gamemillis has not yet had this frame's curtime added.
++        int evaltime = server::gamemillis + curtime - clippovpresentdelay();
 +        // targetyaw/targetpitch: the same piecewise-linear reconstruction this function always
 +        // returned before this fix round - still computed in full below, now feeding the
 +        // quantization-aware smoothing stage instead of being returned directly.
@@ -742,6 +826,17 @@
 +        // the wire-precision note above the ring). Clamping to an endpoint outside the buffered
 +        // range is what keeps this honest: it NEVER extrapolates past the newest recorded sample,
 +        // so nothing is ever invented, only held.
++        // NEVER past the newest buffered sample. The piecewise-linear branches below already
++        // clamped, but the weighted fit further down did not: with a jittering frame time (i.e.
++        // ordinary interactive playback, as opposed to an export's locked 60fps clock) evaltime
++        // can overshoot the newest sample by a frame, and a line fitted only to samples BEHIND it
++        // and then read past the end of them is an extrapolation - inventing motion the recording
++        // does not contain, and doing it from a slope that carries the whole half-degree dither.
++        // Measured in the harness before this clamp: interactive watch-back jerk 1.86 against the
++        // pre-accuracy build's 0.20, while the same code measured 0.34 on a locked-clock export.
++        // Clamping here holds on the newest sample exactly as the target does, so a frame that
++        // outruns the recording repeats the last honest view instead of guessing at the next one.
++        if(evaltime > ordered[clippovringlen-1].time) evaltime = ordered[clippovringlen-1].time;
 +        float targetyaw, targetpitch;
 +        vec targeto;
 +        if(evaltime <= ordered[0].time) { targetyaw = ordered[0].yaw; targetpitch = ordered[0].pitch; targeto = ordered[0].o; }
@@ -794,7 +889,7 @@
 +        {
 +            float h = max(hmax*clippovfitfrac[j], 1.6f*interval);
 +            float sw = 0, sx = 0, sxx = 0, svy = 0, sxvy = 0, svp = 0, sxvp = 0;
-+            int n = 0;
++            int n = 0, nback = 0, nfwd = 0;
 +            loopi(clippovringlen)
 +            {
 +                float x = anchx[i];
@@ -806,8 +901,12 @@
 +                svy += w*anchyaw[i]; sxvy += w*x*anchyaw[i];
 +                svp += w*anchpitch[i]; sxvp += w*x*anchpitch[i];
 +                n++;
++                if(x <= 0) nback++; else nfwd++;
 +            }
 +            if(n < 3) continue;                       // a line needs three points to be a fit
++            // and it has to BRACKET the instant it is read at, never be read off the end of its
++            // own data: a one-sided window is an extrapolator, however well it fits.
++            if(!nback || !nfwd) continue;
 +            float den = sw*sxx - sx*sx;
 +            if(den <= 1e-6f) continue;                // degenerate spread, no usable line
 +            float ay = (sxx*svy - sx*sxvy)/den, by = (sw*sxvy - sx*svy)/den;
@@ -850,35 +949,32 @@
 +            fityaw = dy + CLIPPOVBAND;
 +            fitpitch = targetpitch + CLIPPOVBAND;
 +        }
-+        // ---- the own-shot ray, blended rather than pinned (see clippovaimtime above) ---------
++        // ---- the own shot, blended rather than pinned (see clippovaimtime above) -------------
++        // The anchor is the recorded IMPACT POINT, aimed at from wherever the camera actually is,
++        // rather than the raw ray direction. Both are recorded truth, but the impact point stays
++        // geometrically exact as the camera moves: "the crosshair is on the victim" is a statement
++        // about where the beam ENDS, and pointing along (to - from) only reproduces that at the
++        // exact instant the camera is standing at from. At the shot instant the two are identical.
++        // Crossfaded on a raised cosine, which is 1 at the shot instant and reaches 0 with zero
++        // slope at both edges, so the correction joins the fit without a velocity step - where the
++        // old pin held the view rigid for clipaimhold ms and then released it, two discontinuities
++        // per shot, measured as a 103-127px jump in a single frame.
 +        if(clipaimsnap && clippovaimvalid)
 +        {
 +            float dt = float(evaltime - clippovaimtime);
 +            if(fabs(dt) < CLIPPOVAIMW)
 +            {
-+                float beta = 0.5f*(1.0f + cosf(PI*dt/CLIPPOVAIMW));   // 1 at the shot, 0 and flat at both edges
-+                float anchy = clipaimyaw - ref;
-+                if(anchy > 180) anchy -= 360; else if(anchy < -180) anchy += 360;
-+                float anchp = clipaimpitch;
-+                // Same weighted fit as above, but with the line forced through (shot instant,
-+                // exact ray): only the slope is free, so at dt == 0 it returns the ray exactly.
-+                float sd = 0, sy = 0, sp = 0;
-+                loopi(clippovringlen)
++                vec aimdir = vec(clippovaimto).sub(targeto);
++                if(aimdir.magnitude() > 1e-3f)
 +                {
-+                    float x = anchx[i];
-+                    if(x <= -hmax || x >= hmax) continue;
-+                    float u = x/hmax, w = 1.0f - u*u;
-+                    w *= w;
-+                    if(w <= 0) continue;
-+                    float xs = x + dt;                 // sample time measured from the shot instant
-+                    sd += w*xs*xs;
-+                    sy += w*xs*(anchyaw[i] - anchy);
-+                    sp += w*xs*(anchpitch[i] - anchp);
++                    float beta = 0.5f*(1.0f + cosf(PI*dt/CLIPPOVAIMW));
++                    float aimyaw, aimpitch;
++                    vectoyawpitch(aimdir, aimyaw, aimpitch);
++                    float dy = aimyaw - ref;
++                    if(dy > 180) dy -= 360; else if(dy < -180) dy += 360;
++                    fityaw = beta*dy + (1.0f - beta)*fityaw;
++                    fitpitch = beta*aimpitch + (1.0f - beta)*fitpitch;
 +                }
-+                float cy = anchy, cp = anchp;
-+                if(sd > 1e-6f) { cy += (sy/sd)*dt; cp += (sp/sd)*dt; }
-+                fityaw = beta*cy + (1.0f - beta)*fityaw;
-+                fitpitch = beta*cp + (1.0f - beta)*fitpitch;
 +            }
 +        }
 +        yaw = ref + fityaw;
@@ -891,7 +987,7 @@
      void sendmessages()
      {
          packetbuf p(MAXTRANS);
-@@ -1298,12 +1787,689 @@
+@@ -1298,12 +1883,689 @@
          sendclientpacket(p.finalize(), 1);
      }
  
@@ -1581,7 +1677,7 @@
          sendmessages();
          flushclient();
      }
-@@ -1400,6 +2566,18 @@
+@@ -1400,6 +2662,18 @@
                  int seqcolor = (physstate>>3)&1;
                  fpsent *d = getclient(cn);
                  if(!d || d->lifesequence < 0 || seqcolor!=(d->lifesequence&1) || d->state==CS_DEAD) continue;
@@ -1596,11 +1692,11 @@
 +                // assignment a few lines below does it (d->o = o; d->o.z += d->eyeheight), so what
 +                // clippovinterp() hands back is directly assignable to d->o with no second
 +                // correction anywhere.
-+                if(demoplayback && d == followingplayer(NULL)) clippovpush(cn, server::nextplayback, yaw, pitch, vec(o.x, o.y, o.z + d->eyeheight));
++                if(demoplayback && d == followingplayer(NULL)) clippovpush(cn, server::curplaybacktime, yaw, pitch, vec(o.x, o.y, o.z + d->eyeheight));
                  float oldyaw = d->yaw, oldpitch = d->pitch, oldroll = d->roll;
                  d->yaw = yaw;
                  d->pitch = pitch;
-@@ -1743,6 +2921,36 @@
+@@ -1743,6 +3017,42 @@
                  loopk(3) to[k] = getint(p)/DMF;
                  fpsent *s = getclient(scn);
                  if(!s) break;
@@ -1620,24 +1716,30 @@
 +                    {
 +                        vectoyawpitch(dir, clipaimyaw, clipaimpitch);
 +                        clipaimholduntil = lastmillis + clipaimhold;
-+                        // Round 5: the ray is also kept on the RECORDED timeline (the same
-+                        // server::nextplayback stamp the position samples carry, see
-+                        // clippovpush()'s doc comment) so clippovinterp() can blend it in at the
-+                        // instant it belongs to instead of pinning the view for a fixed window of
-+                        // playback clock. clipaimholduntil stays for the fallback path only -
-+                        // predictplayer() (fpsgame/fps.cpp) applies it just when the timeline
-+                        // reconstruction is unavailable.
-+                        clippovaimtime = server::nextplayback;
++                        // Round 5: the impact point is kept for clippovinterp()'s crossfade, dated
++                        // by the demo-timeline instant THIS frame's camera was evaluated at.
++                        // readdemo() now holds every record back by exactly that same look-behind
++                        // (clippovpresentdelay()), so this record arriving is the camera reaching
++                        // the moment of the shot, to within one frame - which is what makes a
++                        // crossfade centred here honest rather than a pin applied early.
++                        clippovaimto = to;
++                        clippovaimtime = server::gamemillis + curtime - clippovpresentdelay();
 +                        clippovaimvalid = true;
-+                        s->yaw = s->newyaw = clipaimyaw;
-+                        s->pitch = s->newpitch = clipaimpitch;
++                        // This frame's own view was already computed, before this record existed,
++                        // so put it on the impact point directly; from the next frame the
++                        // crossfade continues from exactly this value with no step.
++                        vec aimdir = vec(to).sub(s->o);
++                        if(aimdir.magnitude() > 1e-3f) vectoyawpitch(aimdir, s->yaw, s->pitch);
++                        else { s->yaw = clipaimyaw; s->pitch = clipaimpitch; }
++                        s->newyaw = s->yaw;
++                        s->newpitch = s->pitch;
 +                        s->deltayaw = s->deltapitch = 0;
 +                    }
 +                }
                  if(gun>GUN_FIST && gun<=GUN_PISTOL && s->ammo[gun]) s->ammo[gun]--;
                  s->gunselect = clamp(gun, (int)GUN_FIST, (int)GUN_PISTOL);
                  s->gunwait = guns[s->gunselect].attackdelay;
-@@ -1803,6 +3011,26 @@
+@@ -1803,6 +3113,26 @@
                      if(killstreak > beststreak) beststreak = killstreak;
                      if(killstreak > matchbeststreak) matchbeststreak = killstreak;
                      if(killstreak % 5 == 0 && killstreak <= 20) killstreakmilestone(killstreak/5);
@@ -1664,7 +1766,7 @@
                  }
                  // SwiftGibs: per-player streak for the scoreboard column (all players)
                  if(victim && victim != actor && (!m_teammode || !isteam(actor->team, victim->team)))
-@@ -2057,6 +3285,15 @@
+@@ -2057,6 +3387,15 @@
  
              case N_DEMOPLAYBACK:
              {
@@ -1714,7 +1816,7 @@
  extern void genprivkey(const char *seed, vector<char> &privstr, vector<char> &pubstr);
 --- a/fpsgame/game.h
 +++ b/fpsgame/game.h
-@@ -718,6 +718,18 @@
+@@ -718,6 +718,22 @@
      extern int respawnent;
      extern int following;
      extern int smoothmove, smoothdist;
@@ -1730,10 +1832,14 @@
 +    // change, mirroring clipaimholduntil's own reset sites.
 +    extern void clippovreset();
 +    extern bool clippovinterp(fpsent *d, float &yaw, float &pitch, vec &o);
++    // Both called from fpsgame/server.cpp's readdemo(): the delay it holds each demo record by,
++    // and the read-time tap that keeps the POV ring ahead of the presented world.
++    extern int clippovpresentdelay();
++    extern void clippovpeek(int chan, const uchar *data, int len, int time);
  
      extern bool clientoption(const char *arg);
      extern fpsent *getclient(int cn);
-@@ -729,6 +741,7 @@
+@@ -729,6 +745,7 @@
      extern void teamsound(bool sameteam, int n, const vec *loc = NULL);
      extern void teamsound(fpsent *d, int n, const vec *loc = NULL);
      extern fpsent *pointatplayer();
@@ -1741,7 +1847,7 @@
      extern fpsent *hudplayer();
      extern fpsent *followingplayer(fpsent *fallback = NULL);
      extern void stopfollowing();
-@@ -829,6 +842,19 @@
+@@ -829,6 +846,19 @@
      extern void getbestteams(vector<const char *> &best);
      extern void clearteaminfo();
      extern void setteaminfo(const char *team, int frags);
@@ -1822,7 +1928,7 @@
   
  namespace server
  {
-@@ -121,6 +122,16 @@
+@@ -121,6 +122,21 @@
      extern bool sendpackets(bool force = false);
      extern void serverinforeply(ucharbuf &req, ucharbuf &p);
      extern void serverupdate();
@@ -1836,6 +1942,11 @@
 +    // record's true recorded time, never the following one's).
 +    extern int gamemillis;
 +    extern int nextplayback;
++    // Round 5: nextplayback is now the READ head, which runs a presentation delay ahead of
++    // what is being dispatched (see readdemo(), fpsgame/server.cpp), so it is no longer the
++    // right stamp for a record being parsed. This is: the recorded time of the record whose
++    // messages are being handled right now.
++    extern int curplaybacktime;
      extern bool servercompatible(char *name, char *sdec, char *map, int ping, const vector<int> &attr, int np);
      extern int laninfoport();
      extern int serverinfoport(int servport = -1);
@@ -2193,3 +2304,124 @@
          else if(testteam > 1)
              concatstring(gunname, testteam==2 ? "/blue" : "/red");
          modelattach a[2];
+--- a/fpsgame/server.cpp
++++ b/fpsgame/server.cpp
+@@ -1173,10 +1173,46 @@
+             ci->getdemo->freeCallback = freegetdemo;
+     }
+ 
++    // SwiftGibs clip smoothness round 5: demo records are read on the game clock as before, but
++    // PRESENTED game::clippovpresentdelay() ms later, through this queue. The reason is in that
++    // function's own comment (fpsgame/client.cpp): the POV camera is reconstructed by a symmetric
++    // fit, which needs recorded samples on both sides of the instant it renders, so it is
++    // necessarily behind the newest record read out of the file. Without this queue the world was
++    // presented at the READ position instead, and an own shot's beam and hit sound landed while
++    // the camera was still that far short of the aim that fired it.
++    //
++    // The read loop, the file format, the timestamps and the dispatch order are all untouched;
++    // only the moment of dispatch moves, and it moves by the same constant for every record, so
++    // beams, sounds, deaths, gibs, other players and our own view stay in step with each other.
++    // The queue holds one delay's worth of records (a handful) and drains to empty before the
++    // "demo playback finished" handshake fires, so the tail of a clip is presented in full rather
++    // than cut - which it was, silently, for exactly this long before.
++    //
++    // The camera's own look-ahead does NOT come from this queue: game::clippovpeek() taps each
++    // record as it is READ, so the reconstruction is ahead of the presented world by the delay,
++    // which is the whole point.
++    struct pendingdemopacket { int time, chan; ENetPacket *packet; };
++    static vector<pendingdemopacket> pendingdemo;
++    static bool demoreadend = false;   // file exhausted; finish once pendingdemo has drained
++    // The recorded timestamp of the record currently being dispatched. nextplayback CANNOT be used
++    // for this any more: it is the READ head, which now runs a whole presentation delay ahead of
++    // what is being presented, so anything reading it during message parsing would date the record
++    // about 50ms too late. fpsgame/client.cpp's case N_POS reads this instead.
++    int curplaybacktime = 0;
++
++    static void clearpendingdemo()
++    {
++        loopv(pendingdemo) if(pendingdemo[i].packet && !pendingdemo[i].packet->referenceCount)
++            enet_packet_destroy(pendingdemo[i].packet);
++        pendingdemo.setsize(0);
++    }
++
+     void enddemoplayback()
+     {
+-        if(!demoplayback) return;
++        if(!demoplayback && !demoreadend) return;
+         DELETEP(demoplayback);
++        demoreadend = false;
++        clearpendingdemo();
+ 
+         loopv(clients) sendf(clients[i]->clientnum, 1, "ri3", N_DEMOPLAYBACK, 0, clients[i]->clientnum);
+ 
+@@ -1245,15 +1281,21 @@
+ 
+     void readdemo()
+     {
+-        if(!demoplayback) return;
+-        while(gamemillis>=nextplayback)
++        if(!demoplayback && !demoreadend) return;
++        int presentdelay = 0;
++#ifndef STANDALONE
++        presentdelay = game::clippovpresentdelay();
++#endif
++        // Read exactly as before - same clock, same condition, same order - but queue instead of
++        // dispatching, and tap each record for the POV reconstruction on the way past.
++        while(demoplayback && gamemillis>=nextplayback)
+         {
+             int chan, len;
+             if(demoplayback->read(&chan, sizeof(chan))!=sizeof(chan) ||
+                demoplayback->read(&len, sizeof(len))!=sizeof(len))
+             {
+-                enddemoplayback();
+-                return;
++                DELETEP(demoplayback); demoreadend = true;
++                break;
+             }
+             lilswap(&chan, 1);
+             lilswap(&len, 1);
+@@ -1261,20 +1303,37 @@
+             if(!packet || demoplayback->read(packet->data+1, len)!=size_t(len))
+             {
+                 if(packet) enet_packet_destroy(packet);
+-                enddemoplayback();
+-                return;
++                DELETEP(demoplayback); demoreadend = true;
++                break;
+             }
+             packet->data[0] = N_DEMOPACKET;
+-            sendpacket(-1, chan, packet);
+-            if(!packet->referenceCount) enet_packet_destroy(packet);
+-            if(!demoplayback) break;
++#ifndef STANDALONE
++            game::clippovpeek(chan, packet->data+1, len, nextplayback);
++#endif
++            pendingdemopacket &q = pendingdemo.add();
++            q.time = nextplayback;
++            q.chan = chan;
++            q.packet = packet;
+             if(demoplayback->read(&nextplayback, sizeof(nextplayback))!=sizeof(nextplayback))
+             {
+-                enddemoplayback();
+-                return;
++                DELETEP(demoplayback); demoreadend = true;
++                break;
+             }
+             lilswap(&nextplayback, 1);
+         }
++        // Present everything now due on the delayed clock. Dispatching a record can itself end
++        // playback (a map change reaches "if(m_demo) enddemoplayback()"), which clears the queue,
++        // so the same guard the stock loop had is kept right after the send.
++        while(pendingdemo.length() && gamemillis - presentdelay >= pendingdemo[0].time)
++        {
++            pendingdemopacket q = pendingdemo[0];
++            pendingdemo.remove(0);
++            curplaybacktime = q.time;
++            sendpacket(-1, q.chan, q.packet);
++            if(!q.packet->referenceCount) enet_packet_destroy(q.packet);
++            if(!demoplayback && !demoreadend) return;
++        }
++        if(demoreadend && pendingdemo.empty()) enddemoplayback();
+     }
+ 
+     void timeupdate(int secs)
