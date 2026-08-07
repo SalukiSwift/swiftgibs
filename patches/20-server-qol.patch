@@ -1,0 +1,520 @@
+--- a/engine/engine.h
++++ b/engine/engine.h
+@@ -389,11 +389,18 @@
+ extern int connectwithtimeout(ENetSocket sock, const char *hostname, const ENetAddress &address);
+ extern void addserver(const char *name, int port = 0, const char *password = NULL, bool keep = false);
+ extern void writeservercfg();
++// SwiftGibs server favourites + saved passwords (patch 20) - implemented in
++// engine/serverbrowser.cpp; the interception in engine/client.cpp's disconnect handler
++// needs these two, the rest are only ever called from within serverbrowser.cpp/fps.cpp.
++extern const char *getsavedpassword(const char *name, int port);
++extern void clearsavedpassword(const char *name, int port);
++extern void clearstaleserverpassword(const char *name, int port);
++extern void triggerpasswordprompt(const char *name, int port, const char *prefill);
+ 
+ // client
+ extern void localdisconnect(bool cleanup = true);
+ extern void localservertoclient(int chan, ENetPacket *packet);
+-extern void connectserv(const char *servername, int port, const char *serverpassword);
++extern void connectserv(const char *servername, int port, const char *serverpassword, bool menuinitiated = false);
+ extern void abortconnect();
+ extern void clientkeepalive();
+ 
+--- a/engine/client.cpp
++++ b/engine/client.cpp
+@@ -73,8 +73,16 @@
+ SVARP(connectname, "");
+ VARP(connectport, 0, 0, 0xFFFF);
+ 
+-void connectserv(const char *servername, int serverport, const char *serverpassword)
++// SwiftGibs (patch 20): remembers whether the CURRENT connection attempt was started from
++// the server-browser menu (vs a typed /connect or /reconnect), so gets2c()'s disconnect
++// handler below knows whether to open the password-prompt gui on a DISC_PASSWORD reject.
++// Console-typed connects are never intercepted - only ever set true by connectselected()
++// and the password-prompt's own "connect" action, both in engine/serverbrowser.cpp.
++static bool lastconnectmenu = false;
++
++void connectserv(const char *servername, int serverport, const char *serverpassword, bool menuinitiated)
+ {   
++    lastconnectmenu = menuinitiated;
+     if(connpeer)
+     {
+         conoutf("aborting connection attempt");
+@@ -122,7 +130,7 @@
+     connmillis = totalmillis;
+     connattempts = 0;
+ 
+-    game::connectattempt(servername ? servername : "", serverpassword ? serverpassword : "", address);
++    game::connectattempt(servername ? servername : "", serverpassword ? serverpassword : "", address, menuinitiated);
+ }
+ 
+ void reconnect(const char *serverpassword)
+@@ -615,6 +623,17 @@
+                     if(msg) conoutf(CON_ERROR, "\f3server network error, disconnecting (%s) ...", msg);
+                     else conoutf(CON_ERROR, "\f3server network error, disconnecting...");
+                 }
++                // SwiftGibs (patch 20): a passworded server rejected a menu-initiated connect -
++                // open the password-prompt gui instead of leaving the player at a console-only
++                // dead end. Any saved password for this server is now known-stale; drop it so
++                // the next attempt does not silently retry the same wrong password (never loops -
++                // the user must type a new one and explicitly submit).
++                if(event.data == DISC_PASSWORD && lastconnectmenu)
++                {
++                    clearsavedpassword(connectname, connectport);
++                    clearstaleserverpassword(connectname, connectport);
++                    triggerpasswordprompt(connectname, connectport, NULL);
++                }
+                 disconnect();
+             }
+             return;
+--- a/engine/serverbrowser.cpp
++++ b/engine/serverbrowser.cpp
+@@ -2,6 +2,159 @@
+ 
+ #include "engine.h"
+ 
++// === SwiftGibs server favourites + saved passwords (patch 20) ===
++// Two small persisted stores, same shape as the M3 friend list (patches/03-friends.patch):
++// an in-memory vector, ICOMMANDs to add/remove/query an entry, and a writeXXX() that
++// rewrites the whole file on every change. Both are keyed by the server's displayed name
++// + port - the same identity addserver()/servers.cfg already use, not the resolved IP
++// (a hostname entry may not even have one yet).
++//
++// PLAINTEXT WARNING: serverpasswords.cfg stores passwords in plaintext. This is not a new
++// risk this patch introduces - the stock servers.cfg above already does the same for any
++// server ever connected to with a password (see writeservercfg() further down, predates
++// this patch). Anyone with filesystem access to this profile folder can read either file.
++// The server-browser page hints at this (overlay/menus_serverbrowser.cfg).
++struct favouriteserver { string name; int port; };
++vector<favouriteserver> favourites;
++
++bool isfavourite(const char *name, int port)
++{
++    loopv(favourites) if(favourites[i].port == port && !strcmp(favourites[i].name, name)) return true;
++    return false;
++}
++
++void writefavourites()
++{
++    stream *f = openutf8file(path("favourites.cfg", true), "w");
++    if(!f) return;
++    f->printf("// SwiftGibs favourite servers - starred rows float to the top with a gold highlight\n\n");
++    loopv(favourites) f->printf("addfavourite %s %d\n", escapeid(favourites[i].name), favourites[i].port);
++    delete f;
++}
++
++void addfavourite(const char *name, int port)
++{
++    if(isfavourite(name, port)) return;
++    favouriteserver &fs = favourites.add();
++    copystring(fs.name, name);
++    fs.port = port;
++    writefavourites();
++}
++
++void delfavourite(const char *name, int port)
++{
++    loopv(favourites) if(favourites[i].port == port && !strcmp(favourites[i].name, name))
++    {
++        favourites.remove(i);
++        writefavourites();
++        return;
++    }
++}
++
++void togglefavourite(const char *name, int port)
++{
++    if(isfavourite(name, port)) delfavourite(name, port);
++    else addfavourite(name, port);
++}
++
++ICOMMAND(addfavourite, "si", (const char *name, int *port), addfavourite(name, *port));
++ICOMMAND(delfavourite, "si", (const char *name, int *port), delfavourite(name, *port));
++ICOMMAND(isfavourite, "si", (const char *name, int *port), intret(isfavourite(name, *port) ? 1 : 0));
++
++struct savedserverpass { string name, pass; int port; };
++vector<savedserverpass> savedpasswords;
++
++const char *getsavedpassword(const char *name, int port)
++{
++    loopv(savedpasswords) if(savedpasswords[i].port == port && !strcmp(savedpasswords[i].name, name)) return savedpasswords[i].pass;
++    return NULL;
++}
++
++void writesavedpasswords()
++{
++    stream *f = openutf8file(path("serverpasswords.cfg", true), "w");
++    if(!f) return;
++    f->printf("// SwiftGibs saved server passwords - stored in PLAINTEXT, same as the stock\n"
++               "// servers.cfg password field above. Anyone with access to this profile folder\n"
++               "// can read these. Only servers you successfully joined from the menu with a\n"
++               "// password get an entry; a rejected (stale) password is removed, not kept.\n\n");
++    loopv(savedpasswords) f->printf("addsavedpassword %s %d %s\n", escapeid(savedpasswords[i].name), savedpasswords[i].port, escapestring(savedpasswords[i].pass));
++    delete f;
++}
++
++void setsavedpassword(const char *name, int port, const char *pass)
++{
++    if(!name || !name[0] || !pass || !pass[0]) return;
++    loopv(savedpasswords) if(savedpasswords[i].port == port && !strcmp(savedpasswords[i].name, name))
++    {
++        if(!strcmp(savedpasswords[i].pass, pass)) return;
++        copystring(savedpasswords[i].pass, pass);
++        writesavedpasswords();
++        return;
++    }
++    savedserverpass &sp = savedpasswords.add();
++    copystring(sp.name, name);
++    sp.port = port;
++    copystring(sp.pass, pass);
++    writesavedpasswords();
++}
++
++void clearsavedpassword(const char *name, int port)
++{
++    loopv(savedpasswords) if(savedpasswords[i].port == port && !strcmp(savedpasswords[i].name, name))
++    {
++        savedpasswords.remove(i);
++        writesavedpasswords();
++        return;
++    }
++}
++
++// addsavedpassword is also how serverpasswords.cfg loads itself back in at startup
++// (exec'd from autoexec.cfg) - setsavedpassword() dedupes/rewrites either way.
++ICOMMAND(addsavedpassword, "sis", (const char *name, int *port, const char *pass), setsavedpassword(name, *port, pass));
++
++// Password-prompt UI state (transient, never persisted - overlay/menus_serverbrowser.cfg
++// renders a field/connect/cancel block while sgpwpromptactive is set).
++SVAR(sgpwpromptserver, "");
++VAR(sgpwpromptport, 0, 0, 0xFFFF);
++VAR(sgpwpromptactive, 0, 0, 1);
++SVAR(sgpwpromptvalue, "");
++
++void triggerpasswordprompt(const char *name, int port, const char *prefill)
++{
++    setsvar("sgpwpromptserver", name);
++    setvar("sgpwpromptport", port);
++    setsvar("sgpwpromptvalue", prefill && prefill[0] ? prefill : "");
++    setvar("sgpwpromptactive", 1);
++    // Found via live harness testing: a menu-initiated connect can get rejected while the
++    // player is not even looking at the server-browser page (disconnect() always drops back
++    // to whatever gui/mainmenu state was active). Force that page open so the box the player
++    // just typed a password into - or is about to - is actually on screen, not silently
++    // waiting behind "servers browser.." in the main menu.
++    showgui("servers");
++}
++
++// row action: "connect with password.." - opens the box pre-filled with any saved
++// password, without waiting for a failed connect first (fpsgame/fps.cpp's
++// serverinfoentry column i==10 calls this directly).
++void promptserverpassword(const char *name, int port)
++{
++    triggerpasswordprompt(name, port, getsavedpassword(name, port));
++}
++
++ICOMMAND(sgconnectwithprompt, "", (),
++{
++    if(sgpwpromptserver[0]) connectserv(sgpwpromptserver, sgpwpromptport, sgpwpromptvalue, true);
++    setvar("sgpwpromptactive", 0);
++    setsvar("sgpwpromptvalue", "");
++});
++
++ICOMMAND(sgcancelpwprompt, "", (),
++{
++    setvar("sgpwpromptactive", 0);
++    setsvar("sgpwpromptvalue", "");
++});
++
+ struct resolverthread
+ {
+     SDL_Thread *thread;
+@@ -338,6 +491,9 @@
+              bc = server::servercompatible(b->name, b->sdesc, b->map, b->ping, b->attr, b->numplayers);
+         if(ac > bc) return true;
+         if(bc > ac) return false;
++        bool af = isfavourite(a->name, a->port), bf = isfavourite(b->name, b->port);
++        if(af > bf) return true;
++        if(bf > af) return false;
+         if(a->keep > b->keep) return true;
+         if(a->keep < b->keep) return false;
+         if(a->numplayers < b->numplayers) return false;
+@@ -398,6 +554,17 @@
+     s->keep = keep;
+ }
+ 
++// SwiftGibs (patch 20): companion to clearsavedpassword() above, for the OTHER password
++// memory - the stock serverinfo::password field addserver() (just above) unconditionally
++// overwrites on every connect ATTEMPT, success or failure, so it can hold a password that
++// was never confirmed working. Cleared alongside our own store on a DISC_PASSWORD reject so a
++// second consecutive stale password (ours already cleared, stock not) cannot still be
++// silently retried from connectselected()'s fallback.
++void clearstaleserverpassword(const char *name, int port)
++{
++    loopv(servers) if(servers[i]->port == port && !strcmp(servers[i]->name, name)) { DELETEA(servers[i]->password); return; }
++}
++
+ VARP(searchlan, 0, 0, 1);
+ VARP(servpingrate, 1000, 5000, 60000);
+ VARP(servpingdecay, 1000, 15000, 60000);
+@@ -575,7 +742,7 @@
+         if(header) execute(header);
+         int end = servers.length();
+         cgui->pushlist();
+-        loopi(10)
++        loopi(11)   // SwiftGibs: 9 stock columns + fav (9) + pw.. (10)
+         {
+             if(!game::serverinfostartcolumn(cgui, i)) break;
+             for(int j = start; j < end; j++)
+@@ -601,7 +768,16 @@
+ void connectselected()
+ {
+     if(!selectedserver) return;
+-    connectserv(selectedserver->name, selectedserver->port, selectedserver->password);
++    // Prefer OUR success-gated, staleness-cleared store over the stock serverinfo::password
++    // field: addserver() (called at the top of every connectserv(), success or failure)
++    // overwrites that field unconditionally on every attempt, so it can hold a password that
++    // was never actually confirmed working, or one we already know just went stale - falling
++    // back to it only when we have never successfully saved one of our own (e.g. a password
++    // set via a bare `keepserver name port pass` or an old console /connect, never through
++    // this menu flow at all).
++    const char *pw = getsavedpassword(selectedserver->name, selectedserver->port);
++    if(!pw || !pw[0]) pw = selectedserver->password;
++    connectserv(selectedserver->name, selectedserver->port, pw, true);
+     selectedserver = NULL;
+ }
+ 
+--- a/shared/igame.h
++++ b/shared/igame.h
+@@ -28,7 +28,7 @@
+ 
+     extern void gamedisconnect(bool cleanup);
+     extern void parsepacketclient(int chan, packetbuf &p);
+-    extern void connectattempt(const char *name, const char *password, const ENetAddress &address);
++    extern void connectattempt(const char *name, const char *password, const ENetAddress &address, bool menuinitiated = false);
+     extern void connectfail();
+     extern void gameconnect(bool _remote);
+     extern bool allowedittoggle();
+--- a/shared/iengine.h
++++ b/shared/iengine.h
+@@ -659,3 +659,9 @@
+ extern void g3d_resetcursor();
+ extern void g3d_limitscale(float scale);
+ 
++// SwiftGibs server favourites + saved passwords (patch 20) - implemented in
++// engine/serverbrowser.cpp; called from fpsgame/fps.cpp's serverinfoentry() row buttons.
++extern bool isfavourite(const char *name, int port);
++extern void togglefavourite(const char *name, int port);
++extern void promptserverpassword(const char *name, int port);
++extern void setsavedpassword(const char *name, int port, const char *pass);
+--- a/fpsgame/client.cpp
++++ b/fpsgame/client.cpp
+@@ -1113,14 +1113,31 @@
+         return true;
+     }
+ 
+-    void connectattempt(const char *name, const char *password, const ENetAddress &address)
++    // SwiftGibs (patch 20): a menu-initiated connect that supplied a password gets saved on
++    // successful join (N_WELCOME below). connectpass itself is memset by sendintro() right
++    // after hashing it (well before N_WELCOME can arrive), so the plaintext needed for the
++    // save has to be kept in a separate pending slot with its own lifetime.
++    bool pendingsavepw = false;
++    string pendingsavename = "", pendingsaveplainpass = "";
++    int pendingsaveport = 0;
++
++    void connectattempt(const char *name, const char *password, const ENetAddress &address, bool menuinitiated)
+     {
+         copystring(connectpass, password);
++        pendingsavepw = menuinitiated && password && password[0];
++        if(pendingsavepw)
++        {
++            copystring(pendingsavename, name);
++            pendingsaveport = address.port;
++            copystring(pendingsaveplainpass, password);
++        }
+     }
+ 
+     void connectfail()
+     {
+         memset(connectpass, 0, sizeof(connectpass));
++        pendingsavepw = false;
++        memset(pendingsaveplainpass, 0, sizeof(pendingsaveplainpass));
+     }
+ 
+     void gameconnect(bool _remote)
+@@ -1152,6 +1169,8 @@
+         chatlog.deletearrays();
+         ignores.setsize(0);
+         connected = remote = false;
++        pendingsavepw = false;
++        memset(pendingsaveplainpass, 0, sizeof(pendingsaveplainpass));
+         player1->clientnum = -1;
+         sessionid = 0;
+         mastermode = MM_OPEN;
+@@ -3849,6 +3868,15 @@
+             {
+                 connected = true;
+                 notifywelcome();
++                if(pendingsavepw)
++                {
++                    // setsavedpassword() is declared in shared/iengine.h (global scope, pulled
++                    // in via game.h -> cube.h before this namespace opens - a LOCAL extern here
++                    // would silently declare game::setsavedpassword instead and fail to link).
++                    setsavedpassword(pendingsavename, pendingsaveport, pendingsaveplainpass);
++                    pendingsavepw = false;
++                    memset(pendingsaveplainpass, 0, sizeof(pendingsaveplainpass));
++                }
+                 break;
+             }
+ 
+--- a/fpsgame/fps.cpp
++++ b/fpsgame/fps.cpp
+@@ -2450,8 +2450,8 @@
+ 
+     bool serverinfostartcolumn(g3d_gui *g, int i)
+     {
+-        static const char * const names[] = { "ping ", "players ", "mode ", "map ", "time ", "master ", "host ", "port ", "description " };
+-        static const float struts[] =       { 7,       7,          12.5f,   14,      7,      8,         14,      7,       24.5f };
++        static const char * const names[] = { "ping ", "players ", "mode ", "map ", "time ", "master ", "host ", "port ", "description ", "fav ", "pw.. " };
++        static const float struts[] =       { 7,       7,          12.5f,   14,      7,      8,         14,      7,       24.5f,          3,      6 };
+         if(size_t(i) >= sizeof(names)/sizeof(names[0])) return false;
+         g->pushlist();
+         g->text(names[i], 0xFFFF80, !i ? " " : NULL);
+@@ -2486,12 +2486,19 @@
+         if(filterinstaservers && attr.length() >= 2 && attr[0] == PROTOCOL_VERSION &&
+            m_valid(attr[1]) && !(gamemodes[attr[1] - STARTGAMEMODE].flags & M_INSTA))
+             return false;
++        // SwiftGibs (patch 20): favourite rows get a gold tint throughout, replacing the
++        // one stock text colour every column below used to share, plus their own star/
++        // "pw.." columns (added to serverinfostartcolumn above). isfavourite/
++        // togglefavourite/promptserverpassword are declared in shared/iengine.h and
++        // implemented in engine/serverbrowser.cpp.
++        bool fav = isfavourite(name, port);
++        uint rowcolor = fav ? 0xFFD700 : 0xFFFFDD;
+         if(ping < 0 || attr.empty() || attr[0]!=PROTOCOL_VERSION)
+         {
+             switch(i)
+             {
+                 case 0:
+-                    if(g->button(" ", 0xFFFFDD, "serverunk")&G3D_UP) return true;
++                    if(g->button(" ", rowcolor, "serverunk")&G3D_UP) return true;
+                     break;
+ 
+                 case 1:
+@@ -2499,23 +2506,31 @@
+                 case 3:
+                 case 4:
+                 case 5:
+-                    if(g->button(" ", 0xFFFFDD)&G3D_UP) return true;
++                    if(g->button(" ", rowcolor)&G3D_UP) return true;
+                     break;
+ 
+                 case 6:
+-                    if(g->buttonf("%s ", 0xFFFFDD, NULL, name)&G3D_UP) return true;
++                    if(g->buttonf("%s ", rowcolor, NULL, name)&G3D_UP) return true;
+                     break;
+ 
+                 case 7:
+-                    if(g->buttonf("%d ", 0xFFFFDD, NULL, port)&G3D_UP) return true;
++                    if(g->buttonf("%d ", rowcolor, NULL, port)&G3D_UP) return true;
+                     break;
+ 
+                 case 8:
+                     if(ping < 0)
+                     {
+-                        if(g->button(sdesc, 0xFFFFDD)&G3D_UP) return true;
++                        if(g->button(sdesc, rowcolor)&G3D_UP) return true;
+                     }
+-                    else if(g->buttonf("[%s protocol] ", 0xFFFFDD, NULL, attr.empty() ? "unknown" : (attr[0] < PROTOCOL_VERSION ? "older" : "newer"))&G3D_UP) return true;
++                    else if(g->buttonf("[%s protocol] ", rowcolor, NULL, attr.empty() ? "unknown" : (attr[0] < PROTOCOL_VERSION ? "older" : "newer"))&G3D_UP) return true;
++                    break;
++
++                case 9:
++                    if(g->buttonf(fav ? "*" : "-", fav ? 0xFFD700 : 0x888888, NULL)&G3D_UP) togglefavourite(name, port);
++                    break;
++
++                case 10:
++                    if(g->buttonf("pw..", rowcolor, NULL)&G3D_UP) promptserverpassword(name, port);
+                     break;
+             }
+             return false;
+@@ -2526,24 +2541,24 @@
+             case 0:
+             {
+                 const char *icon = attr.inrange(3) && np >= attr[3] ? "serverfull" : (attr.inrange(4) ? mastermodeicon(attr[4], "serverunk") : "serverunk");
+-                if(g->buttonf("%d ", 0xFFFFDD, icon, ping)&G3D_UP) return true;
++                if(g->buttonf("%d ", rowcolor, icon, ping)&G3D_UP) return true;
+                 break;
+             }
+ 
+             case 1:
+                 if(attr.length()>=4)
+                 {
+-                    if(g->buttonf(np >= attr[3] ? "\f3%d/%d " : "%d/%d ", 0xFFFFDD, NULL, np, attr[3])&G3D_UP) return true;
++                    if(g->buttonf(np >= attr[3] ? "\f3%d/%d " : "%d/%d ", rowcolor, NULL, np, attr[3])&G3D_UP) return true;
+                 }
+-                else if(g->buttonf("%d ", 0xFFFFDD, NULL, np)&G3D_UP) return true;
++                else if(g->buttonf("%d ", rowcolor, NULL, np)&G3D_UP) return true;
+                 break;
+ 
+             case 2:
+-                if(g->buttonf("%s ", 0xFFFFDD, NULL, attr.length()>=2 ? server::modename(attr[1], "") : "")&G3D_UP) return true;
++                if(g->buttonf("%s ", rowcolor, NULL, attr.length()>=2 ? server::modename(attr[1], "") : "")&G3D_UP) return true;
+                 break;
+ 
+             case 3:
+-                if(g->buttonf("%.25s ", 0xFFFFDD, NULL, map)&G3D_UP) return true;
++                if(g->buttonf("%.25s ", rowcolor, NULL, map)&G3D_UP) return true;
+                 break;
+ 
+             case 4:
+@@ -2552,24 +2567,32 @@
+                     int secs = clamp(attr[2], 0, 59*60+59),
+                         mins = secs/60;
+                     secs %= 60;
+-                    if(g->buttonf("%d:%02d ", 0xFFFFDD, NULL, mins, secs)&G3D_UP) return true;
++                    if(g->buttonf("%d:%02d ", rowcolor, NULL, mins, secs)&G3D_UP) return true;
+                 }
+-                else if(g->buttonf(" ", 0xFFFFDD)&G3D_UP) return true;
++                else if(g->buttonf(" ", rowcolor)&G3D_UP) return true;
+                 break;
+             case 5:
+-                if(g->buttonf("%s%s ", 0xFFFFDD, NULL, attr.length()>=5 ? mastermodecolor(attr[4], "") : "", attr.length()>=5 ? server::mastermodename(attr[4], "") : "")&G3D_UP) return true;
++                if(g->buttonf("%s%s ", rowcolor, NULL, attr.length()>=5 ? mastermodecolor(attr[4], "") : "", attr.length()>=5 ? server::mastermodename(attr[4], "") : "")&G3D_UP) return true;
+                 break;
+ 
+             case 6:
+-                if(g->buttonf("%s ", 0xFFFFDD, NULL, name)&G3D_UP) return true;
++                if(g->buttonf("%s ", rowcolor, NULL, name)&G3D_UP) return true;
+                 break;
+ 
+             case 7:
+-                if(g->buttonf("%d ", 0xFFFFDD, NULL, port)&G3D_UP) return true;
++                if(g->buttonf("%d ", rowcolor, NULL, port)&G3D_UP) return true;
+                 break;
+ 
+             case 8:
+-                if(g->buttonf("%.25s", 0xFFFFDD, NULL, sdesc)&G3D_UP) return true;
++                if(g->buttonf("%.25s", rowcolor, NULL, sdesc)&G3D_UP) return true;
++                break;
++
++            case 9:
++                if(g->buttonf(fav ? "*" : "-", fav ? 0xFFD700 : 0x888888, NULL)&G3D_UP) togglefavourite(name, port);
++                break;
++
++            case 10:
++                if(g->buttonf("pw..", rowcolor, NULL)&G3D_UP) promptserverpassword(name, port);
+                 break;
+         }
+         return false;
+--- a/rpggame/rpg.cpp
++++ b/rpggame/rpg.cpp
+@@ -282,7 +282,7 @@
+     void loadconfigs() {}
+ 
+     void parseoptions(vector<const char *> &args) {}
+-    void connectattempt(const char *name, const char *password, const ENetAddress &address) {}
++    void connectattempt(const char *name, const char *password, const ENetAddress &address, bool menuinitiated) {}
+     void connectfail() {}
+     void parsepacketclient(int chan, packetbuf &p) {}
+     bool allowedittoggle() { return true; }
