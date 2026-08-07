@@ -1985,6 +1985,23 @@
  
  extern FILE *getlogfile();
  extern void setlogfile(const char *fname);
+@@ -483,6 +528,16 @@
+ extern void sendclientpacket(ENetPacket *packet, int chan);
+ extern void flushclient();
+ extern void disconnect(bool async = false, bool cleanup = true);
++// SwiftGibs clip export (auto-return after export, fpsgame/client.cpp): the LOCAL-session
++// equivalent of disconnect() above, for when there is no real network peer to disconnect
++// (m_demo clip/export playback is always local) - defined in engine/server.cpp. Deliberately NO
++// default argument here, unlike disconnect() above: engine/engine.h (which fpsgame never
++// includes, but which itself transitively includes THIS header via cube.h) already declares
++// this same function WITH a default for its own engine-internal callers - a second default
++// here would be a straight "default argument given" redeclaration error in any file that sees
++// both. Callers reached only through this header (fpsgame/client.cpp) pass the argument
++// explicitly instead. No-ops safely if there is no local client to disconnect.
++extern void localdisconnect(bool cleanup);
+ extern bool isconnected(bool attempt = false, bool local = true);
+ extern const ENetAddress *connectedpeer();
+ extern bool multiplayer(bool msg = true);
 --- a/shared/igame.h
 +++ b/shared/igame.h
 @@ -103,6 +103,7 @@
@@ -2052,7 +2069,40 @@
      }
  
      VARP(teamcolorchat, 0, 1, 1);
-@@ -2625,6 +2636,973 @@
+@@ -2141,6 +2152,32 @@
+         if(!dst[0]) copystring(dst, fallback, dstsize);
+     }
+ 
++    // SwiftGibs clip export (custom export name): what exportclip() below has always derived an
++    // output basename from when its caller leaves the name field empty - strip a trailing
++    // ".dmo" (a clip filename, not yet sanitised) then run it through clipsanitize() above, the
++    // same allowlist patch 16's validprofilename() established. Pulled out into its own function
++    // (rather than left inline in exportclip(), where it originally lived) so the export
++    // settings page's prefilled text field - clipexportautoname() immediately below - reads the
++    // exact same derivation exportclip() itself will fall back to, and the two can never drift
++    // out of sync with each other.
++    static void clipexportautobase(const char *clipname, char *dst, size_t dstsize)
++    {
++        string base;
++        copystring(base, clipname);
++        size_t blen = strlen(base);
++        if(blen >= 4 && !strcasecmp(&base[blen-4], ".dmo")) base[blen-4] = '\0';
++        clipsanitize(dst, dstsize, base, "clip");
++    }
++    // CubeScript-facing preview of the above, for the "swiftexport" settings page (overlay/
++    // menus_settings.cfg) to prefill its custom-name guifield with the automatic name the moment
++    // the page opens - never called from C++ itself, only from sgOpenExportSettings.
++    ICOMMAND(clipexportautoname, "s", (char *clipname),
++    {
++        string base;
++        clipexportautobase(clipname, base, sizeof(base));
++        result(base);
++    });
++
+     // saveclip: writes <clipdir>/<timestamp>_<map>_<mode>.dmo, gzipped in the stock demo
+     // format (24-byte demoheader, then lilswapped {ms,chan,len} stamps + raw payload,
+     // mirroring writedemo()/setupdemorecord() in fpsgame/server.cpp field-for-field), reading
+@@ -2625,6 +2662,1044 @@
      }
      // === end SwiftGibs instant replay: recording modes =======================================
  
@@ -2168,6 +2218,21 @@
 +    static string clipexportext = "mp4";
 +    static int clipexportwaitstart = 0;
 +    static int clipexporttargetcn = -1;
++    // Auto-return (Task: auto-return after export): set by clipexportabort() for any reason
++    // OTHER than "cancelled" (ESC/cancelclipexport keeps its own existing behaviour - see
++    // overlay/autoexec.cfg's sgCancelExport, deliberately untouched by this task), and
++    // unconditionally by clipexportonplaybackend() (success or failure - neither is ever a
++    // cancellation, since cancellation always routes through clipexportabort("cancelled")
++    // instead). Consumed exactly once, one frame later, at the very top of checkclipexport() -
++    // itself already the established safe, top-level, unconditional-every-frame call site (see
++    // its own doc comment) - never acted on synchronously inside clipexportabort()/
++    // clipexportonplaybackend() themselves. This mirrors, at the C++ layer, the exact reason
++    // sgCancelExport calls stopdemo() from the CubeScript layer rather than from inside
++    // clipexportabort() itself: those two functions are reached from deeply nested contexts
++    // (packet handlers via case N_DEMOPLAYBACK/changemapserv(), gamedisconnect() itself) where
++    // calling back into demo-ending/disconnect logic synchronously would risk reentrancy -
++    // deferring to the next checkclipexport() tick sidesteps that entirely.
++    static bool clipexportpendingreturn = false;
 +    // Audio (this task): this export's own snapshot of clipexportsound, taken once at exportclip() time (like
 +    // width/height/fps/ext above) so a mid-export settings-page change never affects an export already in
 +    // flight. clipexporttmpvideopath/clipexporttmpwavpath are the two small intermediates the two-ffmpeg-pass
@@ -2368,6 +2433,17 @@
 +        clipexportrestoresettings();
 +
 +        conoutf("clip export stopped: %s", reason);
++
++        // Auto-return (Task: auto-return after export): every non-cancellation abort leaves the
++        // replay and returns to the main menu one frame from now (see clipexportpendingreturn's
++        // own doc comment, above, for why this is deferred rather than acted on right here) -
++        // "cancelled" is the one reason string this feature itself never changes the handling
++        // of, since that is ESC/cancelclipexport's own existing behaviour (overlay/autoexec.cfg's
++        // sgCancelExport already leaves the replay via its own stopdemo call immediately after
++        // this function returns, at the CubeScript layer - adding a second, deferred one here
++        // too would be redundant, not incorrect, but the design explicitly keeps that path
++        // unchanged).
++        if(strcmp(reason, "cancelled")) clipexportpendingreturn = true;
 +    }
 +
 +    // Called from case N_DEMOPLAYBACK's on==0 branch (above) - the clip's own NATURAL end
@@ -2489,7 +2565,10 @@
 +        bool ok = !pass1failed && (!clipexportsoundenabled || (muxattempted && !muxfailed));
 +        if(ok)
 +        {
-+            conoutf("clip exported: %s", clipexportoutpath);
++            // Auto-return (Task: auto-return after export): "exported: <filename>" is the exact
++            // line the design doc specifies for a successful export - replaces the previous
++            // "clip exported: %s" wording.
++            conoutf("exported: %s", clipexportoutpath);
 +        }
 +        else if(muxattempted)
 +        {
@@ -2503,6 +2582,14 @@
 +                    clipexportwdfired ? ", had to be force-stopped" : "");
 +            clipexportremoveoutput();
 +        }
++
++        // Auto-return (Task: auto-return after export): success AND failure both leave the
++        // replay and return to the main menu one frame from now - see clipexportpendingreturn's
++        // own doc comment for why this is deferred, and why this function (unlike
++        // clipexportabort()) never needs a "cancelled" exclusion: reaching this function at all
++        // already means capture was never cancelled (cancellation always goes through
++        // clipexportabort("cancelled") instead, never here).
++        clipexportpendingreturn = true;
 +    }
 +
 +    // startgame() interruption guard (called unconditionally from fpsgame/fps.cpp) - only acts
@@ -2611,6 +2698,26 @@
 +    // c2sinfo()/connected). A single int compare when idle.
 +    void checkclipexport()
 +    {
++        // Auto-return (Task: auto-return after export): the deferred half of
++        // clipexportabort()/clipexportonplaybackend() - see clipexportpendingreturn's own doc
++        // comment for why this can never run synchronously inside either of those. localdisconnect()
++        // (extern'd in shared/iengine.h) is the LOCAL-session equivalent of the stock `disconnect`
++        // command: it ends any still-running m_demo playback (server::localdisconnect()'s own
++        // "if(m_demo) enddemoplayback()"), calls game::gamedisconnect() (a safe no-op here as far
++        // as export state goes - clipexportphase is already CLIPEXPORT_IDLE by the time this
++        // runs), and sets mainmenu=1 - genuinely landing back on the main menu, unlike a bare
++        // stopdemo() (which leaves the client sitting in the local demo server's own
++        // post-playback limbo, exactly the state the sgCancelExport/ESC path deliberately keeps
++        // for cancellation - see that alias's own comment). Checked before the idle early-return
++        // below, since by the time this flag is set, clipexportphase already IS idle. Guarded to
++        // fire exactly once per abort/finish (cleared immediately, before the call itself, in
++        // case localdisconnect() somehow re-entered this function).
++        if(clipexportpendingreturn)
++        {
++            clipexportpendingreturn = false;
++            localdisconnect(true);
++        }
++
 +        if(clipexportphase == CLIPEXPORT_IDLE) return;
 +
 +        if(clipexportphase == CLIPEXPORT_WAITING)
@@ -2861,12 +2968,19 @@
 +        // hook already covers that) or a bug; nothing else sets it false.
 +    }
 +
-+    // exportclip <name> <width> <height> <fps> [format]
++    // exportclip <name> <width> <height> <fps> [format] [customname]
 +    // format is "mp4" (default, H.264) or "webm" (VP9); anything else falls back to mp4 with a
 +    // warning. width/height/fps are the caller's choice - Task 5's menu will offer presets plus
 +    // "match my resolution" (screenw/screenh) and a capped fps; for now the caller picks the
 +    // numbers directly (e.g. "exportclip myclip 1280 720 60").
-+    void exportclip(char *name, int *width, int *height, int *fps, char *format)
++    // customname (Task: custom export name) is the OUTPUT basename the player typed on the
++    // export settings page; empty - which is exactly what every call site written before this
++    // parameter existed gets automatically, since command.cpp fills a missing trailing "s" arg
++    // with "" (see callcommand()'s own case 's') - means "derive it from the clip's own name
++    // instead", i.e. exactly what this function always did before this parameter existed. See
++    // clipexportautobase()/clipexportautoname(), above, for the shared derivation and the
++    // settings page's own prefill of the same value.
++    void exportclip(char *name, int *width, int *height, int *fps, char *format, char *customname)
 +    {
 +        if(clipexportphase != CLIPEXPORT_IDLE) { conoutf(CON_ERROR, "exportclip: an export is already in progress (cancelclipexport to stop it)"); return; }
 +        // Refuse only REAL live play, not a bare `connected`: a genuine remote match
@@ -2917,24 +3031,31 @@
 +            return;
 +        }
 +
++        // Custom export name (Task: custom export name): an empty field is the automatic name -
++        // clipexportautobase() (above) applied to the SOURCE clip's own name, exactly what this
++        // function always derived before this parameter existed (see that function's own doc
++        // comment: `name` can reach here straight from a console command, not just the
++        // pre-sanitised menu listing, so it must never be trusted verbatim as a filename
++        // component - clipsanitize(), inside clipexportautobase(), is what makes that safe).
++        // A non-empty field is the player's own choice instead: strip a trailing ".mp4" or
++        // ".webm" they may have typed (either recognised extension, not just whichever format
++        // is currently selected - so switching formats after typing a name never produces a
++        // doubled extension like "myclip.mp4.webm"), THEN sanitise with the exact same
++        // allowlist, for the exact same "never trust a text field verbatim as a filename"
++        // reason. clipsanitize()'s own "clip" fallback (unchanged) still applies if nothing
++        // survives sanitising (e.g. a name that was nothing but symbols) - a custom name is
++        // stripped down, never rejected outright, matching the established precedent.
 +        string clipbase;
-+        copystring(clipbase, name);
-+        size_t blen = strlen(clipbase);
-+        if(blen >= 4 && !strcasecmp(&clipbase[blen-4], ".dmo")) clipbase[blen-4] = '\0';
-+        // Actually sanitise, matching clipexportuniquepath()'s own doc comment above (which
-+        // already claimed this happens) and the same clipsanitize() idiom saveclip() uses for
-+        // untrusted map/mode names - `name` can reach here straight from a console command, not
-+        // just the pre-sanitised menu listing, so it must never be trusted verbatim as a
-+        // filename component. Done AFTER stripping ".dmo" above, not before: clipsanitize()
-+        // strips '.' along with everything else outside [A-Za-z0-9-_], so sanitising first would
-+        // eat the extension's own dot and leave a stray "dmo" glued onto the base instead of
-+        // removing it. Safe to sanitise in place (dst==src): clipsanitize() only ever writes at
-+        // an index <= the number of source characters already read, so the write cursor never
-+        // laps the read cursor. A legitimate saveclip()-written name (whose timestamp legally
-+        // contains '.', e.g. "2026-07-29_23.47.05_map_mode") still sanitises to a valid,
-+        // merely dot-stripped basename, not an empty one - clipsanitize()'s "clip" fallback below
-+        // only matters for a name that is nothing BUT stripped characters.
-+        clipsanitize(clipbase, sizeof(clipbase), clipbase, "clip");
++        if(customname[0])
++        {
++            string stripped;
++            copystring(stripped, customname);
++            size_t slen = strlen(stripped);
++            if(slen >= 4 && !strcasecmp(&stripped[slen-4], ".mp4")) stripped[slen-4] = '\0';
++            else if(slen >= 5 && !strcasecmp(&stripped[slen-5], ".webm")) stripped[slen-5] = '\0';
++            clipsanitize(clipbase, sizeof(clipbase), stripped, "clip");
++        }
++        else clipexportautobase(name, clipbase, sizeof(clipbase));
 +        // Ensure videodir actually exists on disk BEFORE trying any candidate filename in it -
 +        // see clipexportensuredir()'s own doc comment above for the Windows bug this avoids.
 +        // Failure here reports the real resolved path and returns; a distinct failure below
@@ -2993,7 +3114,7 @@
 +        clipexportphase = CLIPEXPORT_WAITING;
 +        clipexportwaitstart = totalmillis;
 +    }
-+    COMMAND(exportclip, "siiis");
++    COMMAND(exportclip, "siiiss");
 +
 +    void cancelclipexport()
 +    {
@@ -3026,7 +3147,7 @@
      void c2sinfo(bool force) // send update to the server
      {
          static int lastupdate = -1000;
-@@ -3476,6 +4454,13 @@
+@@ -3476,6 +4551,13 @@
                  player1->clientnum = getint(p);
                  gamepaused = false;
                  execident(on ? "demostart" : "demoend");
