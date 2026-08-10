@@ -69,7 +69,7 @@
              return;
 --- a/engine/serverbrowser.cpp
 +++ b/engine/serverbrowser.cpp
-@@ -2,6 +2,159 @@
+@@ -2,6 +2,161 @@
  
  #include "engine.h"
  
@@ -205,13 +205,15 @@
 +    showgui("servers");
 +}
 +
-+// row action: "connect with password.." - opens the box pre-filled with any saved
-+// password, without waiting for a failed connect first (fpsgame/fps.cpp's
-+// serverinfoentry column i==10 calls this directly).
-+void promptserverpassword(const char *name, int port)
-+{
-+    triggerpasswordprompt(name, port, getsavedpassword(name, port));
-+}
++// SwiftGibs width-fix (2026-08-10): promptserverpassword(), the "pw.." row-action
++// wrapper around triggerpasswordprompt() below, is deliberately removed - a spec
++// deviation from the original QoL batch item 7. It was the only caller of
++// triggerpasswordprompt() other than the DISC_PASSWORD intercept in
++// engine/client.cpp, which already opens the identical prompt the first time a
++// row click on a passworded server fails (one attempt, then the box) - so the
++// extra "pw.." column was redundant, and it was a direct contributor to the
++// reported menu-shrink regression (fpsgame/fps.cpp's serverinfoentry lost its
++// case 10). triggerpasswordprompt() itself, and everything it feeds, is unchanged.
 +
 +ICOMMAND(sgconnectwithprompt, "", (),
 +{
@@ -229,7 +231,7 @@
  struct resolverthread
  {
      SDL_Thread *thread;
-@@ -338,6 +491,9 @@
+@@ -338,6 +493,9 @@
               bc = server::servercompatible(b->name, b->sdesc, b->map, b->ping, b->attr, b->numplayers);
          if(ac > bc) return true;
          if(bc > ac) return false;
@@ -239,7 +241,7 @@
          if(a->keep > b->keep) return true;
          if(a->keep < b->keep) return false;
          if(a->numplayers < b->numplayers) return false;
-@@ -398,6 +554,17 @@
+@@ -398,6 +556,17 @@
      s->keep = keep;
  }
  
@@ -257,16 +259,16 @@
  VARP(searchlan, 0, 0, 1);
  VARP(servpingrate, 1000, 5000, 60000);
  VARP(servpingdecay, 1000, 15000, 60000);
-@@ -575,7 +742,7 @@
+@@ -575,7 +744,7 @@
          if(header) execute(header);
          int end = servers.length();
          cgui->pushlist();
 -        loopi(10)
-+        loopi(11)   // SwiftGibs: 9 stock columns + fav (9) + pw.. (10)
++        loopi(10)   // SwiftGibs: 9 stock columns + fav (9); pw.. removed, width-fix
          {
              if(!game::serverinfostartcolumn(cgui, i)) break;
              for(int j = start; j < end; j++)
-@@ -601,7 +768,16 @@
+@@ -601,7 +770,16 @@
  void connectselected()
  {
      if(!selectedserver) return;
@@ -297,7 +299,7 @@
      extern bool allowedittoggle();
 --- a/shared/iengine.h
 +++ b/shared/iengine.h
-@@ -659,3 +659,9 @@
+@@ -674,3 +674,8 @@
  extern void g3d_resetcursor();
  extern void g3d_limitscale(float scale);
  
@@ -305,7 +307,6 @@
 +// engine/serverbrowser.cpp; called from fpsgame/fps.cpp's serverinfoentry() row buttons.
 +extern bool isfavourite(const char *name, int port);
 +extern void togglefavourite(const char *name, int port);
-+extern void promptserverpassword(const char *name, int port);
 +extern void setsavedpassword(const char *name, int port, const char *pass);
 --- a/fpsgame/client.cpp
 +++ b/fpsgame/client.cpp
@@ -369,26 +370,31 @@
  
 --- a/fpsgame/fps.cpp
 +++ b/fpsgame/fps.cpp
-@@ -2450,8 +2450,8 @@
+@@ -2460,8 +2460,8 @@
  
      bool serverinfostartcolumn(g3d_gui *g, int i)
      {
 -        static const char * const names[] = { "ping ", "players ", "mode ", "map ", "time ", "master ", "host ", "port ", "description " };
 -        static const float struts[] =       { 7,       7,          12.5f,   14,      7,      8,         14,      7,       24.5f };
-+        static const char * const names[] = { "ping ", "players ", "mode ", "map ", "time ", "master ", "host ", "port ", "description ", "fav ", "pw.. " };
-+        static const float struts[] =       { 7,       7,          12.5f,   14,      7,      8,         14,      7,       24.5f,          3,      6 };
++        static const char * const names[] = { "ping ", "players ", "mode ", "map ", "time ", "master ", "host ", "port ", "description ", "fav " };
++        static const float struts[] =       { 7,       7,          12.5f,   14,      7,      8,         14,      7,       24.5f,          3 };
          if(size_t(i) >= sizeof(names)/sizeof(names[0])) return false;
          g->pushlist();
          g->text(names[i], 0xFFFF80, !i ? " " : NULL);
-@@ -2486,12 +2486,19 @@
+@@ -2496,12 +2496,24 @@
          if(filterinstaservers && attr.length() >= 2 && attr[0] == PROTOCOL_VERSION &&
             m_valid(attr[1]) && !(gamemodes[attr[1] - STARTGAMEMODE].flags & M_INSTA))
              return false;
 +        // SwiftGibs (patch 20): favourite rows get a gold tint throughout, replacing the
-+        // one stock text colour every column below used to share, plus their own star/
-+        // "pw.." columns (added to serverinfostartcolumn above). isfavourite/
-+        // togglefavourite/promptserverpassword are declared in shared/iengine.h and
-+        // implemented in engine/serverbrowser.cpp.
++        // one stock text colour every column below used to share, plus their own star
++        // column (added to serverinfostartcolumn above). isfavourite/togglefavourite are
++        // declared in shared/iengine.h and implemented in engine/serverbrowser.cpp.
++        // Width-fix deviation (2026-08-10): the original spec also had a "pw.." row
++        // action here (case 10 below) for pre-emptive password entry. Removed: it was
++        // redundant with the DISC_PASSWORD intercept in engine/client.cpp, which already
++        // opens the same prompt on a normal row click to a passworded server (one failed
++        // attempt then the box), and the extra column was a direct contributor to the
++        // reported menu-shrink regression. See width-fix-report.md.
 +        bool fav = isfavourite(name, port);
 +        uint rowcolor = fav ? 0xFFD700 : 0xFFFFDD;
          if(ping < 0 || attr.empty() || attr[0]!=PROTOCOL_VERSION)
@@ -401,7 +407,7 @@
                      break;
  
                  case 1:
-@@ -2499,23 +2506,31 @@
+@@ -2509,23 +2521,27 @@
                  case 3:
                  case 4:
                  case 5:
@@ -431,14 +437,10 @@
 +
 +                case 9:
 +                    if(g->buttonf(fav ? "*" : "-", fav ? 0xFFD700 : 0x888888, NULL)&G3D_UP) togglefavourite(name, port);
-+                    break;
-+
-+                case 10:
-+                    if(g->buttonf("pw..", rowcolor, NULL)&G3D_UP) promptserverpassword(name, port);
                      break;
              }
              return false;
-@@ -2526,24 +2541,24 @@
+@@ -2536,24 +2552,24 @@
              case 0:
              {
                  const char *icon = attr.inrange(3) && np >= attr[3] ? "serverfull" : (attr.inrange(4) ? mastermodeicon(attr[4], "serverunk") : "serverunk");
@@ -468,7 +470,7 @@
                  break;
  
              case 4:
-@@ -2552,24 +2567,32 @@
+@@ -2562,24 +2578,28 @@
                      int secs = clamp(attr[2], 0, 59*60+59),
                          mins = secs/60;
                      secs %= 60;
@@ -500,10 +502,6 @@
 +
 +            case 9:
 +                if(g->buttonf(fav ? "*" : "-", fav ? 0xFFD700 : 0x888888, NULL)&G3D_UP) togglefavourite(name, port);
-+                break;
-+
-+            case 10:
-+                if(g->buttonf("pw..", rowcolor, NULL)&G3D_UP) promptserverpassword(name, port);
                  break;
          }
          return false;
