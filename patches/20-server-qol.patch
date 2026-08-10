@@ -22,7 +22,7 @@
  
 --- a/engine/client.cpp
 +++ b/engine/client.cpp
-@@ -73,8 +73,16 @@
+@@ -73,8 +73,26 @@
  SVARP(connectname, "");
  VARP(connectport, 0, 0, 0xFFFF);
  
@@ -37,10 +37,20 @@
 +void connectserv(const char *servername, int serverport, const char *serverpassword, bool menuinitiated)
  {   
 +    lastconnectmenu = menuinitiated;
++    // Field-fix round 2 (item 4, final-review M3): every new connect attempt - however it
++    // started - immediately invalidates any password prompt left open or flagged from an
++    // earlier, now-irrelevant attempt (abandoned via Esc, or superseded by clicking a
++    // different row before the previous one's rejection ever arrived). Without this a stale
++    // sgpwpromptactive=1 could make the dialog reappear later for a server that never asked
++    // for a password - the exact field-reported bug. Only the plain int flag is cleared here
++    // (not the name/value, which stay put so a currently-open dialog for THIS SAME server
++    // does not blank out mid-attempt) - see resetpasswordprompt(), engine/serverbrowser.cpp,
++    // for the full reset used on cancel and on a successful join instead.
++    setvar("sgpwpromptactive", 0);
      if(connpeer)
      {
          conoutf("aborting connection attempt");
-@@ -122,7 +130,7 @@
+@@ -122,7 +140,7 @@
      connmillis = totalmillis;
      connattempts = 0;
  
@@ -49,7 +59,7 @@
  }
  
  void reconnect(const char *serverpassword)
-@@ -615,6 +623,17 @@
+@@ -615,6 +633,17 @@
                      if(msg) conoutf(CON_ERROR, "\f3server network error, disconnecting (%s) ...", msg);
                      else conoutf(CON_ERROR, "\f3server network error, disconnecting...");
                  }
@@ -69,7 +79,7 @@
              return;
 --- a/engine/serverbrowser.cpp
 +++ b/engine/serverbrowser.cpp
-@@ -2,6 +2,161 @@
+@@ -2,6 +2,190 @@
  
  #include "engine.h"
  
@@ -184,12 +194,28 @@
 +// (exec'd from autoexec.cfg) - setsavedpassword() dedupes/rewrites either way.
 +ICOMMAND(addsavedpassword, "sis", (const char *name, int *port, const char *pass), setsavedpassword(name, *port, pass));
 +
-+// Password-prompt UI state (transient, never persisted - overlay/menus_serverbrowser.cfg
-+// renders a field/connect/cancel block while sgpwpromptactive is set).
++// Password-prompt UI state (transient, never persisted - overlay/menus_serverbrowser.cfg's
++// "sgpasswordprompt" is its OWN dialog gui that reads these; see triggerpasswordprompt()).
 +SVAR(sgpwpromptserver, "");
 +VAR(sgpwpromptport, 0, 0, 0xFFFF);
 +VAR(sgpwpromptactive, 0, 0, 1);
 +SVAR(sgpwpromptvalue, "");
++
++// Field-fix round 2 (item 4, final-review M3): a single, authoritative reset for the
++// transient prompt state, called on every path that should invalidate an outstanding or
++// stale prompt - cancel (below) and a successful join (fpsgame/client.cpp's N_WELCOME).
++// A brand new connectserv() attempt (engine/client.cpp) clears just the int flag inline
++// instead of calling this - not a heap-owned SVar, so it is always safe to touch even while
++// another local still holds a copy of the current name/value, and clearing only the flag
++// (not the server/port identity) avoids a one-frame blank "password for :0" flash while a
++// submitted attempt from THIS SAME dialog is still resolving.
++void resetpasswordprompt()
++{
++    setsvar("sgpwpromptserver", "");
++    setvar("sgpwpromptport", 0);
++    setvar("sgpwpromptactive", 0);
++    setsvar("sgpwpromptvalue", "");
++}
 +
 +void triggerpasswordprompt(const char *name, int port, const char *prefill)
 +{
@@ -199,10 +225,14 @@
 +    setvar("sgpwpromptactive", 1);
 +    // Found via live harness testing: a menu-initiated connect can get rejected while the
 +    // player is not even looking at the server-browser page (disconnect() always drops back
-+    // to whatever gui/mainmenu state was active). Force that page open so the box the player
-+    // just typed a password into - or is about to - is actually on screen, not silently
-+    // waiting behind "servers browser.." in the main menu.
++    // to whatever gui/mainmenu state was active). Force that page open so there is a sensible
++    // page behind the dialog (and so a screenshot taken while the dialog is up can confirm the
++    // browser panel itself did not change size), then stack the dialog - its own separate
++    // "sgpasswordprompt" gui (field-fix round 2, item 3) - on top of it. Never rows injected
++    // into "servers" any more; that was the original design and the field-reported cause of
++    // the browser panel changing size whenever this box appeared or disappeared.
 +    showgui("servers");
++    showgui("sgpasswordprompt");
 +}
 +
 +// SwiftGibs width-fix (2026-08-10): promptserverpassword(), the "pw.." row-action
@@ -217,21 +247,30 @@
 +
 +ICOMMAND(sgconnectwithprompt, "", (),
 +{
-+    if(sgpwpromptserver[0]) connectserv(sgpwpromptserver, sgpwpromptport, sgpwpromptvalue, true);
-+    setvar("sgpwpromptactive", 0);
-+    setsvar("sgpwpromptvalue", "");
++    // Field-fix round 2 (item 4): copy out to locals FIRST - connectserv() clears
++    // sgpwpromptactive at its own top (see there) as part of "any new connect attempt
++    // invalidates a stale prompt", and the plaintext value is cleared here immediately after
++    // copying it (same "cleared before the network result is known" property as before) - if
++    // the raw SVar pointers were passed straight through instead, clearing them would free
++    // memory connectserv() is still using for this very call.
++    if(sgpwpromptserver[0])
++    {
++        string server;
++        string pass;
++        copystring(server, sgpwpromptserver);
++        int port = sgpwpromptport;
++        copystring(pass, sgpwpromptvalue);
++        setsvar("sgpwpromptvalue", "");
++        connectserv(server, port, pass, true);
++    }
 +});
 +
-+ICOMMAND(sgcancelpwprompt, "", (),
-+{
-+    setvar("sgpwpromptactive", 0);
-+    setsvar("sgpwpromptvalue", "");
-+});
++ICOMMAND(sgcancelpwprompt, "", (), resetpasswordprompt());
 +
  struct resolverthread
  {
      SDL_Thread *thread;
-@@ -338,6 +493,9 @@
+@@ -338,6 +522,9 @@
               bc = server::servercompatible(b->name, b->sdesc, b->map, b->ping, b->attr, b->numplayers);
          if(ac > bc) return true;
          if(bc > ac) return false;
@@ -241,7 +280,7 @@
          if(a->keep > b->keep) return true;
          if(a->keep < b->keep) return false;
          if(a->numplayers < b->numplayers) return false;
-@@ -398,6 +556,17 @@
+@@ -398,6 +585,17 @@
      s->keep = keep;
  }
  
@@ -259,7 +298,7 @@
  VARP(searchlan, 0, 0, 1);
  VARP(servpingrate, 1000, 5000, 60000);
  VARP(servpingdecay, 1000, 15000, 60000);
-@@ -575,7 +744,7 @@
+@@ -575,7 +773,7 @@
          if(header) execute(header);
          int end = servers.length();
          cgui->pushlist();
@@ -268,7 +307,7 @@
          {
              if(!game::serverinfostartcolumn(cgui, i)) break;
              for(int j = start; j < end; j++)
-@@ -601,7 +770,16 @@
+@@ -601,7 +799,16 @@
  void connectselected()
  {
      if(!selectedserver) return;
@@ -299,7 +338,7 @@
      extern bool allowedittoggle();
 --- a/shared/iengine.h
 +++ b/shared/iengine.h
-@@ -674,3 +674,8 @@
+@@ -674,3 +674,9 @@
  extern void g3d_resetcursor();
  extern void g3d_limitscale(float scale);
  
@@ -308,6 +347,7 @@
 +extern bool isfavourite(const char *name, int port);
 +extern void togglefavourite(const char *name, int port);
 +extern void setsavedpassword(const char *name, int port, const char *pass);
++extern void resetpasswordprompt();   // SwiftGibs field-fix round 2 (engine/serverbrowser.cpp)
 --- a/fpsgame/client.cpp
 +++ b/fpsgame/client.cpp
 @@ -1113,14 +1113,31 @@
@@ -352,25 +392,37 @@
          player1->clientnum = -1;
          sessionid = 0;
          mastermode = MM_OPEN;
-@@ -3849,6 +3868,15 @@
+@@ -4244,6 +4263,27 @@
              {
                  connected = true;
                  notifywelcome();
 +                if(pendingsavepw)
 +                {
-+                    // setsavedpassword() is declared in shared/iengine.h (global scope, pulled
-+                    // in via game.h -> cube.h before this namespace opens - a LOCAL extern here
-+                    // would silently declare game::setsavedpassword instead and fail to link).
++                    // setsavedpassword()/resetpasswordprompt()/cleargui() are declared in
++                    // shared/iengine.h (global scope, pulled in via game.h -> cube.h before
++                    // this namespace opens - a LOCAL extern here would silently declare
++                    // game::setsavedpassword instead and fail to link).
 +                    setsavedpassword(pendingsavename, pendingsaveport, pendingsaveplainpass);
 +                    pendingsavepw = false;
 +                    memset(pendingsaveplainpass, 0, sizeof(pendingsaveplainpass));
++                    // Field-fix round 2 (items 3+4): this join went through the password
++                    // prompt (or auto-supplied a saved password from that same menu flow) -
++                    // the prompt is its own stacked dialog gui now (triggerpasswordprompt(),
++                    // engine/serverbrowser.cpp), sitting ON TOP of "servers" whenever it was
++                    // ever shown, which defeats notifywelcome()'s own guiserversmenu-is-
++                    // topmost check just above (it only fires when servers is literally last
++                    // on the stack). Reset the prompt state and close every menu explicitly so
++                    // a password-authenticated join ends up looking exactly like any other
++                    // successful connect - back in the game, nothing left open.
++                    resetpasswordprompt();
++                    cleargui(0);
 +                }
                  break;
              }
  
 --- a/fpsgame/fps.cpp
 +++ b/fpsgame/fps.cpp
-@@ -2460,8 +2460,8 @@
+@@ -2460,19 +2460,35 @@
  
      bool serverinfostartcolumn(g3d_gui *g, int i)
      {
@@ -381,12 +433,41 @@
          if(size_t(i) >= sizeof(names)/sizeof(names[0])) return false;
          g->pushlist();
          g->text(names[i], 0xFFFF80, !i ? " " : NULL);
-@@ -2496,12 +2496,24 @@
+         if(struts[i]) g->strut(struts[i]);
+-        g->mergehits(true);
++        // Field-fix round 2 (item 1): g->mergehits(true) used to run here for EVERY column,
++        // including fav (i==9) - vanilla Sauerbraten (vendor/sauer2020, predates SwiftGibs)
++        // relies on it because all 9 stock columns share identical click=connect semantics, so
++        // it never mattered that engine/3dgui.cpp's ishit() drops the X check entirely while
++        // merging (a vertical list only checks the click's Y against the row height) - any
++        // click on a row's Y-band registered as a hit on every column's button for that row,
++        // and since they all did the same thing (connect), the redundancy was invisible. Patch
++        // 20 broke that assumption the moment it added fav with a DIFFERENT click meaning
++        // (toggle, never connect) under the exact same mechanism: every row click connected
++        // AND toggled favourite, because the merged fav cell fired on ANY x position at that
++        // row's height - this was the actual root cause of "clicking any server favourites
++        // it", confirmed by tracing ishit()'s merged branch, not the column-index shift the
++        // original brief guessed at (the width fix's column removal is unrelated). Fix:
++        // mergehits is no longer set here at all. The default (non-merged) hit test bounds
++        // each column's click box to THIS column's own accumulated width (engine/3dgui.cpp's
++        // per-list `xsize`, reset by pushlist() above and scoped to this push/pop pair) - so
++        // the 9 connect columns still collectively span the whole row (unchanged reachable
++        // area) while fav finally gets its own correctly-bounded, independently-clickable cell.
+         return true;
+     }
+ 
+     void serverinfoendcolumn(g3d_gui *g, int i)
+     {
+-        g->mergehits(false);
+         g->column(i);
+         g->poplist();
+     }
+@@ -2496,12 +2512,30 @@
          if(filterinstaservers && attr.length() >= 2 && attr[0] == PROTOCOL_VERSION &&
             m_valid(attr[1]) && !(gamemodes[attr[1] - STARTGAMEMODE].flags & M_INSTA))
              return false;
 +        // SwiftGibs (patch 20): favourite rows get a gold tint throughout, replacing the
-+        // one stock text colour every column below used to share, plus their own star
++        // one stock text colour every column below used to share, plus their own checkbox
 +        // column (added to serverinfostartcolumn above). isfavourite/togglefavourite are
 +        // declared in shared/iengine.h and implemented in engine/serverbrowser.cpp.
 +        // Width-fix deviation (2026-08-10): the original spec also had a "pw.." row
@@ -395,6 +476,12 @@
 +        // opens the same prompt on a normal row click to a passworded server (one failed
 +        // attempt then the box), and the extra column was a direct contributor to the
 +        // reported menu-shrink regression. See width-fix-report.md.
++        // Field-fix round 2 (items 1+2): case 9 below now draws a checkbox glyph
++        // ("checkbox_on"/"checkbox_off", the same icons menus.cpp's guicheckbox already uses
++        // for every other checkbox on this page) instead of a "*"/"-" text glyph, and
++        // serverinfostartcolumn's removal of mergehits (see there) means this cell only
++        // reacts to a click actually landing on it - a row click anywhere else still connects,
++        // clicking this cell only ever toggles.
 +        bool fav = isfavourite(name, port);
 +        uint rowcolor = fav ? 0xFFD700 : 0xFFFFDD;
          if(ping < 0 || attr.empty() || attr[0]!=PROTOCOL_VERSION)
@@ -407,7 +494,7 @@
                      break;
  
                  case 1:
-@@ -2509,23 +2521,27 @@
+@@ -2509,23 +2543,27 @@
                  case 3:
                  case 4:
                  case 5:
@@ -436,11 +523,11 @@
 +                    break;
 +
 +                case 9:
-+                    if(g->buttonf(fav ? "*" : "-", fav ? 0xFFD700 : 0x888888, NULL)&G3D_UP) togglefavourite(name, port);
++                    if(g->button(" ", 0xFFFFFF, fav ? "checkbox_on" : "checkbox_off")&G3D_UP) togglefavourite(name, port);
                      break;
              }
              return false;
-@@ -2536,24 +2552,24 @@
+@@ -2536,24 +2574,24 @@
              case 0:
              {
                  const char *icon = attr.inrange(3) && np >= attr[3] ? "serverfull" : (attr.inrange(4) ? mastermodeicon(attr[4], "serverunk") : "serverunk");
@@ -470,7 +557,7 @@
                  break;
  
              case 4:
-@@ -2562,24 +2578,28 @@
+@@ -2562,24 +2600,28 @@
                      int secs = clamp(attr[2], 0, 59*60+59),
                          mins = secs/60;
                      secs %= 60;
@@ -501,7 +588,7 @@
 +                break;
 +
 +            case 9:
-+                if(g->buttonf(fav ? "*" : "-", fav ? 0xFFD700 : 0x888888, NULL)&G3D_UP) togglefavourite(name, port);
++                if(g->button(" ", 0xFFFFFF, fav ? "checkbox_on" : "checkbox_off")&G3D_UP) togglefavourite(name, port);
                  break;
          }
          return false;
