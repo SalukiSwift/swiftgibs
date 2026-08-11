@@ -338,7 +338,15 @@
      extern bool allowedittoggle();
 --- a/shared/iengine.h
 +++ b/shared/iengine.h
-@@ -674,3 +674,9 @@
+@@ -4,6 +4,7 @@
+ extern int lastmillis;                  // last time
+ extern int elapsedtime;                 // elapsed frame time
+ extern int totalmillis;                 // total elapsed time
++extern int lastinputmillis;             // SwiftGibs AFK-aware auto-respawn: wall-clock (totalmillis-based) timestamp of the last real keyboard/mouse event (engine/main.cpp, engine/console.cpp) - declared here, not engine/engine.h, so unqualified lookup from inside namespace game (fpsgame/fps.cpp) finds this global, not a namespaced copy
+ extern uint totalsecs;
+ extern int gamespeed, paused;
+ 
+@@ -674,3 +675,9 @@
  extern void g3d_resetcursor();
  extern void g3d_limitscale(float scale);
  
@@ -422,7 +430,7 @@
  
 --- a/fpsgame/fps.cpp
 +++ b/fpsgame/fps.cpp
-@@ -2460,19 +2460,35 @@
+@@ -2542,19 +2542,35 @@
  
      bool serverinfostartcolumn(g3d_gui *g, int i)
      {
@@ -462,7 +470,7 @@
          g->column(i);
          g->poplist();
      }
-@@ -2496,12 +2512,30 @@
+@@ -2578,12 +2594,30 @@
          if(filterinstaservers && attr.length() >= 2 && attr[0] == PROTOCOL_VERSION &&
             m_valid(attr[1]) && !(gamemodes[attr[1] - STARTGAMEMODE].flags & M_INSTA))
              return false;
@@ -494,7 +502,7 @@
                      break;
  
                  case 1:
-@@ -2509,23 +2543,27 @@
+@@ -2591,23 +2625,27 @@
                  case 3:
                  case 4:
                  case 5:
@@ -527,7 +535,7 @@
                      break;
              }
              return false;
-@@ -2536,24 +2574,24 @@
+@@ -2618,24 +2656,24 @@
              case 0:
              {
                  const char *icon = attr.inrange(3) && np >= attr[3] ? "serverfull" : (attr.inrange(4) ? mastermodeicon(attr[4], "serverunk") : "serverunk");
@@ -557,7 +565,7 @@
                  break;
  
              case 4:
-@@ -2562,24 +2600,28 @@
+@@ -2644,24 +2682,28 @@
                      int secs = clamp(attr[2], 0, 59*60+59),
                          mins = secs/60;
                      secs %= 60;

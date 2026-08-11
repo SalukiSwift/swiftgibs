@@ -1898,9 +1898,41 @@
  int drawconlines(int conskip, int confade, int conwidth, int conheight, int conoff, int filter, int y = 0, int dir = 1)
  {
      filter &= CON_FLAGS;
+@@ -602,6 +619,7 @@
+ 
+ void processkey(int code, bool isdown, int modstate)
+ {
++    lastinputmillis = totalmillis;   // SwiftGibs AFK-aware auto-respawn: real keyboard key or mouse button/wheel (checkinput(), engine/main.cpp, synthesizes mouse buttons/wheel into this same call) - updated even while a menu is open, before any bind/console/gui dispatch below
+     switch(code)
+     {
+         case SDLK_LGUI: case SDLK_RGUI:
 --- a/engine/main.cpp
 +++ b/engine/main.cpp
-@@ -1378,6 +1378,15 @@
+@@ -77,6 +77,15 @@
+ }
+ 
+ int curtime = 0, lastmillis = 1, elapsedtime = 0, totalmillis = 1;
++// SwiftGibs AFK-aware auto-respawn: wall-clock (totalmillis-based) timestamp of the last
++// REAL SDL input event that reached the client - keyboard (processkey(), engine/console.cpp)
++// or mouse movement (the SDL_MOUSEMOTION case in checkinput() below); mouse buttons/wheel
++// are synthesized into processkey() calls by checkinput() too, so they are covered there, not
++// here. Updated even while a menu is open - this is the raw event-pump loop, before any menu
++// consumes the event. Declared extern in shared/iengine.h (not engine/engine.h) so unqualified
++// lookup from inside namespace game (fpsgame/fps.cpp) finds this global, not a namespaced copy -
++// same pitfall documented in .superpowers/sdd/2026-08-07-qol-batch/laneB-report.md.
++int lastinputmillis = 0;
+ 
+ dynent *player = NULL;
+ 
+@@ -1001,6 +1010,7 @@
+                 break;
+ 
+             case SDL_MOUSEMOTION:
++                lastinputmillis = totalmillis;   // SwiftGibs AFK-aware auto-respawn: real mouse movement, regardless of menu state
+                 if(grabinput)
+                 {
+                     int dx = event.motion.xrel, dy = event.motion.yrel;
+@@ -1378,6 +1388,15 @@
      {
          static int frames = 0;
          int millis = getclockmillis();
@@ -1916,7 +1948,7 @@
          limitfps(millis, totalmillis);
          elapsedtime = millis - totalmillis;
          static int timeerr = 0;
-@@ -1385,6 +1394,7 @@
+@@ -1385,6 +1404,7 @@
          curtime = scaledtime/100;
          timeerr = scaledtime%100;
          if(!multiplayer(false) && curtime>200) curtime = 200;
@@ -3288,7 +3320,7 @@
  
 --- a/fpsgame/fps.cpp
 +++ b/fpsgame/fps.cpp
-@@ -345,6 +345,15 @@
+@@ -355,6 +355,15 @@
      void checkautorespawn();   // SwiftGibs Task 7: defined below, after the cue-demo helpers it checks
      void updateworld()        // main game update loop
      {
@@ -3304,7 +3336,7 @@
          updatereloadmetronome();
          if(!maptime) { maptime = lastmillis; maprealtime = totalmillis; return; }
          if(!curtime) { gets2c(); if(player1->clientnum>=0) c2sinfo(); return; }
-@@ -1229,6 +1238,13 @@
+@@ -1239,6 +1248,13 @@
          // returns) would still be stale/empty.
          cliprecordfinalizeall("map change");
          cliprecordarmmatchstart();
@@ -3318,7 +3350,7 @@
  
          clearmovables();
          clearmonsters();
-@@ -2298,7 +2314,7 @@
+@@ -2308,7 +2324,7 @@
          hudmatrix.scale(h/1800.0f, h/1800.0f, 1);
          flushhudmatrix();
  

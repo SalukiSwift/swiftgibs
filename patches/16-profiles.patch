@@ -1,22 +1,26 @@
 --- a/fpsgame/fps.cpp
 +++ b/fpsgame/fps.cpp
-@@ -237,6 +237,7 @@
+@@ -237,6 +237,8 @@
      }
  
      void updatereloadmetronome();
 +    void checkautorespawn();   // SwiftGibs Task 7: defined below, after the cue-demo helpers it checks
++    void checkautospec();      // SwiftGibs AFK-aware auto-respawn Part B: defined below, after checkautorespawn()
      void updateworld()        // main game update loop
      {
          updatereloadmetronome();
-@@ -260,6 +261,7 @@
+@@ -258,8 +260,10 @@
+         updatemonsters(curtime);
+         if(connected)
          {
++            checkautospec();   // SwiftGibs AFK-aware auto-respawn Part B: runs every tick regardless of state - dead+idle may fire a self-spectate request, spectator+pending prints the rejoin hint once real input resumes (see checkautospec() below)
              if(player1->state == CS_DEAD)
              {
 +                checkautorespawn();   // SwiftGibs Task 7: auto-respawn + ready pip, no-op unless dead+eligible
                  if(player1->ragdoll) moveragdoll(player1);
                  else if(lastmillis-player1->lastpain<2000)
                  {
-@@ -369,6 +371,33 @@
+@@ -369,6 +373,47 @@
      }
      COMMAND(respawn, "");
  
@@ -34,6 +38,20 @@
 +    // called from updateworld()'s CS_DEAD branch above.
 +    VARP(autorespawn, 0, 1, 1);
 +    VARP(respawnreadysound, 0, 1, 1);
++    // SwiftGibs AFK-aware auto-respawn (design doc 2026-08-11-afk-aware-autorespawn-design.md):
++    // autorespawnidle (Part A) pauses the respawn() call in checkautorespawn() below while the
++    // player is idle, instead of cycling spawn->die->spawn for free frags. autospecidle (Part
++    // B, off by default) additionally moves an idle DEAD player to spectator after a longer
++    // wait. Both measured against lastinputmillis - a single wall-clock totalmillis timestamp,
++    // updated on any real keyboard/mouse event reaching the client including in menus (engine/
++    // console.cpp's processkey(), engine/main.cpp's SDL_MOUSEMOTION case; declared in shared/
++    // iengine.h).
++    VARP(autorespawnidle, 0, 30, 300);   // seconds idle before auto-respawn pauses; 0 = never pause (pre-change behaviour)
++    VARP(autospecidle, 0, 0, 600);       // seconds dead+idle before self-spectate; 0 = off (suggested UI value 120)
++    bool autorespawnpausenotified = false;   // latches the "auto respawn paused" console line to once per death, see deathstate()
++    bool autospecrequested = false;          // latches the self-spectate request to once per death - never resent every frame while the server confirms it
++    bool autospecpending = false;            // true from a fired auto-spec until the next real input, when the rejoin hint prints once
++    int autospecpromptmillis = 0;            // lastinputmillis snapshot taken at auto-spec time; the rejoin hint fires once lastinputmillis moves past this
 +    static const int RESPAWNREADYFLOOR = 300;   // mirrors server DEATHMILLIS (fpsgame/server.cpp)'s post-death settle window
 +    int respawnreadyat = -1;      // lastmillis timestamp; (re)armed on every player1 death, see deathstate()
 +    bool respawnreadyfired = false;
@@ -50,7 +68,7 @@
      // inputs
  
      VARP(attackspawn, 0, 1, 1);
-@@ -535,6 +564,36 @@
+@@ -535,6 +580,41 @@
              //d->pitch = 0;
              d->roll = 0;
              playsound(S_DIE1+rnd(2));
@@ -65,6 +83,11 @@
 +            int respawnwaitms = max(RESPAWNREADYFLOOR, max(spawnwait, cmode ? cmode->respawnwait(d)*1000 : 0));
 +            respawnreadyat = lastmillis + respawnwaitms;
 +            respawnreadyfired = false;
++            // SwiftGibs AFK-aware auto-respawn: (re)arm the idle-pause and auto-spec latches
++            // for this new death - see the VARPs' own comment above checkautorespawn().
++            autorespawnpausenotified = false;
++            autospecrequested = false;
++            autospecpending = false;
 +            // SwiftGibs Task 8: (re)arm the 3-2-1 countdown-tone slots for this same death.
 +            // Only schedule a slot whose T-Ns offset actually lands after this moment (wait
 +            // strictly greater than the offset) - otherwise leave it unscheduled (-1) and
@@ -87,7 +110,7 @@
          }
          else
          {
-@@ -581,6 +640,59 @@
+@@ -581,6 +661,59 @@
      ICOMMAND(numplayers, "", (), intret(players.length()));
      ICOMMAND(getplayername, "i", (int *i), result(players.inrange(*i) ? players[*i]->name : ""));
  
@@ -147,7 +170,7 @@
      void killed(fpsent *d, fpsent *actor)
      {
          if(d->state==CS_EDITING)
-@@ -1639,6 +1751,44 @@
+@@ -1639,6 +1772,105 @@
          reloadoverlaypass = false;
      }
  
@@ -184,8 +207,69 @@
 +        }
 +        if(autorespawn && lastmillis - lastautorespawn >= 250)
 +        {
-+            lastautorespawn = lastmillis;
-+            respawn();
++            // SwiftGibs AFK-aware auto-respawn, Part A: an idle player (no real input for
++            // autorespawnidle seconds) lies dead exactly like stock instead of respawning -
++            // lastinputmillis is never touched here, only read; it is updated in engine/
++            // main.cpp/engine/console.cpp (see the VARPs' comment above). autorespawnidle 0
++            // = never pause (pre-change behaviour). The pause line is latched to print once
++            // per death (autorespawnpausenotified, cleared in deathstate() above); any later
++            // input drops totalmillis-lastinputmillis back under the threshold on the very
++            // next tick, so the normal respawn cadence below just resumes on its own - no
++            // extra reset code needed.
++            if(autorespawnidle > 0 && totalmillis - lastinputmillis > autorespawnidle*1000)
++            {
++                if(!autorespawnpausenotified)
++                {
++                    autorespawnpausenotified = true;
++                    conoutf("auto respawn paused, you seem afk - move the mouse or press any key");
++                }
++            }
++            else
++            {
++                lastautorespawn = lastmillis;
++                respawn();
++            }
++        }
++    }
++
++    // === SwiftGibs AFK-aware auto-respawn, Part B: idle auto-spectate (design doc
++    // 2026-08-11-afk-aware-autorespawn-design.md). OFF by default (autospecidle 0). Runs every
++    // tick while connected (see the call site in updateworld() above), unlike checkautorespawn()
++    // above which only runs while CS_DEAD - the rejoin-hint half below needs to keep checking
++    // after the player has actually become CS_SPECTATOR. ===
++    extern void togglespectator(int val, const char *who);   // fpsgame/client.cpp, namespace game - the same self-spectate request the master-menu "toggle spectator" button sends
++    extern int mastermode;   // fpsgame/client.cpp, namespace game - this client's own mirror of the server's current mastermode (N_CURRENTMASTER on join, N_MASTERMODE on change)
++    void checkautospec()
++    {
++        if(!connected) return;
++        if(autospecidle > 0 && !intermission && m_mp(gamemode) && player1->state == CS_DEAD && !autospecrequested
++           && totalmillis - lastinputmillis > autospecidle*1000)
++        {
++            // Vendor rule (fpsgame/server.cpp, N_SPECTATOR handler): an unprivileged, non-local
++            // client's OWN request to leave spectator is refused whenever "!ci->privilege &&
++            // !ci->local && spectator==sender && ci->state.state==CS_SPECTATOR &&
++            // mastermode>=MM_LOCKED" - i.e. locked/private/password mastermodes trap a
++            // self-spectated player until a privileged player frees them; open/veto do not.
++            // Gating the auto-spec itself on the SAME threshold (mastermode < MM_LOCKED) means
++            // this feature never puts an idle player into a state it cannot get itself back out
++            // of - if the mastermode would trap them, Part A's pause is already protecting them
++            // and this does nothing (m_mp/intermission mirror checkautorespawn()'s own guards).
++            if(mastermode < MM_LOCKED)
++            {
++                autospecrequested = true;   // latch: one request per death, never resent every frame while the server confirms it
++                togglespectator(1, "");
++                conoutf("moved to spectator while afk");
++                autospecpromptmillis = lastinputmillis;
++                autospecpending = true;
++            }
++        }
++        // First real input after an auto-spec: print the rejoin hint once. Checked separately
++        // from the block above since it must keep firing after state has left CS_DEAD (the
++        // togglespectator() request above is not applied locally until the server confirms it).
++        if(autospecpending && player1->state == CS_SPECTATOR && lastinputmillis > autospecpromptmillis)
++        {
++            autospecpending = false;
++            conoutf("you were moved to spectator while afk - open the master menu or use /spectator 0 to rejoin");
 +        }
 +    }
 +
