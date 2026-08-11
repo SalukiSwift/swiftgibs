@@ -63,7 +63,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y imagemagick zip bzip2
+      # the second line is the SDL source-build deps for build/fetch-sdl-linux.sh (the bundled
+      # lean SDL runtime); its configure-summary check fails the build if one goes missing.
+      - run: |
+          sudo apt-get update && sudo apt-get install -y imagemagick zip bzip2 \
+            pkg-config libx11-dev libxext-dev libxcursor-dev libxi-dev libxfixes-dev libxrandr-dev \
+            libxss-dev libxinerama-dev libxxf86vm-dev libxkbcommon-dev libwayland-dev wayland-protocols \
+            libegl-dev libgles-dev libdrm-dev libgbm-dev libdecor-0-dev libdbus-1-dev libudev-dev \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev libsamplerate0-dev
       - uses: actions/download-artifact@v4
         with: { path: /tmp/arts }
       - name: Install rcodesign

@@ -49,7 +49,8 @@ Grab the latest build for your platform from the **[Releases](../../releases)** 
 ### Linux (x86-64)
 1. Download `SwiftGibs-linux-x86_64.tar.gz` and extract it.
 2. Run `./swiftgibs.sh`.
-   Needs system SDL2, e.g. `sudo apt install libsdl2-2.0-0 libsdl2-image-2.0-0 libsdl2-mixer-2.0-0`.
+   No packages to install: if your system has SDL2 the game uses it, and if not it falls back
+   to the lean copies bundled in `lib/` (see `docs/sdl-provenance.md`).
 
 Your settings and saved friends live in your user config directory and persist between updates.
 

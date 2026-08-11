@@ -31,9 +31,40 @@ mkdir -p "$OUT/ffmpeg"
 cp "$FFMPEG_DIR/ffmpeg" "$FFMPEG_DIR/LICENSE.txt" "$FFMPEG_DIR/NOTICE.txt" "$OUT/ffmpeg/"
 chmod +x "$OUT/ffmpeg/ffmpeg"
 
+# Bundled SDL2 runtime (lean, source-built - see build/fetch-sdl-linux.sh and
+# docs/sdl-provenance.md): lets the bundle run out of the box on a machine with no SDL
+# packages installed. The launcher below only puts lib/ on the library path when the
+# system's own SDL is missing, so a normal desktop keeps using its distro libraries.
+SDL_DIR="$("$ROOT/build/fetch-sdl-linux.sh")"
+mkdir -p "$OUT/lib"
+cp "$SDL_DIR"/libSDL2-2.0.so.0 "$SDL_DIR"/libSDL2_image-2.0.so.0 "$SDL_DIR"/libSDL2_mixer-2.0.so.0 \
+   "$SDL_DIR/NOTICE.txt" "$OUT/lib/"
+
 cat > "$OUT/swiftgibs.sh" <<'SH'
 #!/usr/bin/env bash
-cd "$(dirname "$0")" && exec ./bin/swiftgibs -q.
+# SwiftGibs launcher. Besides starting the game it catches the two ways a fresh install
+# used to fail with a cryptic error (or not start at all):
+cd "$(dirname "$0")"
+
+# 1) Half-extracted archive: notexture.png is the first file the engine hard-requires, and
+# packages/ sorts late in the tarball, so a truncated extraction loses it. Fail with an
+# explanation instead of the engine's "could not find core textures".
+if [ ! -f packages/textures/notexture.png ] || [ ! -f data/glsl.cfg ]; then
+  echo "SwiftGibs: game data is missing or incomplete."
+  echo "This usually means the archive was only partly extracted."
+  echo "Delete this folder, then fully extract SwiftGibs-linux-x86_64.tar.gz again."
+  exit 1
+fi
+
+# 2) No SDL2 on the system: prefer the distro's libraries when they are all present (they
+# get distro fixes and updates), otherwise fall back to the lean copies bundled in lib/,
+# so the game runs with zero packages installed. If ldd itself is unavailable we can't
+# tell, so use the bundled copies - the safe default either way.
+if ! command -v ldd >/dev/null 2>&1 || ldd bin/swiftgibs 2>/dev/null | grep -q 'not found'; then
+  export LD_LIBRARY_PATH="$PWD/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
+exec ./bin/swiftgibs -q.
 SH
 cp "$ROOT/updater/update-swiftgibs.sh" "$OUT/update-swiftgibs.sh"
 chmod +x "$OUT/swiftgibs.sh" "$OUT/bin/swiftgibs" "$OUT/update-swiftgibs.sh"
