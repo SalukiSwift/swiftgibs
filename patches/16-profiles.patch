@@ -170,7 +170,7 @@
      void killed(fpsent *d, fpsent *actor)
      {
          if(d->state==CS_EDITING)
-@@ -1639,6 +1772,105 @@
+@@ -1639,6 +1772,124 @@
          reloadoverlaypass = false;
      }
  
@@ -271,6 +271,25 @@
 +            autospecpending = false;
 +            conoutf("you were moved to spectator while afk - open the master menu or use /spectator 0 to rejoin");
 +        }
++    }
++
++    // SwiftGibs AFK-aware auto-respawn - fix round 1 (found by review): clears all four idle-
++    // pause/auto-spec latches. Called from fpsgame/client.cpp's gamedisconnect() (every
++    // disconnect/quit routes through there) and from the N_DEMOPLAYBACK packet handler's
++    // demo-start branch (client.cpp) - the one place player1->state is forced to CS_SPECTATOR
++    // outside any disconnect, so a stale autospecpending armed-but-never-fired from an earlier
++    // death (e.g. auto-spec correctly withheld under a locked mastermode, see checkautospec()
++    // above) could otherwise misfire its rejoin hint on this wholly unrelated later transition (a
++    // different server, a demo/clip). autorespawnpausenotified/autospecrequested are reset too for
++    // the same "never let stale per-death state leak into an unrelated later context" reason, even
++    // though their own failure mode is milder (console spam / one extra network request, never a
++    // wrong user-facing message).
++    void resetafklatches()
++    {
++        autorespawnpausenotified = false;
++        autospecrequested = false;
++        autospecpending = false;
++        autospecpromptmillis = 0;
 +    }
 +
      // === SwiftGibs reload metronome (audio tick/ding over the rifle reload) ===

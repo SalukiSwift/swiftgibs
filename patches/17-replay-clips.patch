@@ -2013,7 +2013,7 @@
                  }
                  // SwiftGibs: per-player streak for the scoreboard column (all players)
                  if(victim && victim != actor && (!m_teammode || !isteam(actor->team, victim->team)))
-@@ -2057,6 +3634,15 @@
+@@ -2057,8 +3634,30 @@
  
              case N_DEMOPLAYBACK:
              {
@@ -2027,8 +2027,24 @@
 +                // hunk in this same case block.
 +                clippovreset();
                  int on = getint(p);
-                 if(on) player1->state = CS_SPECTATOR;
+-                if(on) player1->state = CS_SPECTATOR;
++                if(on)
++                {
++                    player1->state = CS_SPECTATOR;
++                    // SwiftGibs AFK-aware auto-respawn - fix round 1: belt-and-braces reset (see
++                    // resetafklatches(), fpsgame/fps.cpp) - gamedisconnect() covers every ordinary
++                    // disconnect/quit, but a demo/clip can start WITHOUT ever calling it (e.g.
++                    // reviewing a clip mid-session on a hosted local match: changemap()'s
++                    // `if(!remote)` branch skips localconnect() - and gamedisconnect() with it -
++                    // once already connected), and this is the one place outside a disconnect
++                    // that forces player1 into CS_SPECTATOR, the exact transition a stale
++                    // autospecpending latch would otherwise misfire its rejoin hint on.
++                    extern void resetafklatches();
++                    resetafklatches();
++                }
                  else clearclients();
+                 demoplayback = on!=0;
+                 player1->clientnum = getint(p);
 --- a/shared/iengine.h
 +++ b/shared/iengine.h
 @@ -489,6 +489,29 @@
@@ -2365,7 +2381,7 @@
      }
  
      void otherplayers(int curtime)
-@@ -244,6 +359,24 @@
+@@ -245,6 +360,24 @@
          if(!maptime) { maptime = lastmillis; maprealtime = totalmillis; return; }
          if(!curtime) { gets2c(); if(player1->clientnum>=0) c2sinfo(); return; }
  
@@ -2390,7 +2406,7 @@
          physicsframe();
          ai::navigate();
          if(player1->state != CS_DEAD && !intermission)
-@@ -672,6 +805,13 @@
+@@ -693,6 +826,13 @@
              {
                  case ID_VAR:   f->printf("%s %d\n", names[i], *id->storage.i); break;
                  case ID_FVAR:  f->printf("%s %s\n", names[i], floatstr(*id->storage.f)); break;
@@ -2404,7 +2420,7 @@
                  case ID_ALIAS: f->printf("%s = [%s]\n", names[i], id->getstr()); break;
              }
          }
-@@ -749,6 +889,16 @@
+@@ -770,6 +910,16 @@
          else
          {
              intermission = true;
@@ -2421,7 +2437,7 @@
              player1->attacking = false;
              if(cmode) cmode->gameover();
              conoutf(CON_GAMEINFO, "\f2intermission:");
-@@ -840,6 +990,24 @@
+@@ -861,6 +1011,24 @@
  
      void startgame()
      {
@@ -2446,7 +2462,7 @@
          clearmovables();
          clearmonsters();
  
-@@ -995,10 +1163,10 @@
+@@ -1016,10 +1184,10 @@
  
      const char *colorname(fpsent *d, const char *name, const char *prefix, const char *suffix, const char *alt)
      {
@@ -2459,7 +2475,7 @@
          {
              formatstring(hpre, "\fs\f%s%s", selfcolor, prefix);
              formatstring(hsuf, "%s\fr", suffix);
-@@ -1026,7 +1194,7 @@
+@@ -1047,7 +1215,7 @@
      const char *teamcolorname(fpsent *d, const char *alt)
      {
          if(!teamcolortext || !m_teammode || d->state==CS_SPECTATOR) return colorname(d, NULL, "", "", alt);
@@ -2468,7 +2484,7 @@
      }
  
      const char *teamcolor(const char *name, bool sameteam, const char *alt)
-@@ -1039,7 +1207,7 @@
+@@ -1060,7 +1228,7 @@
  
      const char *teamcolor(const char *name, const char *team, const char *alt)
      {
@@ -2477,7 +2493,7 @@
      }
  
      VARP(teamsounds, 0, 1, 1);
-@@ -1051,7 +1219,7 @@
+@@ -1072,7 +1240,7 @@
  
      void teamsound(fpsent *d, int n, const vec *loc)
      {
@@ -2486,7 +2502,7 @@
      }
  
      void suicide(physent *d)
-@@ -1879,6 +2047,27 @@
+@@ -1980,6 +2148,27 @@
          pophudmatrix();
      }
  
@@ -2514,7 +2530,7 @@
      void gameplayhud(int w, int h)
      {
          pushhudmatrix();
-@@ -1914,6 +2103,7 @@
+@@ -2015,6 +2204,7 @@
          drawexpandedmap(w, h);
          drawkillstreak(w, h);
          drawflagpopup(w, h);

@@ -2091,7 +2091,7 @@
      void gamedisconnect(bool cleanup)
      {
          if(remote) stopfollowing();
-@@ -1177,6 +1180,14 @@
+@@ -1177,6 +1180,23 @@
          // hook at the very TOP (right after stopfollowing()) so that patch's context match is
          // undisturbed.
          cliprecordfinalizeall("disconnect");
@@ -2103,10 +2103,19 @@
 +        // A no-op (single int compare) when no export is active - safe to call unconditionally,
 +        // including on every ordinary disconnect that has nothing to do with export.
 +        clipexportabort("disconnected");
++        // SwiftGibs AFK-aware auto-respawn - fix round 1 (found by review): clear the idle-pause/
++        // auto-spec latches on every disconnect (this function is the one place both a real
++        // disconnect AND `quit` are guaranteed to pass through - see the comment above
++        // clipexportabort() just above) so a latch armed but never fired this session (e.g.
++        // auto-spec withheld under a locked mastermode) can never misfire on a wholly unrelated
++        // later CS_SPECTATOR transition (a different server, a demo/clip). See
++        // resetafklatches() (fpsgame/fps.cpp) for the full reasoning.
++        extern void resetafklatches();
++        resetafklatches();
      }
  
      VARP(teamcolorchat, 0, 1, 1);
-@@ -2141,6 +2152,32 @@
+@@ -2141,6 +2161,32 @@
          if(!dst[0]) copystring(dst, fallback, dstsize);
      }
  
@@ -2139,7 +2148,7 @@
      // saveclip: writes <clipdir>/<timestamp>_<map>_<mode>.dmo, gzipped in the stock demo
      // format (24-byte demoheader, then lilswapped {ms,chan,len} stamps + raw payload,
      // mirroring writedemo()/setupdemorecord() in fpsgame/server.cpp field-for-field), reading
-@@ -2803,6 +2840,1164 @@
+@@ -2803,6 +2849,1164 @@
      }
      // === end SwiftGibs instant replay: recording modes =======================================
  
@@ -3304,7 +3313,7 @@
      void c2sinfo(bool force) // send update to the server
      {
          static int lastupdate = -1000;
-@@ -3654,6 +4849,13 @@
+@@ -3667,6 +4871,13 @@
                  player1->clientnum = getint(p);
                  gamepaused = false;
                  execident(on ? "demostart" : "demoend");
@@ -3320,8 +3329,8 @@
  
 --- a/fpsgame/fps.cpp
 +++ b/fpsgame/fps.cpp
-@@ -355,6 +355,15 @@
-     void checkautorespawn();   // SwiftGibs Task 7: defined below, after the cue-demo helpers it checks
+@@ -356,6 +356,15 @@
+     void checkautospec();      // SwiftGibs AFK-aware auto-respawn Part B: defined below, after checkautorespawn()
      void updateworld()        // main game update loop
      {
 +        // SwiftGibs clip export (Task 3): a genuinely unconditional per-frame hook (updateworld()
@@ -3336,7 +3345,7 @@
          updatereloadmetronome();
          if(!maptime) { maptime = lastmillis; maprealtime = totalmillis; return; }
          if(!curtime) { gets2c(); if(player1->clientnum>=0) c2sinfo(); return; }
-@@ -1239,6 +1248,13 @@
+@@ -1260,6 +1269,13 @@
          // returns) would still be stale/empty.
          cliprecordfinalizeall("map change");
          cliprecordarmmatchstart();
@@ -3350,7 +3359,7 @@
  
          clearmovables();
          clearmonsters();
-@@ -2308,7 +2324,7 @@
+@@ -2409,7 +2425,7 @@
          hudmatrix.scale(h/1800.0f, h/1800.0f, 1);
          flushhudmatrix();
  
