@@ -47,8 +47,8 @@
 +    // console.cpp's processkey(), engine/main.cpp's SDL_MOUSEMOTION case; declared in shared/
 +    // iengine.h).
 +    VARP(autorespawnidle, 0, 30, 300);   // seconds idle before auto-respawn pauses; 0 = never pause (pre-change behaviour)
-+    VARP(autospecidle, 0, 120, 600);     // seconds dead+idle before self-spectate; default 120 (2 min) - matches
-+                                          // how public servers typically behave (April, 2026-08-11); 0 = off
++    VARP(autospecidle, 0, 60, 600);      // seconds dead+idle before self-spectate; default 60 (1 min) - April's
++                                          // preferred default (2026-08-11, one minute); 0 = off
 +    bool autorespawnpausenotified = false;   // latches the "auto respawn paused" console line to once per death, see deathstate()
 +    bool autospecrequested = false;          // latches the self-spectate request to once per death - never resent every frame while the server confirms it
 +    bool autospecpending = false;            // true from a fired auto-spec until the next real input, when the rejoin hint prints once
@@ -234,7 +234,7 @@
 +    }
 +
 +    // === SwiftGibs AFK-aware auto-respawn, Part B: idle auto-spectate (design doc
-+    // 2026-08-11-afk-aware-autorespawn-design.md). ON by default (autospecidle 120). Runs every
++    // 2026-08-11-afk-aware-autorespawn-design.md). ON by default (autospecidle 60). Runs every
 +    // tick while connected (see the call site in updateworld() above), unlike checkautorespawn()
 +    // above which only runs while CS_DEAD - the rejoin-hint half below needs to keep checking
 +    // after the player has actually become CS_SPECTATOR. ===
