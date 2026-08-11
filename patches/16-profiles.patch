@@ -20,7 +20,7 @@
                  if(player1->ragdoll) moveragdoll(player1);
                  else if(lastmillis-player1->lastpain<2000)
                  {
-@@ -369,6 +373,47 @@
+@@ -369,6 +373,48 @@
      }
      COMMAND(respawn, "");
  
@@ -47,7 +47,8 @@
 +    // console.cpp's processkey(), engine/main.cpp's SDL_MOUSEMOTION case; declared in shared/
 +    // iengine.h).
 +    VARP(autorespawnidle, 0, 30, 300);   // seconds idle before auto-respawn pauses; 0 = never pause (pre-change behaviour)
-+    VARP(autospecidle, 0, 0, 600);       // seconds dead+idle before self-spectate; 0 = off (suggested UI value 120)
++    VARP(autospecidle, 0, 120, 600);     // seconds dead+idle before self-spectate; default 120 (2 min) - matches
++                                          // how public servers typically behave (April, 2026-08-11); 0 = off
 +    bool autorespawnpausenotified = false;   // latches the "auto respawn paused" console line to once per death, see deathstate()
 +    bool autospecrequested = false;          // latches the self-spectate request to once per death - never resent every frame while the server confirms it
 +    bool autospecpending = false;            // true from a fired auto-spec until the next real input, when the rejoin hint prints once
@@ -68,7 +69,7 @@
      // inputs
  
      VARP(attackspawn, 0, 1, 1);
-@@ -535,6 +580,41 @@
+@@ -535,6 +581,41 @@
              //d->pitch = 0;
              d->roll = 0;
              playsound(S_DIE1+rnd(2));
@@ -110,7 +111,7 @@
          }
          else
          {
-@@ -581,6 +661,59 @@
+@@ -581,6 +662,59 @@
      ICOMMAND(numplayers, "", (), intret(players.length()));
      ICOMMAND(getplayername, "i", (int *i), result(players.inrange(*i) ? players[*i]->name : ""));
  
@@ -170,7 +171,7 @@
      void killed(fpsent *d, fpsent *actor)
      {
          if(d->state==CS_EDITING)
-@@ -1639,6 +1772,124 @@
+@@ -1639,6 +1773,124 @@
          reloadoverlaypass = false;
      }
  
@@ -233,7 +234,7 @@
 +    }
 +
 +    // === SwiftGibs AFK-aware auto-respawn, Part B: idle auto-spectate (design doc
-+    // 2026-08-11-afk-aware-autorespawn-design.md). OFF by default (autospecidle 0). Runs every
++    // 2026-08-11-afk-aware-autorespawn-design.md). ON by default (autospecidle 120). Runs every
 +    // tick while connected (see the call site in updateworld() above), unlike checkautorespawn()
 +    // above which only runs while CS_DEAD - the rejoin-hint half below needs to keep checking
 +    // after the player has actually become CS_SPECTATOR. ===
