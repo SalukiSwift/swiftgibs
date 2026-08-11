@@ -12,3 +12,7 @@ docs/superpowers/
 docs/HANDOFF*
 docs/*handoff*
 docs/*playtest-checklist*
+
+# Local Claude Code context - never publish
+CLAUDE.md
+.claude/
