@@ -1,6 +1,6 @@
 --- a/engine/serverbrowser.cpp
 +++ b/engine/serverbrowser.cpp
-@@ -749,3 +749,168 @@
+@@ -749,3 +749,197 @@
      delete f;
  }
  
@@ -20,13 +20,37 @@
 +SVAR(feedbackhost, "salukiswift.com");
 +VAR(feedbackport, 1, 8300, 0xFFFF);
 +
-+#define FEEDBACKLIMIT 15000
++// sghttp's timeoutms now covers resolve+connect+send+recv as ONE budget,
++// where the pre-extraction code gave each phase its own window (resolverwait
++// RESOLVERLIMIT 3000 + connectwithtimeout CONNLIMIT 20000 + the old shared
++// send/recv FEEDBACKLIMIT 15000): 3000+20000+15000 = 38000, so the combined
++// budget below matches the old worst-case ceiling instead of shrinking it.
++#define FEEDBACKLIMIT 38000
 +#define FEEDBACKBOUNDARY "----SwiftGibsFeedback7d1298fa3e8a"
 +
 +static void feedbackstatus(const char *msg)
 +{
 +    alias("feedbackstatus", msg);
 +    conoutf("feedback: %s", msg);
++}
++
++// sghttp only reports WHICH phase failed (sghttperrphase(), valid after a 0
++// return), not the finer distinctions the old inline socket code used to
++// make (eg. "could not open a socket" vs "could not reach the feedback
++// server" were both pre-connect failures - now one CONNECT phase). Restores
++// the old message text where the phase still maps 1:1; the rest fold into
++// the closest-fitting original string.
++static const char *feedbackerrmsg(int phase)
++{
++    switch(phase)
++    {
++        case SGHTTP_ERR_RESOLVE: return "could not resolve the feedback server";
++        case SGHTTP_ERR_CONNECT: return "could not reach the feedback server";
++        case SGHTTP_ERR_SEND: return "timed out - try again later";
++        case SGHTTP_ERR_RECV: return "no reply from the feedback server";
++        case SGHTTP_ERR_BADREPLY: return "bad reply from the feedback server";
++        default: return "could not reach the feedback server";
++    }
 +}
 +
 +static void feedbackfield(vector<char> &out, const char *name, const char *value)
@@ -109,7 +133,7 @@
 +    int code = sghttppost(feedbackhost, feedbackport, "/feedback", "multipart/form-data; boundary=" FEEDBACKBOUNDARY, body, out, FEEDBACKLIMIT, &fp);
 +
 +    if(code == -1) { feedbackstatus("aborted"); return; }
-+    if(code == 0) { feedbackstatus("could not reach the feedback server"); return; }
++    if(code == 0) { feedbackstatus(feedbackerrmsg(sghttperrphase())); return; }
 +
 +    out.add('\0');
 +    char *msg = (char *)out.getbuf();
@@ -135,7 +159,12 @@
 +// sghttpget below is what keeps it silent - sghttp never renders on its own).
 +// Results land in the aliases swiftgibsupdate (0/1) + swiftgibslatest, which
 +// the main-menu gui reads.
-+#define CHECKUPDLIMIT 2500
++// Same single-budget-covers-everything change as FEEDBACKLIMIT above: old
++// worst case was resolverwait's RESOLVERLIMIT 3000 + this function's own
++// silent one-shot connect wait (2000) + the old shared send/recv
++// CHECKUPDLIMIT 2500 = 7500, so the combined budget below matches that
++// instead of shrinking to the old send/recv-only window.
++#define CHECKUPDLIMIT 7500
 +
 +static bool parseversion(const char *s, int &major, int &minor, int &patch)
 +{
@@ -197,7 +226,7 @@
          if(!hidestats)
 --- /dev/null
 +++ b/fpsgame/sghttp.h
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,39 @@
 +// sghttp.h: minimal blocking HTTP/1.1 GET/POST transport over raw enet
 +// sockets. Extracted from the feedback-relay code (patch 14) so later
 +// features (eg. map streaming) can reuse the same transport.
@@ -227,10 +256,19 @@
 +// Blocking raw-HTTP/1.1 POST (Connection: close). Same return convention as sghttpget.
 +int sghttppost(const char *host, int port, const char *path, const char *contenttype, const vector<char> &body, vector<uchar> &out, int timeoutms, sghttpprogress *progress);
 +
++// Which phase failed on the most recent 0-return from sghttpget/sghttppost -
++// stale/meaningless after a cancel (-1) or a successful status (>0); only
++// read it right after a 0 return. Thread-local to the CALLING thread: sghttp
++// is always driven synchronously by whichever thread calls
++// sghttpget/sghttppost, so each calling thread's last failure is tracked
++// independently, with no locking needed to read it back.
++enum { SGHTTP_ERR_NONE = 0, SGHTTP_ERR_RESOLVE, SGHTTP_ERR_CONNECT, SGHTTP_ERR_SEND, SGHTTP_ERR_RECV, SGHTTP_ERR_BADREPLY };
++int sghttperrphase();
++
 +#endif
 --- /dev/null
 +++ b/fpsgame/sghttp.cpp
-@@ -0,0 +1,212 @@
+@@ -0,0 +1,393 @@
 +// sghttp.cpp: minimal blocking HTTP/1.1 GET/POST transport over raw enet
 +// sockets. Shared by the in-game feedback POST and the launch-time
 +// update-check GET (see engine/serverbrowser.cpp) - previously each hand-rolled
@@ -240,15 +278,44 @@
 +// header + Content-Length parsing. Never calls renderprogress/interceptkey or
 +// any other renderer/UI function - callers drive their own progress bar and
 +// cancel key through the sghttpprogress callback passed in. Nothing in here
-+// actually touches SDL/GL either (only enet_* calls + cube's vector<>), so a
-+// -DSTANDALONE build (same flag the dedicated server already uses) links
-+// this file with just enet + zlib, no SDL/GL/X11 needed.
++// actually touches SDL/GL either (only enet_* calls, cube's vector<>, and a
++// raw platform thread for DNS - see below), so a -DSTANDALONE build (same
++// flag the dedicated server already uses) links this file with just enet +
++// zlib, no SDL/GL/X11 needed.
++//
++// The DNS-resolve job below uses GCC/Clang's __atomic_* builtins rather than
++// <atomic> - <atomic> transitively includes <new>, which conflicts with
++// shared/tools.h's own hand-rolled placement-new operators (a hard
++// "redefinition" compile error the moment both are in one translation unit).
++// The builtins need no header at all and work identically here.
 +
 +#include <string.h>
 +#include <stdio.h>
 +#include <stdlib.h>
++#include <time.h>
 +#include <enet/enet.h>
++#ifndef WIN32
++#include <pthread.h>
++#endif
 +#include "sghttp.h"
++
++// Last failure phase, per calling thread - see sghttp.h for the contract.
++static thread_local int sghttplasterr = SGHTTP_ERR_NONE;
++
++int sghttperrphase() { return sghttplasterr; }
++
++#ifdef WIN32
++static void sghttpsleepms(int ms) { if(ms > 0) Sleep(ms); }
++#else
++static void sghttpsleepms(int ms)
++{
++    if(ms <= 0) return;
++    struct timespec ts;
++    ts.tv_sec = ms / 1000;
++    ts.tv_nsec = (ms % 1000) * 1000000L;
++    nanosleep(&ts, NULL);
++}
++#endif
 +
 +// One deadline shared across resolve/connect/send/recv for a single call.
 +// enet_time_get() is a plain gettimeofday()/GetTickCount() wrapper inside
@@ -272,23 +339,148 @@
 +    return true;
 +}
 +
++// --- async DNS resolve -----------------------------------------------------
++// Mirrors engine/serverbrowser.cpp's resolverwait: a background thread runs
++// the blocking enet_address_set_host() call so the calling/render thread
++// never blocks on DNS, polled from here under the SAME budget/progress/cancel
++// plumbing as connect/send/recv. Reimplemented self-contained (a raw platform
++// thread, not SDL_Thread) so this still works under -DSTANDALONE, where
++// cube.h does not pull in SDL. Only one thread is spawned per call - sghttp
++// calls are one-shot requests, not the server browser's continuous ping
++// loop, so a persistent resolver-thread pool is not needed here.
++enum { SGHTTP_RJ_PENDING = 0, SGHTTP_RJ_DONE = 1, SGHTTP_RJ_ABANDONED = 2 };
++
++struct sghttpresolvejob
++{
++    char host[256];
++    ENetAddress address;
++    // Lock-free single-producer (worker)/single-consumer (poller) handoff via
++    // GCC/Clang __atomic builtins (see the file-top comment for why not
++    // <atomic>): whichever side's compare-exchange away from PENDING loses
++    // the race takes ownership of freeing the job - see
++    // sghttpresolvefinish() (worker side, below) and sghttpresolve() (poller
++    // side, further down).
++    int state;
++};
++
++static void sghttpresolvefinish(sghttpresolvejob *job, bool resolved)
++{
++    if(!resolved) job->address.host = ENET_HOST_ANY;
++    int expected = SGHTTP_RJ_PENDING;
++    if(!__atomic_compare_exchange_n(&job->state, &expected, SGHTTP_RJ_DONE, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
++        delete job; // poller already abandoned it
++}
++
++#ifdef WIN32
++static DWORD WINAPI sghttpresolvethread(LPVOID data)
++{
++    sghttpresolvejob *job = (sghttpresolvejob *)data;
++    bool ok = enet_address_set_host(&job->address, job->host) >= 0;
++    sghttpresolvefinish(job, ok);
++    return 0;
++}
++#else
++static void *sghttpresolvethread(void *data)
++{
++    sghttpresolvejob *job = (sghttpresolvejob *)data;
++    bool ok = enet_address_set_host(&job->address, job->host) >= 0;
++    sghttpresolvefinish(job, ok);
++    return NULL;
++}
++#endif
++
++static sghttpresolvejob *sghttpresolvestart(const char *host)
++{
++    sghttpresolvejob *job = new sghttpresolvejob;
++    job->address.host = ENET_HOST_ANY;
++    job->address.port = 0;
++    job->state = SGHTTP_RJ_PENDING; // plain store - no other thread can see `job` until we return it
++    size_t len = strlen(host);
++    if(len >= sizeof(job->host)) len = sizeof(job->host) - 1;
++    memcpy(job->host, host, len);
++    job->host[len] = '\0';
++
++#ifdef WIN32
++    HANDLE t = CreateThread(NULL, 0, sghttpresolvethread, job, 0, NULL);
++    if(!t) { delete job; return NULL; }
++    CloseHandle(t); // fire-and-forget - the thread itself keeps running
++#else
++    pthread_t t;
++    if(pthread_create(&t, NULL, sghttpresolvethread, job) != 0) { delete job; return NULL; }
++    pthread_detach(t);
++#endif
++    return job;
++}
++
++// Polls under the shared budget, ticking progress each iteration (never the
++// renderer - only the caller's callback). On success, fills *address and
++// frees the job. On timeout/cancel, ABANDONS the job - the worker thread
++// (still resolving in the background) frees it whenever it eventually
++// returns, since the underlying getaddrinfo() call cannot be forcibly
++// interrupted; the calling side still returns within budget either way, so a
++// slow/dead DNS name respects timeoutms/esc-cancel here even though the OS
++// call it is waiting on does not.
++static bool sghttpresolve(const char *host, ENetAddress &address, sghttpbudget &b, sghttpprogress *progress, bool &cancelled)
++{
++    sghttpresolvejob *job = sghttpresolvestart(host);
++    if(!job) return false;
++
++    for(;;)
++    {
++        if(__atomic_load_n(&job->state, __ATOMIC_SEQ_CST) == SGHTTP_RJ_DONE)
++        {
++            bool ok = job->address.host != ENET_HOST_ANY;
++            if(ok) address.host = job->address.host;
++            delete job;
++            return ok;
++        }
++
++        int left = b.remaining();
++        if(left <= 0 || !sghttptick(progress, 0, 0, cancelled))
++        {
++            int expected = SGHTTP_RJ_PENDING;
++            if(!__atomic_compare_exchange_n(&job->state, &expected, SGHTTP_RJ_ABANDONED, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
++            {
++                // worker finished right at this instant - we own cleanup now
++                bool ok = job->address.host != ENET_HOST_ANY;
++                if(ok) address.host = job->address.host;
++                delete job;
++                return ok;
++            }
++            return false; // abandoned; the worker thread frees it later
++        }
++
++        sghttpsleepms(min(left, 20));
++    }
++}
++// --- end async DNS resolve ---------------------------------------------
++
 +static ENetSocket sghttpconnect(const char *host, int port, sghttpbudget &b, sghttpprogress *progress, bool &cancelled)
 +{
 +    ENetAddress address;
 +    address.host = ENET_HOST_ANY;
 +    address.port = enet_uint16(port);
-+    if(enet_address_set_host(&address, host) < 0) return ENET_SOCKET_NULL;
++    if(!sghttpresolve(host, address, b, progress, cancelled))
++    {
++        if(!cancelled) sghttplasterr = SGHTTP_ERR_RESOLVE;
++        return ENET_SOCKET_NULL;
++    }
 +
 +    ENetSocket sock = enet_socket_create(ENET_SOCKET_TYPE_STREAM);
-+    if(sock == ENET_SOCKET_NULL) return ENET_SOCKET_NULL;
++    if(sock == ENET_SOCKET_NULL) { sghttplasterr = SGHTTP_ERR_CONNECT; return ENET_SOCKET_NULL; }
 +    enet_socket_set_option(sock, ENET_SOCKOPT_NONBLOCK, 1);
 +
-+    if(enet_socket_connect(sock, &address) < 0) { enet_socket_destroy(sock); return ENET_SOCKET_NULL; }
++    if(enet_socket_connect(sock, &address) < 0) { enet_socket_destroy(sock); sghttplasterr = SGHTTP_ERR_CONNECT; return ENET_SOCKET_NULL; }
 +
 +    for(;;)
 +    {
 +        int left = b.remaining();
-+        if(left <= 0 || !sghttptick(progress, 0, 0, cancelled)) { enet_socket_destroy(sock); return ENET_SOCKET_NULL; }
++        if(left <= 0 || !sghttptick(progress, 0, 0, cancelled))
++        {
++            enet_socket_destroy(sock);
++            if(!cancelled) sghttplasterr = SGHTTP_ERR_CONNECT;
++            return ENET_SOCKET_NULL;
++        }
 +        enet_uint32 events = ENET_SOCKET_WAIT_SEND | ENET_SOCKET_WAIT_RECEIVE;
 +        if(enet_socket_wait(sock, &events, min(left, 250)) >= 0 && events)
 +        {
@@ -296,6 +488,7 @@
 +            if(enet_socket_get_option(sock, ENET_SOCKOPT_ERROR, &error) < 0 || error)
 +            {
 +                enet_socket_destroy(sock);
++                sghttplasterr = SGHTTP_ERR_CONNECT;
 +                return ENET_SOCKET_NULL;
 +            }
 +            return sock;
@@ -309,7 +502,11 @@
 +    while(sentlen < len)
 +    {
 +        int left = b.remaining();
-+        if(left <= 0 || !sghttptick(progress, sentlen, len, cancelled)) return false;
++        if(left <= 0 || !sghttptick(progress, sentlen, len, cancelled))
++        {
++            if(!cancelled) sghttplasterr = SGHTTP_ERR_SEND;
++            return false;
++        }
 +        enet_uint32 events = ENET_SOCKET_WAIT_SEND;
 +        if(enet_socket_wait(sock, &events, min(left, 250)) >= 0 && events)
 +        {
@@ -317,11 +514,22 @@
 +            buf.data = (void *)(data + sentlen);
 +            buf.dataLength = len - sentlen;
 +            int sent = enet_socket_send(sock, NULL, &buf, 1);
-+            if(sent < 0) return false;
++            if(sent < 0) { sghttplasterr = SGHTTP_ERR_SEND; return false; }
 +            sentlen += sent;
 +        }
 +    }
-+    return sghttptick(progress, sentlen, len, cancelled);
++    // One last tick so the caller sees 100% and gets a final cancel check
++    // before recv begins. sghttptick only ever returns false via a genuine
++    // cancel (it sets `cancelled` itself), so the `!cancelled` guard here
++    // never fires in that branch - it only matters if a future edit adds a
++    // non-cancel false path to sghttptick, so both callers here stay correct
++    // by construction rather than by the current call graph's shape.
++    if(!sghttptick(progress, sentlen, len, cancelled))
++    {
++        if(!cancelled) sghttplasterr = SGHTTP_ERR_SEND;
++        return false;
++    }
++    return true;
 +}
 +
 +// offset of the first body byte just past the blank line, or -1 if the
@@ -378,7 +586,11 @@
 +        int left = b.remaining();
 +        int bodygot = headerend >= 0 ? raw.length() - headerend : 0;
 +        int bodytotal = headerend >= 0 ? contentlength : -1;
-+        if(left <= 0 || !sghttptick(progress, bodygot, bodytotal, cancelled)) return false;
++        if(left <= 0 || !sghttptick(progress, bodygot, bodytotal, cancelled))
++        {
++            if(!cancelled) sghttplasterr = SGHTTP_ERR_RECV;
++            return false;
++        }
 +
 +        enet_uint32 events = ENET_SOCKET_WAIT_RECEIVE;
 +        if(enet_socket_wait(sock, &events, min(left, 250)) >= 0 && events)
@@ -388,7 +600,11 @@
 +            buf.data = raw.getbuf() + raw.length();
 +            buf.dataLength = raw.capacity() - raw.length();
 +            int recv = enet_socket_receive(sock, NULL, &buf, 1);
-+            if(recv <= 0) return headerend >= 0; // peer closed - ok if headers arrived
++            if(recv <= 0)
++            {
++                if(headerend < 0) sghttplasterr = SGHTTP_ERR_RECV; // closed before headers ever arrived
++                return headerend >= 0;
++            }
 +            raw.advance(recv);
 +        }
 +    }
@@ -397,6 +613,8 @@
 +static int sghttprequest(const char *host, int port, const char *reqhead, int reqheadlen,
 +                          const char *body, int bodylen, vector<uchar> &out, int timeoutms, sghttpprogress *progress)
 +{
++    sghttplasterr = SGHTTP_ERR_NONE;
++
 +    sghttpbudget b(timeoutms);
 +    bool cancelled = false;
 +
@@ -419,7 +637,8 @@
 +    enet_socket_destroy(sock);
 +
 +    if(cancelled) return -1;
-+    if(!recvok || headerend < 0 || status <= 0) return 0;
++    if(!recvok) return 0; // sghttprecv already recorded SGHTTP_ERR_RECV
++    if(status <= 0) { sghttplasterr = SGHTTP_ERR_BADREPLY; return 0; }
 +
 +    int bodygot = raw.length() - headerend;
 +    if(contentlength >= 0) bodygot = min(bodygot, contentlength);
