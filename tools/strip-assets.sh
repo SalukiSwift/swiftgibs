@@ -64,4 +64,10 @@ find "$STAGE/packages" -type d \( \
 find "$STAGE/packages" -iname '*.ogg' -not -path '*/sounds/*' -delete
 find "$STAGE/packages" -iname '*.dds' -delete
 
+# 6) drop sound files nothing references (list maintained by tools/scan-dead-sounds.sh)
+while read -r dead; do
+  [ -z "$dead" ] && continue
+  rm -f "$STAGE/$dead"
+done < "$(dirname "$0")/dead-sounds.txt"
+
 echo "stage size: $(du -sh "$STAGE" | cut -f1)"
