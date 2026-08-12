@@ -1,0 +1,325 @@
+--- a/Makefile
++++ b/Makefile
+@@ -126,12 +126,14 @@
+ 	fpsgame/client.o \
+ 	fpsgame/entities.o \
+ 	fpsgame/fps.o \
++	fpsgame/mapstream.o \
+ 	fpsgame/monster.o \
+ 	fpsgame/movable.o \
+ 	fpsgame/render.o \
+ 	fpsgame/scoreboard.o \
+ 	fpsgame/server.o \
+ 	fpsgame/sghttp.o \
++	fpsgame/sgsha256.o \
+ 	fpsgame/waypoint.o \
+ 	fpsgame/weapon.o
+ 
+--- a/fpsgame/fps.cpp
++++ b/fpsgame/fps.cpp
+@@ -1,5 +1,6 @@
+ #include "game.h"
+ #include "texture.h"
++#include "mapstream.h"   // SwiftGibs map streaming (Task 4): manifest load/lookup
+ 
+ namespace game
+ {
+@@ -2744,6 +2745,8 @@
+         execident("playsong");
+ 
+         execfile("auth.cfg", false);
++
++        loadmapmanifest();   // SwiftGibs map streaming (Task 4): read data/mapmanifest.cfg if the bundle ships one, silent no-op otherwise
+     }
+ }
+ 
+--- /dev/null
++++ b/fpsgame/mapstream.h
+@@ -0,0 +1,22 @@
++// mapstream.h: shipped map manifest - format, load, lookup.
++//
++// data/mapmanifest.cfg format - one line per map, space-separated:
++//   <name> <ogzbytes> <ogzsha256hex> [<wptbytes> <wptsha256hex>]
++// Generated offline by build/make-map-manifest.sh from the official 2020
++// data. wptsize 0 means the map has no waypoint file.
++//
++// This is the load/lookup slice only (Task 4) - later tasks add the actual
++// fetch/stream/cache machinery that consumes these entries to pull maps on
++// demand instead of shipping them all in the bundle.
++
++#ifndef __MAPSTREAM_H__
++#define __MAPSTREAM_H__
++
++#include "cube.h"
++
++struct mapmanifestentry { string name; int ogzsize; string ogzsha; int wptsize; string wptsha; }; // wptsize 0 = no wpt
++
++void loadmapmanifest();                                   // reads data/mapmanifest.cfg, silent no-op if absent
++const mapmanifestentry *mapmanifestfind(const char *name);
++
++#endif
+--- /dev/null
++++ b/fpsgame/mapstream.cpp
+@@ -0,0 +1,54 @@
++// mapstream.cpp: load + look up the shipped map manifest (data/mapmanifest.cfg).
++// See mapstream.h for the on-disk line format. This is the "load/lookup
++// only" slice (Task 4) - later tasks add the fetch/stream/cache machinery
++// that actually uses these entries to pull maps on demand.
++
++#include "cube.h"
++#include "mapstream.h"
++
++static vector<mapmanifestentry> mapmanifest;
++
++void loadmapmanifest()
++{
++    mapmanifest.setsize(0);
++
++    stream *f = openfile("data/mapmanifest.cfg", "r");
++    if(!f) return;   // silent no-op - not every bundle ships a manifest (or streams maps at all)
++
++    string line;
++    while(f->getline(line, sizeof(line)))
++    {
++        string namebuf, oshabuf, wshabuf;
++        int ogzsize = 0, wptsize = 0;
++        namebuf[0] = oshabuf[0] = wshabuf[0] = '\0';
++        int got = sscanf(line, "%259s %d %259s %d %259s", namebuf, &ogzsize, oshabuf, &wptsize, wshabuf);
++        if(got < 3) continue;   // blank/malformed line - skip rather than abort the whole manifest
++
++        mapmanifestentry &e = mapmanifest.add();
++        copystring(e.name, namebuf);
++        e.ogzsize = ogzsize;
++        copystring(e.ogzsha, oshabuf);
++        if(got >= 5) { e.wptsize = wptsize; copystring(e.wptsha, wshabuf); }
++        else { e.wptsize = 0; e.wptsha[0] = '\0'; }
++    }
++
++    f->close();
++    delete f;
++}
++
++const mapmanifestentry *mapmanifestfind(const char *name)
++{
++    loopv(mapmanifest) if(!strcmp(mapmanifest[i].name, name)) return &mapmanifest[i];
++    return NULL;
++}
++
++// SwiftGibs debug command: /mapmanifeststat [name] - prints how many
++// entries loaded plus a named lookup (defaults to fdm6 when no arg given),
++// eg. "331 maps, fdm6: 0.6MB+wpt".
++ICOMMAND(mapmanifeststat, "s", (char *name),
++{
++    const char *lookup = name[0] ? name : "fdm6";
++    const mapmanifestentry *e = mapmanifestfind(lookup);
++    if(!e) { conoutf("%d maps, %s: not found", mapmanifest.length(), lookup); return; }
++    conoutf("%d maps, %s: %.1fMB%s", mapmanifest.length(), lookup, e->ogzsize/1048576.0f, e->wptsize > 0 ? "+wpt" : "");
++});
+--- /dev/null
++++ b/fpsgame/sgsha256.h
+@@ -0,0 +1,30 @@
++// sgsha256.h: vendored public-domain SHA-256.
++//
++// The algorithm/implementation is derived from Brad Conte's public-domain
++// SHA-256 (https://github.com/B-Con/crypto-algorithms, sha256.h/sha256.c),
++// released by the author into the public domain - see the provenance/
++// license note at the top of sgsha256.cpp for the exact dedication text.
++// Renamed to the sgsha256_* prefix and wrapped behind the single hex-digest
++// entry point below; the compression core is the standard FIPS 180-4
++// SHA-256 algorithm, unmodified.
++//
++// Deliberately has NO engine includes (no cube.h/tools.h/anything else from
++// this codebase) so this header+source pair compiles standalone with plain
++// g++ - tools/test-manifest.sh depends on that to verify the two FIPS 180-4
++// test vectors in isolation, outside the full engine build.
++
++#ifndef __SGSHA256_H__
++#define __SGSHA256_H__
++
++#ifndef _TOOLS_H
++// shared/tools.h (if already included earlier in this translation unit -
++// true for every real engine .cpp) already provides `uchar`. Only define
++// our own when building standalone, where tools.h is never pulled in.
++typedef unsigned char uchar;
++#endif
++
++// Writes the 64 lowercase hex chars + NUL terminator of the SHA-256 digest
++// of data[0..len) into out65.
++void sgsha256hex(const uchar *data, int len, char out65[65]);
++
++#endif
+--- /dev/null
++++ b/fpsgame/sgsha256.cpp
+@@ -0,0 +1,172 @@
++// sgsha256.cpp: vendored public-domain SHA-256.
++//
++// Derived from Brad Conte's public-domain implementation:
++//   https://github.com/B-Con/crypto-algorithms  (sha256.c / sha256.h)
++//
++// Original license text (from that repository's LICENSE, reproduced here
++// per its own request to keep the dedication with the code):
++//
++//   Author: Brad Conte (brad AT bradconte.com)
++//   This code is released into the public domain free of any restrictions.
++//   The author requests acknowledgement if the code is used, but does not
++//   require it.
++//
++// The compression core below is the unmodified, standard FIPS 180-4 SHA-256
++// algorithm; only names were prefixed with sgsha256_ to avoid clashing with
++// anything else in this codebase, and everything except the single
++// sgsha256hex() entry point declared in sgsha256.h is kept internal (static)
++// to this file.
++//
++// Deliberately has ZERO engine includes - no cube.h, no tools.h, nothing
++// from the rest of this codebase - only the standard C headers below. This
++// is what lets tools/test-manifest.sh compile+run it with plain g++,
++// independent of the full engine build, to verify the FIPS test vectors.
++
++#include "sgsha256.h"
++#include <string.h>
++
++typedef unsigned int sgsha256_u32;
++
++#define SGSHA256_DIGEST_BYTES 32   // 256 bits
++
++struct sgsha256_ctx
++{
++    unsigned char data[64];
++    sgsha256_u32 datalen;
++    unsigned long long bitlen;
++    sgsha256_u32 state[8];
++};
++
++static const sgsha256_u32 sgsha256_k[64] =
++{
++    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
++    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
++    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
++    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
++    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
++    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
++    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
++    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
++};
++
++#define SGSHA256_ROTLEFT(a,b)  (((a) << (b)) | ((a) >> (32-(b))))
++#define SGSHA256_ROTRIGHT(a,b) (((a) >> (b)) | ((a) << (32-(b))))
++
++#define SGSHA256_CH(x,y,z)  (((x) & (y)) ^ (~(x) & (z)))
++#define SGSHA256_MAJ(x,y,z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
++#define SGSHA256_EP0(x) (SGSHA256_ROTRIGHT(x,2)  ^ SGSHA256_ROTRIGHT(x,13) ^ SGSHA256_ROTRIGHT(x,22))
++#define SGSHA256_EP1(x) (SGSHA256_ROTRIGHT(x,6)  ^ SGSHA256_ROTRIGHT(x,11) ^ SGSHA256_ROTRIGHT(x,25))
++#define SGSHA256_SIG0(x) (SGSHA256_ROTRIGHT(x,7) ^ SGSHA256_ROTRIGHT(x,18) ^ ((x) >> 3))
++#define SGSHA256_SIG1(x) (SGSHA256_ROTRIGHT(x,17) ^ SGSHA256_ROTRIGHT(x,19) ^ ((x) >> 10))
++
++static void sgsha256_transform(sgsha256_ctx *ctx, const unsigned char data[])
++{
++    sgsha256_u32 a, b, c, d, e, f, g, h, i, j, t1, t2, m[64];
++
++    for(i = 0, j = 0; i < 16; ++i, j += 4)
++        m[i] = ((sgsha256_u32)data[j] << 24) | ((sgsha256_u32)data[j+1] << 16) |
++               ((sgsha256_u32)data[j+2] << 8)  | ((sgsha256_u32)data[j+3]);
++    for( ; i < 64; ++i)
++        m[i] = SGSHA256_SIG1(m[i-2]) + m[i-7] + SGSHA256_SIG0(m[i-15]) + m[i-16];
++
++    a = ctx->state[0]; b = ctx->state[1]; c = ctx->state[2]; d = ctx->state[3];
++    e = ctx->state[4]; f = ctx->state[5]; g = ctx->state[6]; h = ctx->state[7];
++
++    for(i = 0; i < 64; ++i)
++    {
++        t1 = h + SGSHA256_EP1(e) + SGSHA256_CH(e,f,g) + sgsha256_k[i] + m[i];
++        t2 = SGSHA256_EP0(a) + SGSHA256_MAJ(a,b,c);
++        h = g; g = f; f = e; e = d + t1;
++        d = c; c = b; b = a; a = t1 + t2;
++    }
++
++    ctx->state[0] += a; ctx->state[1] += b; ctx->state[2] += c; ctx->state[3] += d;
++    ctx->state[4] += e; ctx->state[5] += f; ctx->state[6] += g; ctx->state[7] += h;
++}
++
++static void sgsha256_init(sgsha256_ctx *ctx)
++{
++    ctx->datalen = 0;
++    ctx->bitlen = 0;
++    ctx->state[0] = 0x6a09e667; ctx->state[1] = 0xbb67ae85;
++    ctx->state[2] = 0x3c6ef372; ctx->state[3] = 0xa54ff53a;
++    ctx->state[4] = 0x510e527f; ctx->state[5] = 0x9b05688c;
++    ctx->state[6] = 0x1f83d9ab; ctx->state[7] = 0x5be0cd19;
++}
++
++static void sgsha256_update(sgsha256_ctx *ctx, const unsigned char data[], size_t len)
++{
++    for(size_t i = 0; i < len; ++i)
++    {
++        ctx->data[ctx->datalen] = data[i];
++        ctx->datalen++;
++        if(ctx->datalen == 64)
++        {
++            sgsha256_transform(ctx, ctx->data);
++            ctx->bitlen += 512;
++            ctx->datalen = 0;
++        }
++    }
++}
++
++static void sgsha256_final(sgsha256_ctx *ctx, unsigned char hash[])
++{
++    sgsha256_u32 i = ctx->datalen;
++
++    // pad
++    if(ctx->datalen < 56)
++    {
++        ctx->data[i++] = 0x80;
++        while(i < 56) ctx->data[i++] = 0x00;
++    }
++    else
++    {
++        ctx->data[i++] = 0x80;
++        while(i < 64) ctx->data[i++] = 0x00;
++        sgsha256_transform(ctx, ctx->data);
++        memset(ctx->data, 0, 56);
++    }
++
++    // append the original message length, in bits, big-endian
++    ctx->bitlen += (unsigned long long)ctx->datalen * 8;
++    ctx->data[63] = (unsigned char)(ctx->bitlen);
++    ctx->data[62] = (unsigned char)(ctx->bitlen >> 8);
++    ctx->data[61] = (unsigned char)(ctx->bitlen >> 16);
++    ctx->data[60] = (unsigned char)(ctx->bitlen >> 24);
++    ctx->data[59] = (unsigned char)(ctx->bitlen >> 32);
++    ctx->data[58] = (unsigned char)(ctx->bitlen >> 40);
++    ctx->data[57] = (unsigned char)(ctx->bitlen >> 48);
++    ctx->data[56] = (unsigned char)(ctx->bitlen >> 56);
++    sgsha256_transform(ctx, ctx->data);
++
++    // state is stored big-endian; convert to a big-endian byte digest
++    for(i = 0; i < 4; ++i)
++    {
++        hash[i]      = (unsigned char)((ctx->state[0] >> (24 - i * 8)) & 0xff);
++        hash[i + 4]  = (unsigned char)((ctx->state[1] >> (24 - i * 8)) & 0xff);
++        hash[i + 8]  = (unsigned char)((ctx->state[2] >> (24 - i * 8)) & 0xff);
++        hash[i + 12] = (unsigned char)((ctx->state[3] >> (24 - i * 8)) & 0xff);
++        hash[i + 16] = (unsigned char)((ctx->state[4] >> (24 - i * 8)) & 0xff);
++        hash[i + 20] = (unsigned char)((ctx->state[5] >> (24 - i * 8)) & 0xff);
++        hash[i + 24] = (unsigned char)((ctx->state[6] >> (24 - i * 8)) & 0xff);
++        hash[i + 28] = (unsigned char)((ctx->state[7] >> (24 - i * 8)) & 0xff);
++    }
++}
++
++void sgsha256hex(const uchar *data, int len, char out65[65])
++{
++    sgsha256_ctx ctx;
++    unsigned char hash[SGSHA256_DIGEST_BYTES];
++
++    sgsha256_init(&ctx);
++    sgsha256_update(&ctx, (const unsigned char *)data, (size_t)(len < 0 ? 0 : len));
++    sgsha256_final(&ctx, hash);
++
++    static const char hexdigits[] = "0123456789abcdef";
++    for(int i = 0; i < SGSHA256_DIGEST_BYTES; ++i)
++    {
++        out65[i*2]     = hexdigits[(hash[i] >> 4) & 0xf];
++        out65[i*2 + 1] = hexdigits[hash[i] & 0xf];
++    }
++    out65[64] = '\0';
++}
