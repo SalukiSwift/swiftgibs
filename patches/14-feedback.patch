@@ -1,20 +1,21 @@
 --- a/engine/serverbrowser.cpp
 +++ b/engine/serverbrowser.cpp
-@@ -749,3 +749,286 @@
+@@ -749,3 +749,168 @@
      delete f;
  }
  
++#include "sghttp.h"
 +
 +// --- SwiftGibs: in-game feedback -> plain-HTTP POST to the feedback relay ---
-+// Reuses the master-server raw-TCP pattern above (resolverwait +
-+// connectwithtimeout + enet wait loops): blocks with a progress bar, esc
-+// aborts, bounded by FEEDBACKLIMIT. Plaintext on purpose - the engine has no
-+// TLS and nothing secret crosses this hop (the GitHub token stays server-side).
-+// The POST is multipart/form-data: text fields (feedback + telemetry the
-+// engine can see: map, mode, position, fps) plus an optional JPEG screenshot
-+// taken by the F8 hotkey (screenshot/feedbackshot.jpg). Match stats arrive as
-+// the script-assembled "info" argument (frags/deaths/... commands live in the
-+// game dll side, not here).
++// Transport (resolve/connect/send/recv, header + Content-Length parsing) now
++// lives in fpsgame/sghttp.cpp - this is just request assembly and the UI loop
++// (progress bar + esc-to-abort) that drives it. Plaintext on purpose - the
++// engine has no TLS and nothing secret crosses this hop (the GitHub token
++// stays server-side). The POST is multipart/form-data: text fields (feedback
++// + telemetry the engine can see: map, mode, position, fps) plus an optional
++// JPEG screenshot taken by the F8 hotkey (screenshot/feedbackshot.jpg). Match
++// stats arrive as the script-assembled "info" argument (frags/deaths/...
++// commands live in the game dll side, not here).
 +
 +SVAR(feedbackhost, "salukiswift.com");
 +VAR(feedbackport, 1, 8300, 0xFFFF);
@@ -35,6 +36,19 @@
 +    out.put(value, strlen(value));
 +    out.put("\r\n", 2);
 +}
++
++// Drives sghttppost's progress bar - the one renderprogress/interceptkey loop
++// left in this file. sghttp itself never touches either.
++struct feedbackprogress : sghttpprogress
++{
++    const char *text;
++    feedbackprogress(const char *text) : text(text) {}
++    bool tick(int got, int total)
++    {
++        renderprogress(total > 0 ? float(got)/total : 0.0f, text);
++        return !interceptkey(SDLK_ESCAPE);
++    }
++};
 +
 +void sendfeedback(const char *name, const char *category, const char *version, const char *text, int shot, const char *info)
 +{
@@ -87,104 +101,23 @@
 +    }
 +    body.put("--" FEEDBACKBOUNDARY "--\r\n", strlen("--" FEEDBACKBOUNDARY "--\r\n"));
 +
-+    ENetAddress address;
-+    address.host = ENET_HOST_ANY;
-+    address.port = feedbackport;
-+    if(!resolverwait(feedbackhost, &address))
-+    {
-+        feedbackstatus("could not resolve the feedback server");
-+        return;
-+    }
-+    ENetSocket sock = enet_socket_create(ENET_SOCKET_TYPE_STREAM);
-+    if(sock == ENET_SOCKET_NULL) { feedbackstatus("could not open a socket"); return; }
-+    enet_socket_set_option(sock, ENET_SOCKOPT_NONBLOCK, 1);
-+    if(connectwithtimeout(sock, feedbackhost, address))
-+    {
-+        enet_socket_destroy(sock);
-+        feedbackstatus("could not reach the feedback server");
-+        return;
-+    }
-+
-+    vector<char> req;
-+    defformatstring(header,
-+        "POST /feedback HTTP/1.1\r\n"
-+        "Host: %s\r\n"
-+        "User-Agent: SwiftGibs\r\n"
-+        "Content-Type: multipart/form-data; boundary=" FEEDBACKBOUNDARY "\r\n"
-+        "Content-Length: %d\r\n"
-+        "Connection: close\r\n"
-+        "\r\n",
-+        feedbackhost, body.length());
-+    req.put(header, strlen(header));
-+    req.put(body.getbuf(), body.length());
-+
 +    defformatstring(progresstext, "sending feedback to %s... (esc to abort)", feedbackhost);
++    feedbackprogress fp(progresstext);
 +    renderprogress(0, progresstext);
 +
-+    int starttime = SDL_GetTicks(), timeout = 0;
-+    const char *out = req.getbuf();
-+    int outlen = req.length();
-+    ENetBuffer buf;
-+    while(outlen > 0)
-+    {
-+        enet_uint32 events = ENET_SOCKET_WAIT_SEND;
-+        if(enet_socket_wait(sock, &events, 250) >= 0 && events)
-+        {
-+            buf.data = (void *)out;
-+            buf.dataLength = outlen;
-+            int sent = enet_socket_send(sock, NULL, &buf, 1);
-+            if(sent < 0) break;
-+            out += sent;
-+            outlen -= sent;
-+        }
-+        timeout = SDL_GetTicks() - starttime;
-+        renderprogress(min(float(timeout)/FEEDBACKLIMIT, 1.0f), progresstext);
-+        if(interceptkey(SDLK_ESCAPE)) timeout = FEEDBACKLIMIT + 1;
-+        if(timeout > FEEDBACKLIMIT) break;
-+    }
++    vector<uchar> out;
++    int code = sghttppost(feedbackhost, feedbackport, "/feedback", "multipart/form-data; boundary=" FEEDBACKBOUNDARY, body, out, FEEDBACKLIMIT, &fp);
 +
-+    vector<char> data;
-+    if(outlen <= 0) for(;;)
-+    {
-+        enet_uint32 events = ENET_SOCKET_WAIT_RECEIVE;
-+        if(enet_socket_wait(sock, &events, 250) >= 0 && events)
-+        {
-+            if(data.length() >= data.capacity()) data.reserve(4096);
-+            buf.data = data.getbuf() + data.length();
-+            buf.dataLength = data.capacity() - data.length();
-+            int recv = enet_socket_receive(sock, NULL, &buf, 1);
-+            if(recv <= 0) break;
-+            data.advance(recv);
-+        }
-+        timeout = SDL_GetTicks() - starttime;
-+        renderprogress(min(float(timeout)/FEEDBACKLIMIT, 1.0f), progresstext);
-+        if(interceptkey(SDLK_ESCAPE)) timeout = FEEDBACKLIMIT + 1;
-+        if(timeout > FEEDBACKLIMIT) break;
-+    }
-+    enet_socket_destroy(sock);
++    if(code == -1) { feedbackstatus("aborted"); return; }
++    if(code == 0) { feedbackstatus("could not reach the feedback server"); return; }
 +
-+    if(outlen > 0 || data.empty())
-+    {
-+        feedbackstatus(timeout > FEEDBACKLIMIT ? "timed out - try again later" : "no reply from the feedback server");
-+        return;
-+    }
-+    data.add('\0');
++    out.add('\0');
++    char *msg = (char *)out.getbuf();
++    char *end = strpbrk(msg, "\r\n");
++    if(end) *end = '\0';
 +
-+    int code = 0;
-+    if(sscanf(data.getbuf(), "HTTP/%*s %d", &code) != 1)
-+    {
-+        feedbackstatus("bad reply from the feedback server");
-+        return;
-+    }
-+    char *msg = strstr(data.getbuf(), "\r\n\r\n");
-+    if(msg)
-+    {
-+        msg += 4;
-+        char *end = strpbrk(msg, "\r\n");
-+        if(end) *end = '\0';
-+    }
-+    if(code == 200) feedbackstatus(msg && msg[0] ? msg : "sent - thank you!");
-+    else if(msg && msg[0] && code >= 400 && code < 500) feedbackstatus(msg);
++    if(code == 200) feedbackstatus(msg[0] ? msg : "sent - thank you!");
++    else if(msg[0] && code >= 400 && code < 500) feedbackstatus(msg);
 +    else
 +    {
 +        defformatstring(err, "feedback server error (%d)", code);
@@ -198,8 +131,10 @@
 +// Asks the relay for the latest release tag (GET /version - the engine cannot
 +// reach GitHub's HTTPS itself). Deliberately SILENT and short-budget: it runs
 +// during init, so no progress UI and no error spam - a dead relay or an
-+// offline box just means no update banner. Results land in the aliases
-+// swiftgibsupdate (0/1) + swiftgibslatest, which the main-menu gui reads.
++// offline box just means no update banner (passing no sghttpprogress to
++// sghttpget below is what keeps it silent - sghttp never renders on its own).
++// Results land in the aliases swiftgibsupdate (0/1) + swiftgibslatest, which
++// the main-menu gui reads.
 +#define CHECKUPDLIMIT 2500
 +
 +static bool parseversion(const char *s, int &major, int &minor, int &patch)
@@ -214,64 +149,11 @@
 +    alias("swiftgibsupdate", "0");
 +    alias("swiftgibslatest", "");
 +
-+    ENetAddress address;
-+    address.host = ENET_HOST_ANY;
-+    address.port = feedbackport;
-+    if(!resolverwait(feedbackhost, &address)) return;
-+    ENetSocket sock = enet_socket_create(ENET_SOCKET_TYPE_STREAM);
-+    if(sock == ENET_SOCKET_NULL) return;
-+    enet_socket_set_option(sock, ENET_SOCKOPT_NONBLOCK, 1);
++    vector<uchar> out;
++    if(sghttpget(feedbackhost, feedbackport, "/version", out, CHECKUPDLIMIT) != 200) return;
++    out.add('\0');
 +
-+    // silent bounded connect (connectwithtimeout would paint a 20s progress bar)
-+    if(enet_socket_connect(sock, &address) < 0) { enet_socket_destroy(sock); return; }
-+    enet_uint32 events = ENET_SOCKET_WAIT_SEND | ENET_SOCKET_WAIT_RECEIVE;
-+    if(enet_socket_wait(sock, &events, 2000) < 0 || !events) { enet_socket_destroy(sock); return; }
-+    int connerror = 0;
-+    if(enet_socket_get_option(sock, ENET_SOCKOPT_ERROR, &connerror) < 0 || connerror) { enet_socket_destroy(sock); return; }
-+
-+    defformatstring(reqstr, "GET /version HTTP/1.1\r\nHost: %s\r\nUser-Agent: SwiftGibs\r\nConnection: close\r\n\r\n", feedbackhost);
-+    int starttime = SDL_GetTicks();
-+    const char *out = reqstr;
-+    int outlen = strlen(reqstr);
-+    ENetBuffer buf;
-+    while(outlen > 0)
-+    {
-+        enet_uint32 ev = ENET_SOCKET_WAIT_SEND;
-+        if(enet_socket_wait(sock, &ev, 250) >= 0 && ev)
-+        {
-+            buf.data = (void *)out;
-+            buf.dataLength = outlen;
-+            int sent = enet_socket_send(sock, NULL, &buf, 1);
-+            if(sent < 0) break;
-+            out += sent;
-+            outlen -= sent;
-+        }
-+        if(SDL_GetTicks() - starttime > CHECKUPDLIMIT) break;
-+    }
-+    vector<char> data;
-+    if(outlen <= 0) for(;;)
-+    {
-+        enet_uint32 ev = ENET_SOCKET_WAIT_RECEIVE;
-+        if(enet_socket_wait(sock, &ev, 250) >= 0 && ev)
-+        {
-+            if(data.length() >= data.capacity()) data.reserve(4096);
-+            buf.data = data.getbuf() + data.length();
-+            buf.dataLength = data.capacity() - data.length();
-+            int recv = enet_socket_receive(sock, NULL, &buf, 1);
-+            if(recv <= 0) break;
-+            data.advance(recv);
-+        }
-+        if(SDL_GetTicks() - starttime > CHECKUPDLIMIT) break;
-+    }
-+    enet_socket_destroy(sock);
-+    if(outlen > 0 || data.empty()) return;
-+    data.add('\0');
-+
-+    int code = 0;
-+    if(sscanf(data.getbuf(), "HTTP/%*s %d", &code) != 1 || code != 200) return;
-+    char *tag = strstr(data.getbuf(), "\r\n\r\n");
-+    if(!tag) return;
-+    tag += 4;
++    char *tag = (char *)out.getbuf();
 +    char *end = strpbrk(tag, "\r\n");
 +    if(end) *end = '\0';
 +
@@ -313,3 +195,261 @@
      if(!hidehud && !mainmenu)
      {
          if(!hidestats)
+--- /dev/null
++++ b/fpsgame/sghttp.h
+@@ -0,0 +1,30 @@
++// sghttp.h: minimal blocking HTTP/1.1 GET/POST transport over raw enet
++// sockets. Extracted from the feedback-relay code (patch 14) so later
++// features (eg. map streaming) can reuse the same transport.
++//
++// Deliberately engine-light: this header only needs shared/cube.h (for
++// vector<>/uchar and the enet/zlib types cube.h itself requires) - no
++// engine.h, no renderer, no UI. Under -DSTANDALONE (the same flag the
++// dedicated server already builds with) cube.h skips SDL/GL entirely, so
++// sghttp.cpp builds and links against nothing but enet + zlib; that is how
++// it stays testable on its own. Callers own all progress display and
++// cancellation (eg. renderprogress/interceptkey) through the sghttpprogress
++// callback; sghttp itself never touches them.
++
++#ifndef __SGHTTP_H__
++#define __SGHTTP_H__
++
++#include "cube.h"
++
++struct sghttpprogress { virtual bool tick(int got, int total) = 0; };  // false = cancel
++
++// Blocking raw-HTTP/1.1 GET (Connection: close). Returns HTTP status (200...), 0 on
++// connect/socket failure, -1 on cancel. Body bytes are appended to `out` (headers stripped,
++// Content-Length honored when present). Progress ticked from the CALLING thread.
++int sghttpget(const char *host, int port, const char *path, vector<uchar> &out,
++              int timeoutms, sghttpprogress *progress = NULL);
++
++// Blocking raw-HTTP/1.1 POST (Connection: close). Same return convention as sghttpget.
++int sghttppost(const char *host, int port, const char *path, const char *contenttype, const vector<char> &body, vector<uchar> &out, int timeoutms, sghttpprogress *progress);
++
++#endif
+--- /dev/null
++++ b/fpsgame/sghttp.cpp
+@@ -0,0 +1,212 @@
++// sghttp.cpp: minimal blocking HTTP/1.1 GET/POST transport over raw enet
++// sockets. Shared by the in-game feedback POST and the launch-time
++// update-check GET (see engine/serverbrowser.cpp) - previously each hand-rolled
++// its own resolve/connect/send/recv loop; this file is the one copy.
++//
++// Transport only: name resolution, socket connect, request framing, response
++// header + Content-Length parsing. Never calls renderprogress/interceptkey or
++// any other renderer/UI function - callers drive their own progress bar and
++// cancel key through the sghttpprogress callback passed in. Nothing in here
++// actually touches SDL/GL either (only enet_* calls + cube's vector<>), so a
++// -DSTANDALONE build (same flag the dedicated server already uses) links
++// this file with just enet + zlib, no SDL/GL/X11 needed.
++
++#include <string.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <enet/enet.h>
++#include "sghttp.h"
++
++// One deadline shared across resolve/connect/send/recv for a single call.
++// enet_time_get() is a plain gettimeofday()/GetTickCount() wrapper inside
++// enet - no SDL/cube dependency needed just to track a timeout.
++struct sghttpbudget
++{
++    enet_uint32 deadline;
++    sghttpbudget(int timeoutms) : deadline(enet_time_get() + enet_uint32(timeoutms > 0 ? timeoutms : 0)) {}
++    int remaining() const
++    {
++        enet_uint32 now = enet_time_get();
++        return now >= deadline ? 0 : int(deadline - now);
++    }
++};
++
++// progress is optional (checkupdate's silent GET passes NULL); ticking with
++// no callback always allows continuing, bounded only by the time budget.
++static bool sghttptick(sghttpprogress *progress, int got, int total, bool &cancelled)
++{
++    if(progress && !progress->tick(got, total)) { cancelled = true; return false; }
++    return true;
++}
++
++static ENetSocket sghttpconnect(const char *host, int port, sghttpbudget &b, sghttpprogress *progress, bool &cancelled)
++{
++    ENetAddress address;
++    address.host = ENET_HOST_ANY;
++    address.port = enet_uint16(port);
++    if(enet_address_set_host(&address, host) < 0) return ENET_SOCKET_NULL;
++
++    ENetSocket sock = enet_socket_create(ENET_SOCKET_TYPE_STREAM);
++    if(sock == ENET_SOCKET_NULL) return ENET_SOCKET_NULL;
++    enet_socket_set_option(sock, ENET_SOCKOPT_NONBLOCK, 1);
++
++    if(enet_socket_connect(sock, &address) < 0) { enet_socket_destroy(sock); return ENET_SOCKET_NULL; }
++
++    for(;;)
++    {
++        int left = b.remaining();
++        if(left <= 0 || !sghttptick(progress, 0, 0, cancelled)) { enet_socket_destroy(sock); return ENET_SOCKET_NULL; }
++        enet_uint32 events = ENET_SOCKET_WAIT_SEND | ENET_SOCKET_WAIT_RECEIVE;
++        if(enet_socket_wait(sock, &events, min(left, 250)) >= 0 && events)
++        {
++            int error = 0;
++            if(enet_socket_get_option(sock, ENET_SOCKOPT_ERROR, &error) < 0 || error)
++            {
++                enet_socket_destroy(sock);
++                return ENET_SOCKET_NULL;
++            }
++            return sock;
++        }
++    }
++}
++
++static bool sghttpsend(ENetSocket sock, const char *data, int len, sghttpbudget &b, sghttpprogress *progress, bool &cancelled)
++{
++    int sentlen = 0;
++    while(sentlen < len)
++    {
++        int left = b.remaining();
++        if(left <= 0 || !sghttptick(progress, sentlen, len, cancelled)) return false;
++        enet_uint32 events = ENET_SOCKET_WAIT_SEND;
++        if(enet_socket_wait(sock, &events, min(left, 250)) >= 0 && events)
++        {
++            ENetBuffer buf;
++            buf.data = (void *)(data + sentlen);
++            buf.dataLength = len - sentlen;
++            int sent = enet_socket_send(sock, NULL, &buf, 1);
++            if(sent < 0) return false;
++            sentlen += sent;
++        }
++    }
++    return sghttptick(progress, sentlen, len, cancelled);
++}
++
++// offset of the first body byte just past the blank line, or -1 if the
++// header block has not fully arrived yet.
++static int sghttpheaderend(const char *buf, int len)
++{
++    for(int i = 3; i < len; i++)
++        if(buf[i-3] == '\r' && buf[i-2] == '\n' && buf[i-1] == '\r' && buf[i] == '\n') return i+1;
++    return -1;
++}
++
++static void sghttpparseheaders(const char *buf, int headerlen, int &status, int &contentlength)
++{
++    char *headers = new char[headerlen+1];
++    memcpy(headers, buf, headerlen);
++    headers[headerlen] = '\0';
++
++    status = 0;
++    sscanf(headers, "HTTP/%*s %d", &status);
++
++    contentlength = -1;
++    for(char *line = headers;;)
++    {
++        char *eol = strchr(line, '\n');
++        if(!strncasecmp(line, "Content-Length:", 15)) { contentlength = atoi(line+15); break; }
++        if(!eol) break;
++        line = eol+1;
++    }
++    delete[] headers;
++}
++
++// Reads the raw response into `raw` until the declared Content-Length is
++// satisfied, the peer closes the connection, or the budget runs out. Ticks
++// progress with body bytes received vs Content-Length (-1 while unknown, ie.
++// before the header block has fully arrived, or when the response omits it -
++// matches the old code's read-until-EOF fallback in that case).
++static bool sghttprecv(ENetSocket sock, vector<char> &raw, sghttpbudget &b, sghttpprogress *progress, bool &cancelled,
++                        int &status, int &headerend, int &contentlength)
++{
++    status = 0; headerend = -1; contentlength = -1;
++    for(;;)
++    {
++        if(headerend < 0)
++        {
++            int end = sghttpheaderend(raw.getbuf(), raw.length());
++            if(end >= 0)
++            {
++                headerend = end;
++                sghttpparseheaders(raw.getbuf(), headerend, status, contentlength);
++            }
++        }
++        if(headerend >= 0 && contentlength >= 0 && raw.length() - headerend >= contentlength) return true;
++
++        int left = b.remaining();
++        int bodygot = headerend >= 0 ? raw.length() - headerend : 0;
++        int bodytotal = headerend >= 0 ? contentlength : -1;
++        if(left <= 0 || !sghttptick(progress, bodygot, bodytotal, cancelled)) return false;
++
++        enet_uint32 events = ENET_SOCKET_WAIT_RECEIVE;
++        if(enet_socket_wait(sock, &events, min(left, 250)) >= 0 && events)
++        {
++            if(raw.length() >= raw.capacity()) raw.reserve(4096);
++            ENetBuffer buf;
++            buf.data = raw.getbuf() + raw.length();
++            buf.dataLength = raw.capacity() - raw.length();
++            int recv = enet_socket_receive(sock, NULL, &buf, 1);
++            if(recv <= 0) return headerend >= 0; // peer closed - ok if headers arrived
++            raw.advance(recv);
++        }
++    }
++}
++
++static int sghttprequest(const char *host, int port, const char *reqhead, int reqheadlen,
++                          const char *body, int bodylen, vector<uchar> &out, int timeoutms, sghttpprogress *progress)
++{
++    sghttpbudget b(timeoutms);
++    bool cancelled = false;
++
++    ENetSocket sock = sghttpconnect(host, port, b, progress, cancelled);
++    if(sock == ENET_SOCKET_NULL) return cancelled ? -1 : 0;
++
++    vector<char> req;
++    req.put(reqhead, reqheadlen);
++    if(bodylen > 0) req.put(body, bodylen);
++
++    if(!sghttpsend(sock, req.getbuf(), req.length(), b, progress, cancelled))
++    {
++        enet_socket_destroy(sock);
++        return cancelled ? -1 : 0;
++    }
++
++    vector<char> raw;
++    int status = 0, headerend = -1, contentlength = -1;
++    bool recvok = sghttprecv(sock, raw, b, progress, cancelled, status, headerend, contentlength);
++    enet_socket_destroy(sock);
++
++    if(cancelled) return -1;
++    if(!recvok || headerend < 0 || status <= 0) return 0;
++
++    int bodygot = raw.length() - headerend;
++    if(contentlength >= 0) bodygot = min(bodygot, contentlength);
++    if(bodygot > 0) out.put((uchar *)raw.getbuf() + headerend, bodygot);
++
++    return status;
++}
++
++int sghttpget(const char *host, int port, const char *path, vector<uchar> &out, int timeoutms, sghttpprogress *progress)
++{
++    char head[1024];
++    snprintf(head, sizeof(head), "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: SwiftGibs\r\nConnection: close\r\n\r\n", path, host);
++    return sghttprequest(host, port, head, int(strlen(head)), NULL, 0, out, timeoutms, progress);
++}
++
++int sghttppost(const char *host, int port, const char *path, const char *contenttype, const vector<char> &body, vector<uchar> &out, int timeoutms, sghttpprogress *progress)
++{
++    char head[1024];
++    snprintf(head, sizeof(head),
++        "POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: SwiftGibs\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
++        path, host, contenttype, body.length());
++    return sghttprequest(host, port, head, int(strlen(head)), body.getbuf(), body.length(), out, timeoutms, progress);
++}
+--- a/Makefile
++++ b/Makefile
+@@ -130,6 +130,7 @@
+ 	fpsgame/render.o \
+ 	fpsgame/scoreboard.o \
+ 	fpsgame/server.o \
++	fpsgame/sghttp.o \
+ 	fpsgame/waypoint.o \
+ 	fpsgame/weapon.o
+ 
