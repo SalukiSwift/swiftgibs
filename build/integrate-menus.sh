@@ -5,11 +5,14 @@
 # rows that clash with settings SwiftGibs manages itself (player brightness, forced player models,
 # hit-crosshair markers, the built-in crosshair picker, bilinear filtering, the chat-console checkbox)
 # so a fresh stock data/menus.cfg can never silently ship those foot-guns next to SwiftGibs' own tabs.
+# Also strips the stock singleplayer campaign menu (main-menu "campaign.." button + the campaign/
+# armyofone/privatestansauer guis) - SwiftGibs is multiplayer-instagib-only, so those rows/guis and
+# the bot-only singleplayer maps they point at have no use here.
 # Idempotent (splice + surgery are gated on the same "already integrated" check). The splice heredoc
 # writes to disk immediately, but the surgery heredoc below only writes after all its checks pass, so
 # a run interrupted (or a surgery pattern that failed to match) between the two steps can leave a
 # staged menus.cfg that is spliced but NOT surgered. The tab-splice marker alone is therefore not
-# proof the file is fully integrated: a re-run below re-verifies surgery completion (all six leftover
+# proof the file is fully integrated: a re-run below re-verifies surgery completion (all ten leftover
 # patterns absent and the replacement pointer row present) before trusting the marker, and if the file
 # is spliced-but-not-surgered it completes the surgery step (safe to re-run: its patterns match
 # pre-surgery text) rather than silently reporting success.
@@ -35,6 +38,10 @@ leftovers = [
     b'guibutton "crosshair: "',
     b'guicheckbox "bilinear filtering"',
     b'guicheckbox "chat console" miniconfilter',
+    b'showgui campaign',
+    b'"sp lost"',
+    b'newgui armyofone',
+    b'newgui privatestansauer',
 ]
 pointer = b'guitext "^f4player brightness is tuned for SwiftGibs flat colours"'
 ok = all(b.count(pat) == 0 for pat in leftovers) and b.count(pointer) >= 1
@@ -65,15 +72,17 @@ print("integrate-menus: attached SwiftGibs + Cues + Audio + Clips + Friends tabs
 PY
 fi
 
-# --- Stock options surgery -------------------------------------------------
+# --- Stock options surgery + campaign menu gut ------------------------------
 # Also runs to complete a spliced-but-not-surgered file left behind by an interrupted prior run
 # (see the SPLICE_DONE branch above) - safe to re-run because every pattern below still matches
 # pre-surgery text exactly once in that case.
 # Six stock options rows clash with settings SwiftGibs manages itself (its own player-brightness
 # controls, forced-model/hitmarker/crosshair/filtering behaviour that would otherwise fight the
 # SwiftGibs tabs). Remove/replace them here, on the STAGED copy only, never edit vendor/ or a real
-# install. Every pattern below must match EXACTLY ONCE; a miss means the stock data/menus.cfg changed
-# shape, so this fails loudly (exit 1) rather than silently shipping un-surgered rows.
+# install. Four more entries gut the singleplayer campaign menu (main-menu button + the campaign/
+# armyofone/privatestansauer guis) - SwiftGibs is multiplayer-only. Every pattern below must match
+# EXACTLY ONCE; a miss means the stock data/menus.cfg changed shape, so this fails loudly (exit 1)
+# rather than silently shipping un-surgered rows.
 python3 - "$M" <<'PY'
 import sys
 p = sys.argv[1]
@@ -159,6 +168,49 @@ surgeries = [
     ("console tab: chat console (miniconfilter) checkbox removed", block(
         b'    guicheckbox "chat console" miniconfilter 0x300 0',
     ) + nl, b""),
+    ("main menu: campaign button removed", block(
+        b'        guibutton "campaign.."       "showgui campaign"',
+    ) + nl, b""),
+    ("campaign gui removed", block(
+        b'newgui campaign [',
+        b'    guibutton "start Private Stan Sauer"           "showgui privatestansauer"',
+        b'    guibutton "start An Army Of One"               "showgui armyofone"',
+        b'    guibutton "start Lost"                         "sp lost" "cube"',
+        b'    guibutton "start Meltdown"                     "sp skrsp1" "cube"',
+        b'    guibutton "start Missile Pass"                 "sp crnsp1" "cube"',
+        b'    guibutton "start Level 9"                      "sp level9" "cube"',
+        b'    guibar',
+        b'    guibutton "start DMSP map.."                   "mode -2; showgui maps"',
+        b'    guicheckbox "slow motion"                      "slowmosp"',
+        b'    guitext   "skill (default: 3)"',
+        b'    guislider skill',
+        b']',
+    ) + nl, b""),
+    ("armyofone gui removed", block(
+        b'newgui armyofone [',
+        b'    guilist [',
+        b'        guilist [',
+        b'            guibutton "Part I"   "sp mpsp6a" "cube"',
+        b'            guibutton "Part II"  "sp mpsp6b" "cube"',
+        b'            guibutton "Part III" "sp mpsp6c" "cube"',
+        b'        ]',
+        b'        showmapshot (substr $guirolloveraction 3)',
+        b'    ]',
+        b'] "An Army Of One"',
+    ) + nl, b""),
+    ("privatestansauer gui removed", block(
+        b'newgui privatestansauer [',
+        b'    guilist [',
+        b'        guilist [',
+        b'            guibutton "Run N\' Gun Part I"        "sp mpsp9a" "cube"',
+        b'            guibutton "Run N\' Gun Part II"       "sp mpsp9b" "cube"',
+        b'            guibutton "Run N\' Gun Part III"      "sp mpsp9c" "cube"',
+        b'            guibutton "THE SERIOUSLY BIG VALLEY" "sp mpsp10" "cube"',
+        b'        ]',
+        b'        showmapshot (substr $guirolloveraction 3)',
+        b'    ]',
+        b'] "Private Stan Sauer"',
+    ) + nl, b""),
 ]
 
 for label, old, new in surgeries:
@@ -175,6 +227,10 @@ leftovers = [
     b'guibutton "crosshair: "',
     b'guicheckbox "bilinear filtering"',
     b'guicheckbox "chat console" miniconfilter',
+    b'showgui campaign',
+    b'"sp lost"',
+    b'newgui armyofone',
+    b'newgui privatestansauer',
 ]
 for pat in leftovers:
     n = b.count(pat)
@@ -186,7 +242,8 @@ for keep in (b'guicheckbox "always use team skins" teamskins',
              b'guicheckbox "teammates" teamcrosshair',
              b'guicheckbox "trilinear filtering (mipmaps)" trilinear',
              b'guitext "crosshair size"',
-             b'guitab "SwiftGibs"', b'guitab "Cues"', b'guitab "Audio"', b'guitab "Clips"', b'guitab "Friends"'):
+             b'guitab "SwiftGibs"', b'guitab "Cues"', b'guitab "Audio"', b'guitab "Clips"', b'guitab "Friends"',
+             b'] "bot match"'):
     assert b.count(keep) >= 1, "integrate-menus: expected row/tab missing after surgery: %r" % keep
 
 after_crosshairsize_count = b.count(b"guislider crosshairsize")
@@ -200,5 +257,5 @@ assert after_guitab_count == before_guitab_count, (
     "touched" % (before_guitab_count, after_guitab_count))
 
 open(p, "wb").write(b)
-print("integrate-menus: stock options surgery complete (6/6 rows) on", p)
+print("integrate-menus: stock options surgery + campaign menu gut complete (%d/%d rows) on" % (len(surgeries), len(surgeries)), p)
 PY
