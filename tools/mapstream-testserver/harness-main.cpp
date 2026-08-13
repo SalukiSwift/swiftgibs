@@ -85,7 +85,14 @@ int main(int argc, char **argv)
 
     Uint32 totalelapsed = SDL_GetTicks() - startticks;
     int state = mapstreamstate();
-    printf("HARNESS: %s\n", mapstreamstatustext());
+    // mapstreamsettext() runs before the state atomic flips (mapstream.cpp's
+    // mapstreamfail()/done path) - so the loop above can already have
+    // observed and printed this exact final text while state still read
+    // MS_ACTIVE, one iteration before breaking out here. Dedupe against
+    // lasttext (mirrors the fix in mapstream.cpp's mapstreamwaitloop()) so
+    // that race can never produce two identical "HARNESS: <outcome>" lines.
+    const char *finaltext = mapstreamstatustext();
+    if(strcmp(finaltext, lasttext)) printf("HARNESS: %s\n", finaltext);
     printf("HARNESS: RESULT state=%s elapsed_ms=%u\n",
            state == MS_DONE ? "MS_DONE" : state == MS_FAILED ? "MS_FAILED" : "MS_OTHER",
            (unsigned)totalelapsed);

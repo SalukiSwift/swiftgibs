@@ -146,13 +146,33 @@ assert_no_files()
     fi
 }
 
+# Exact-count check for final-outcome log lines, not just presence (grep -q).
+# Covers the settext-before-state race fixed in mapstreamwaitloop()/harness-
+# main.cpp's mirror loop: the worker publishes statustext before flipping the
+# state atomic, so the poll loop can observe the already-final text one tick
+# before state catches up, print it there, then (pre-fix) print the identical
+# line again unconditionally after the loop. An exact count of 1 is what
+# actually catches a regression of that dedupe; "at least one" would not.
+assert_count_eq()
+{
+    local pattern="$1" want="$2" hlog="$3" desc="$4"
+    local got
+    got="$(grep -c -- "$pattern" "$hlog" || true)"
+    if [ "$got" -eq "$want" ]; then
+        pass "$desc"
+    else
+        fail "$desc (saw $got occurrence(s) of \"$pattern\", expected $want) - log: $(cat "$hlog")"
+    fi
+}
+
 # --- Mode 1: ok ---------------------------------------------------------------
 
 echo "== mode: ok =="
 start_server ok
 hlog="$(run_harness ok fdm6)"
 stop_server
-if grep -q "fdm6: done" "$hlog" && grep -q "RESULT state=MS_DONE" "$hlog"; then pass "ok: MS_DONE logged"; else fail "ok: MS_DONE not logged ($(cat "$hlog"))"; fi
+assert_count_eq "fdm6: done" 1 "$hlog" "ok: MS_DONE outcome line logged exactly once"
+assert_count_eq "RESULT state=MS_DONE" 1 "$hlog" "ok: RESULT line logged exactly once"
 if [ -f "$BUNDLE/packages/base/fdm6.ogz" ] && [ ! -e "$BUNDLE/packages/base/fdm6.ogz.part" ]; then
     pass "ok: .ogz appears, .part gone"
 else
@@ -169,7 +189,8 @@ echo "== mode: missing =="
 start_server missing
 hlog="$(run_harness missing fdm6)"
 stop_server
-if grep -q "404" "$hlog" && grep -q "RESULT state=MS_FAILED" "$hlog"; then pass "missing: MS_FAILED \"404\""; else fail "missing: expected 404/MS_FAILED ($(cat "$hlog"))"; fi
+assert_count_eq "404" 1 "$hlog" "missing: MS_FAILED \"404\" outcome line logged exactly once"
+assert_count_eq "RESULT state=MS_FAILED" 1 "$hlog" "missing: RESULT line logged exactly once"
 assert_no_files fdm6 "missing"
 
 # --- Mode 3: corrupt -----------------------------------------------------------
@@ -180,7 +201,8 @@ hlog="$(run_harness corrupt fdm6)"
 stop_server
 ATTEMPTS="$(grep -c "downloading fdm6.ogz" "$hlog" || true)"
 [ "$ATTEMPTS" -eq 2 ] && pass "corrupt: exactly 2 fetch attempts logged" || fail "corrupt: saw $ATTEMPTS attempts, expected 2"
-if grep -q "checksum mismatch" "$hlog" && grep -q "RESULT state=MS_FAILED" "$hlog"; then pass "corrupt: MS_FAILED \"checksum mismatch\""; else fail "corrupt: expected checksum mismatch/MS_FAILED ($(cat "$hlog"))"; fi
+assert_count_eq "checksum mismatch" 1 "$hlog" "corrupt: MS_FAILED \"checksum mismatch\" outcome line logged exactly once"
+assert_count_eq "RESULT state=MS_FAILED" 1 "$hlog" "corrupt: RESULT line logged exactly once"
 [ ! -e "$BUNDLE/packages/base/fdm6.ogz" ] && pass "corrupt: no .ogz" || fail "corrupt: .ogz should not exist"
 
 # --- Mode 4: truncate ----------------------------------------------------------
@@ -189,7 +211,11 @@ echo "== mode: truncate =="
 start_server truncate
 hlog="$(run_harness truncate fdm6)"
 stop_server
-grep -q "RESULT state=MS_FAILED" "$hlog" && pass "truncate: MS_FAILED (short body vs Content-Length)" || fail "truncate: expected MS_FAILED ($(cat "$hlog"))"
+# truncate resolves via the same checksum-mismatch path as corrupt (a short
+# body naturally fails its hash check - see mapstream.cpp's Mechanics, which
+# specifies only a checksum check, no separate length check).
+assert_count_eq "checksum mismatch" 1 "$hlog" "truncate: MS_FAILED \"checksum mismatch\" (short body vs Content-Length) outcome line logged exactly once"
+assert_count_eq "RESULT state=MS_FAILED" 1 "$hlog" "truncate: RESULT line logged exactly once"
 [ ! -e "$BUNDLE/packages/base/fdm6.ogz" ] && pass "truncate: no .ogz" || fail "truncate: .ogz should not exist"
 
 # --- Mode 5: stall + cancel -----------------------------------------------------
@@ -201,7 +227,8 @@ hlog="$(run_harness stall fdm6 500)"
 ENDMS=$(($(date +%s%N)/1000000))
 stop_server
 ELAPSED=$((ENDMS - STARTMS))
-if grep -q "cancelled" "$hlog" && grep -q "RESULT state=MS_FAILED" "$hlog"; then pass "stall: MS_FAILED \"cancelled\""; else fail "stall: expected cancelled/MS_FAILED ($(cat "$hlog"))"; fi
+assert_count_eq "cancelled" 1 "$hlog" "stall: MS_FAILED \"cancelled\" outcome line logged exactly once"
+assert_count_eq "RESULT state=MS_FAILED" 1 "$hlog" "stall: RESULT line logged exactly once"
 if [ "$ELAPSED" -lt 2000 ]; then pass "stall: cancel took effect within 2s (${ELAPSED}ms)"; else fail "stall: took ${ELAPSED}ms, expected < 2000ms"; fi
 assert_no_files fdm6 "stall"
 
@@ -211,11 +238,8 @@ echo "== bonus: shindou (second manifest entry) in ok mode =="
 start_server ok
 hlog="$(run_harness ok shindou)"
 stop_server
-if grep -q "shindou: done" "$hlog" && [ -f "$BUNDLE/packages/base/shindou.ogz" ]; then
-    pass "bonus: shindou (a different manifest entry) streams cleanly too"
-else
-    fail "bonus: shindou fetch failed ($(cat "$hlog"))"
-fi
+assert_count_eq "shindou: done" 1 "$hlog" "bonus: shindou MS_DONE outcome line logged exactly once"
+[ -f "$BUNDLE/packages/base/shindou.ogz" ] && pass "bonus: shindou (a different manifest entry) streams cleanly too" || fail "bonus: shindou.ogz missing"
 
 # --- Summary --------------------------------------------------------------
 

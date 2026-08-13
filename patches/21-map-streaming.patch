@@ -85,7 +85,7 @@
 +#endif
 --- /dev/null
 +++ b/fpsgame/mapstream.cpp
-@@ -0,0 +1,467 @@
+@@ -0,0 +1,480 @@
 +// mapstream.cpp: load + look up the shipped map manifest (data/mapmanifest.cfg),
 +// plus (Task 5) the background downloader that fetches a missing map's .ogz
 +// (+.wpt) from mapstreamurl on demand. See mapstream.h for the on-disk
@@ -535,9 +535,22 @@
 +        SDL_Delay(20);
 +    }
 +
++    // The worker publishes statustext BEFORE flipping state to MS_DONE/
++    // MS_FAILED (mapstreamfail()/mapstreamthreadfn()'s done path both
++    // settext-then-set-state) - so there is a narrow window where the loop
++    // above can already observe the FINAL text while state still reads
++    // MS_ACTIVE, print it there, then fall out of the loop next iteration
++    // once state catches up. Dedupe against lasttext here (same
++    // changed-text check the loop already uses) so that race can never
++    // produce two identical outcome lines - only print if this exact text
++    // was not the one already logged.
 +    int state = mapstreamstate();
-+    if(state == MS_DONE) conoutf("map stream: %s", mapstreamstatustext());
-+    else if(state == MS_FAILED) conoutf(CON_ERROR, "map stream: %s", mapstreamstatustext());
++    const char *text = mapstreamstatustext();
++    if(strcmp(text, lasttext))
++    {
++        if(state == MS_DONE) conoutf("map stream: %s", text);
++        else if(state == MS_FAILED) conoutf(CON_ERROR, "map stream: %s", text);
++    }
 +}
 +
 +// /mapstreamfetch <name> - starts a fetch (fire and forget; poll state/
