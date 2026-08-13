@@ -25,6 +25,14 @@ APP_ZIP="${APP_ZIP:-}"
 APP_DIR="${APP_DIR:-}"
 STAGE="${STAGE:-/tmp/swiftgibs-mac-stage}"
 OUT="$ROOT/dist/SwiftGibs.app"
+# MAPS=none (slim, default): mapshots + map cfgs only, .ogz/.wpt stream on demand (patch 21).
+# MAPS=all (fat): every stock map baked in, for public-server compat / zero-network play.
+# The archive filename carries an -allmaps suffix for the fat variant, but the bundle INSIDE
+# the archive is always "SwiftGibs.app" (see the zip line below) so both variants extract to,
+# and update-swiftgibs.command overlays onto, the same app.
+MAPS="${MAPS:-none}"
+ARCHIVE="SwiftGibs-mac"
+[ "$MAPS" = all ] && ARCHIVE="SwiftGibs-mac-allmaps"
 
 rm -rf "$OUT" "$STAGE"; mkdir -p "$STAGE" "$ROOT/dist"
 
@@ -40,14 +48,22 @@ else
   echo "set APP_ZIP (CI artifact zip) or APP_DIR (a prebuilt SwiftGibs.app)"; exit 1
 fi
 
-# 2) strip a low-res data tree from the install (same as Windows; all 331 maps by default)
-SRC="$INSTALL" ALLMAPS="${ALLMAPS:-1}" "$ROOT/tools/strip-assets.sh" "$ROOT/maps/pool.txt" "$STAGE/game"
+# 2) strip a low-res data tree from the install (same as Windows/Linux).
+#    MAPS=none (default): ship only mapshots + map cfgs (.ogz/.wpt stream on demand, patch 21).
+#    MAPS=all: ship every stock map so any public server's map loads with zero network use.
+SRC="$INSTALL" MAPS="$MAPS" "$ROOT/tools/strip-assets.sh" "$STAGE/game"
 
 # 3) game data lives in Contents/Resources (the Mac binary uses the bundle Resources as its data root)
 RES="$OUT/Contents/Resources"
 cp -a "$STAGE/game/data" "$RES/data"
 cp -a "$STAGE/game/packages" "$RES/packages"
 chmod -R u+w "$RES"
+
+# 3b) map manifest (patch 21's streaming downloader reads this): every bundle ships it, slim AND
+# fat alike, so the client always knows the full 331-map catalogue (name/size/hash) even when
+# most of those maps aren't physically present yet. Generated from the SAME install the maps
+# themselves were staged from, so hashes always match what's actually on disk for MAPS=all.
+"$ROOT/build/make-map-manifest.sh" "$INSTALL" > "$RES/data/mapmanifest.cfg"
 
 # 4) overlay last so it wins; drop the internal reference file
 cp -a "$ROOT/overlay/." "$RES/"
@@ -98,6 +114,6 @@ cp "$ROOT/updater/update-swiftgibs.command" "$ROOT/dist/update-swiftgibs.command
 chmod +x "$ROOT/dist/update-swiftgibs.command"
 
 # 7) zip the .app for distribution (standard on macOS; -y preserves the framework symlinks)
-cd "$ROOT/dist"; rm -f SwiftGibs-mac.zip
-zip -rqy SwiftGibs-mac.zip SwiftGibs.app update-swiftgibs.command
-echo "mac bundle: $(du -sh "$OUT" | cut -f1) | zip: $(du -sh SwiftGibs-mac.zip | cut -f1)"
+cd "$ROOT/dist"; rm -f "$ARCHIVE.zip"
+zip -rqy "$ARCHIVE.zip" SwiftGibs.app update-swiftgibs.command
+echo "mac bundle (MAPS=$MAPS): $(du -sh "$OUT" | cut -f1) | zip: $(du -sh "$ARCHIVE.zip" | cut -f1)"

@@ -11,12 +11,19 @@ INSTALL="${INSTALL:-/mnt/c/Program Files (x86)/Sauerbraten}"   # 2020 install (o
 WINBIN="$INSTALL/bin64"
 OUT="$ROOT/dist/swiftgibs-win64"
 STAGE="${STAGE:-/tmp/swiftgibs-stage}"
+# MAPS=none (slim, default): mapshots + map cfgs only, .ogz/.wpt stream on demand (patch 21).
+# MAPS=all (fat): every stock map baked in, for public-server compat / zero-network play.
+# The archive filename carries an -allmaps suffix for the fat variant, but the folder INSIDE
+# the archive is always "swiftgibs-win64" (see the zip line below) so both variants extract to,
+# and update-swiftgibs.bat overlays onto, the same install directory.
+MAPS="${MAPS:-none}"
+ARCHIVE="swiftgibs-win64"
+[ "$MAPS" = all ] && ARCHIVE="swiftgibs-win64-allmaps"
 
 # 1) strip a low-res tree from the SAME install the exe comes from.
-#    ALLMAPS=1 (default): ship every stock map so any public server's map loads.
-#    Set ALLMAPS=0 to ship only the curated pool in maps/pool.txt (RUGBY rotation + venice + local
-#    bot-match maps) for a ~halved download, at the cost of maps outside the pool not loading.
-SRC="$INSTALL" ALLMAPS="${ALLMAPS:-1}" "$ROOT/tools/strip-assets.sh" "$ROOT/maps/pool.txt" "$STAGE"
+#    MAPS=none (default): ship only mapshots + map cfgs (.ogz/.wpt stream on demand, patch 21).
+#    MAPS=all: ship every stock map so any public server's map loads with zero network use.
+SRC="$INSTALL" MAPS="$MAPS" "$ROOT/tools/strip-assets.sh" "$STAGE"
 
 rm -rf "$OUT"; mkdir -p "$OUT/bin64"
 
@@ -33,6 +40,12 @@ cp "$ROOT"/vendor/windows-dlls/*.dll "$OUT/bin64/"   # vendored redistributable 
 cp -a "$STAGE/data" "$OUT/data"
 cp -a "$STAGE/packages" "$OUT/packages"
 chmod -R u+w "$OUT"
+
+# 3b) map manifest (patch 21's streaming downloader reads this): every bundle ships it, slim AND
+# fat alike, so the client always knows the full 331-map catalogue (name/size/hash) even when
+# most of those maps aren't physically present yet. Generated from the SAME install the maps
+# themselves were staged from, so hashes always match what's actually on disk for MAPS=all.
+"$ROOT/build/make-map-manifest.sh" "$INSTALL" > "$OUT/data/mapmanifest.cfg"
 
 # 4) overlay last so it wins (autoexec, menus, crosshair, servers.cfg)
 cp -a "$ROOT/overlay/." "$OUT/"
@@ -58,6 +71,6 @@ printf '@echo off\r\nstart bin64\\sauerbraten.exe -q.\r\n' > "$OUT/swiftgibs.bat
 
 # 6) zip
 cd "$ROOT/dist"
-rm -f swiftgibs-win64.zip
-zip -rq swiftgibs-win64.zip swiftgibs-win64
-echo "bundle: $(du -sh "$OUT" | cut -f1) | zip: $(du -sh swiftgibs-win64.zip | cut -f1)"
+rm -f "$ARCHIVE.zip"
+zip -rq "$ARCHIVE.zip" swiftgibs-win64
+echo "bundle (MAPS=$MAPS): $(du -sh "$OUT" | cut -f1) | zip: $(du -sh "$ARCHIVE.zip" | cut -f1)"

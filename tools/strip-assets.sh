@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Stage a minimal, low-res Sauerbraten data tree for SwiftGibs.
-# Usage: strip-assets.sh <pool-file> <stage-dir>
+# Usage: [MAPS=none|all] strip-assets.sh <stage-dir>
 set -euo pipefail
 SRC="${SRC:-$HOME/repos/sauerbraten}"
-POOL="${1:?usage: strip-assets.sh <pool-file> <stage-dir>}"
-STAGE="${2:?stage dir required}"
+STAGE="${1:?usage: strip-assets.sh <stage-dir>}"
 WORLD_PX="${WORLD_PX:-2}"   # world textures crushed to this many px (flat look); fonts/hud exempt
 
 # A killed prior run can leave read-only package dirs in the stage (some install
@@ -23,19 +22,23 @@ for d in "$SRC"/packages/*/; do
   cp -a "$d" "$STAGE/packages/$name"
 done
 
-# 3) base maps. ALLMAPS=1 ships every map (full public-server compat); otherwise
-#    only the curated pool (tiny, for local + own-server play).
-if [ "${ALLMAPS:-0}" = 1 ]; then
-  cp -a "$SRC/packages/base/." "$STAGE/packages/base/"
-else
-  while read -r m; do
-    [ -z "$m" ] && continue
-    for ext in ogz cfg wpt jpg; do
-      f="$SRC/packages/base/$m.$ext"
-      [ -f "$f" ] && cp "$f" "$STAGE/packages/base/"
-    done
-  done < "$POOL"
+# 3) base maps. MAPS=all ships every map (fat variant); MAPS=none (slim, default)
+#    ships only mapshots + map cfgs - .ogz/.wpt stream on demand (patch 21).
+#    Guard first: the extraction logic below is a flat, non-recursive file
+#    copy/find, so a subdirectory appearing under packages/base (none exist in
+#    the 2020 official release as of writing) would silently vanish from the
+#    stage in the none case, or copy correctly-but-unnoticed in the all case.
+#    Fail loudly instead of guessing.
+if [ -n "$(find "$SRC/packages/base" -mindepth 1 -type d)" ]; then
+  echo "strip-assets: unexpected subdirectory under packages/base - update this script to handle it explicitly" >&2
+  find "$SRC/packages/base" -mindepth 1 -type d >&2
+  exit 1
 fi
+case "${MAPS:-none}" in
+  all)  cp -a "$SRC/packages/base/." "$STAGE/packages/base/" ;;
+  none) find "$SRC/packages/base" -maxdepth 1 -type f \( -iname '*.jpg' -o -iname '*.png' -o -iname '*.cfg' -o -iname '*.txt' \) -exec cp {} "$STAGE/packages/base/" \; ;;
+  *) echo "strip-assets: MAPS must be none|all" >&2; exit 1 ;;
+esac
 
 # make the stage writable: copies off a Windows mount (/mnt/c) come read-only,
 # which would block the downscale below and the overlay copy later.
