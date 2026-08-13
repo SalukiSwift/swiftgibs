@@ -35,17 +35,20 @@
  
 --- /dev/null
 +++ b/fpsgame/mapstream.h
-@@ -0,0 +1,22 @@
-+// mapstream.h: shipped map manifest - format, load, lookup.
+@@ -0,0 +1,47 @@
++// mapstream.h: shipped map manifest (format, load, lookup) plus the
++// background downloader that fetches a missing map's .ogz (+.wpt) from
++// mapstreamurl on demand.
 +//
 +// data/mapmanifest.cfg format - one line per map, space-separated:
 +//   <name> <ogzbytes> <ogzsha256hex> [<wptbytes> <wptsha256hex>]
 +// Generated offline by build/make-map-manifest.sh from the official 2020
 +// data. wptsize 0 means the map has no waypoint file.
 +//
-+// This is the load/lookup slice only (Task 4) - later tasks add the actual
-+// fetch/stream/cache machinery that consumes these entries to pull maps on
-+// demand instead of shipping them all in the bundle.
++// Manifest load/lookup was Task 4. Task 5 (below) adds the actual fetch/
++// verify/store machinery that consumes these entries to pull maps on demand
++// instead of shipping them all in the bundle - see mapstream.cpp for the
++// download mechanics (background SDL thread, sha256 verify, .part+rename).
 +
 +#ifndef __MAPSTREAM_H__
 +#define __MAPSTREAM_H__
@@ -57,17 +60,41 @@
 +void loadmapmanifest();                                   // reads data/mapmanifest.cfg, silent no-op if absent
 +const mapmanifestentry *mapmanifestfind(const char *name);
 +
++// --- Task 5: background map downloader ---------------------------------
++// mapstreamurl: host+path the streamer fetches <name>.ogz/<name>.wpt from,
++// eg. "http://swiftgibs.salukiswift.com/maps" -> GET .../maps/fdm6.ogz. No
++// trailing slash. Defined (SVARP) in mapstream.cpp; declared extern here so
++// other files can read/report the current value - a plain SVARP(...) macro
++// invocation can't live in a header included by more than one translation
++// unit (mapstream.h is also included by fpsgame/fps.cpp), since the macro
++// expands to an actual variable definition and would collide at link time.
++extern char *mapstreamurl;
++
++enum { MS_IDLE = 0, MS_ACTIVE, MS_DONE, MS_FAILED };
++
++// Begin fetching <name>.ogz (+wpt if the manifest lists one) on the
++// background thread. Preconditions checked inside: manifest entry exists,
++// file absent. Returns false if not startable (also false while another
++// fetch is already active).
++bool mapstreambegin(const char *name);
++int  mapstreamstate();                       // MS_*
++float mapstreamprogress();                   // 0..1 of current file
++const char *mapstreamstatustext();           // "downloading fdm6 (0.6 MB)" / failure reason
++void mapstreamcancel();                      // async-safe; thread notices within one wait tick
++
 +#endif
 --- /dev/null
 +++ b/fpsgame/mapstream.cpp
-@@ -0,0 +1,54 @@
-+// mapstream.cpp: load + look up the shipped map manifest (data/mapmanifest.cfg).
-+// See mapstream.h for the on-disk line format. This is the "load/lookup
-+// only" slice (Task 4) - later tasks add the fetch/stream/cache machinery
-+// that actually uses these entries to pull maps on demand.
+@@ -0,0 +1,467 @@
++// mapstream.cpp: load + look up the shipped map manifest (data/mapmanifest.cfg),
++// plus (Task 5) the background downloader that fetches a missing map's .ogz
++// (+.wpt) from mapstreamurl on demand. See mapstream.h for the on-disk
++// manifest line format and the downloader's public contract.
 +
 +#include "cube.h"
 +#include "mapstream.h"
++#include "sghttp.h"
++#include "sgsha256.h"
 +
 +static vector<mapmanifestentry> mapmanifest;
 +
@@ -115,6 +142,417 @@
 +    if(!e) { conoutf("%d maps, %s: not found", mapmanifest.length(), lookup); return; }
 +    conoutf("%d maps, %s: %.1fMB%s", mapmanifest.length(), lookup, e->ogzsize/1048576.0f, e->wptsize > 0 ? "+wpt" : "");
 +});
++
++// ==========================================================================
++// Task 5: background map downloader
++//
++// Mechanics: mapstreambegin() spawns one SDL_Thread ("map stream") that runs
++// mapstreamthreadfn() start to finish for a single map. State/progress/
++// cancel are shared with the caller purely through SDL_atomic_t (and one
++// SDL_SpinLock-guarded status-text buffer) - the worker thread never touches
++// the renderer, the console, or any cube scripting entry point directly; all
++// conoutf'ing happens on the MAIN thread (mapstreamwaitloop(), below, driven
++// by the /mapstreamwait debug command), which polls the 5 contract functions
++// and logs on each observed statustext change. This mirrors patch 19's clip
++// export watchdog: background thread sets flags/text, main thread's poll
++// loop is the only thing that ever calls conoutf.
++//
++// Body bytes are held in memory start to finish (largest stock ogz is ~7MB -
++// fine; no streaming-to-disk complexity here, see the task's YAGNI note).
++// The .ogz/.wpt file only ever touches disk once, after a verified sha256
++// match: write to "<name>.ext.part", flush+close, then rename() onto the
++// real "<name>.ext". Any stale .part (a previous crashed/killed run, or a
++// failed write this run) is removed - see mapstreamremovepart()/
++// mapstreamwritefile() - so a .part never survives outside the brief window
++// between opening it for write and either renaming it away or deleting it.
++// ==========================================================================
++
++SVARP(mapstreamurl, "http://swiftgibs.salukiswift.com/maps");
++
++// Forward-declared rather than #include "engine.h" (which pulls in world.h/
++// octa.h/lightmap.h/bih.h/texture.h/model.h - none of which this file needs)
++// - mapstream.cpp only needs this one debug-UI hook, for /mapstreamwait
++// below. renderprogress is a real symbol (engine/main.cpp), already linked
++// into the same client binary fpsgame/*.o is part of; a plain extern with a
++// matching signature is enough - GLuint itself comes from cube.h's own
++// SDL_opengl.h include.
++extern void renderprogress(float bar, const char *text, GLuint tex = 0, bool background = false);
++
++#define MAPSTREAM_TIMEOUTMS 60000   // budget per fetch attempt - generous; the stall/cancel path is a separate, much faster escape (see sghttpprogress::tick below), not this ceiling
++
++static SDL_Thread *mapstreamthread = NULL;
++static SDL_atomic_t mapstreamstateatom;    // MS_*
++static SDL_atomic_t mapstreamcancelatom;   // 0/1, set by mapstreamcancel()
++static SDL_atomic_t mapstreamgotatom;      // bytes received, current fetch
++static SDL_atomic_t mapstreamtotalatom;    // bytes expected, current fetch (<=0 = unknown/none)
++
++static SDL_SpinLock mapstreamtextlock = 0;
++static string mapstreamtextbuf = "";
++
++// name of the map currently being (or about to be) fetched. Written by the
++// main thread in mapstreambegin() strictly BEFORE SDL_CreateThread() is
++// called - thread creation is itself a happens-before edge (same reasoning
++// patch 19's clip export watchdog documents for its own read-only-after-
++// creation fields), so the worker thread reading it needs no lock.
++static string mapstreamcurname;
++
++// Worker-thread-only scratch: set immediately after an HTTP transport
++// failure inside mapstreamfetchfile() and consumed immediately afterwards
++// by mapstreamoutcometext(), both called back-to-back from the same thread
++// with no other fetch ever running concurrently - no locking needed, same
++// single-writer/single-reader-on-the-same-thread reasoning as sghttp's own
++// thread_local sghttplasterr (see sghttp.h).
++static int mapstreamlasthttpstatus = 0;
++
++static void mapstreamsettext(const char *s)
++{
++    SDL_AtomicLock(&mapstreamtextlock);
++    copystring(mapstreamtextbuf, s);
++    SDL_AtomicUnlock(&mapstreamtextlock);
++}
++
++int mapstreamstate() { return SDL_AtomicGet(&mapstreamstateatom); }
++
++float mapstreamprogress()
++{
++    int total = SDL_AtomicGet(&mapstreamtotalatom);
++    if(total <= 0) return 0.0f;
++    int got = SDL_AtomicGet(&mapstreamgotatom);
++    float f = float(got)/float(total);
++    return f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
++}
++
++const char *mapstreamstatustext()
++{
++    static string out;
++    SDL_AtomicLock(&mapstreamtextlock);
++    copystring(out, mapstreamtextbuf);
++    SDL_AtomicUnlock(&mapstreamtextlock);
++    return out;
++}
++
++void mapstreamcancel()
++{
++    SDL_AtomicSet(&mapstreamcancelatom, 1);
++}
++
++// sghttpget's progress callback: runs on the WORKER thread (sghttp drives it
++// synchronously from whichever thread calls sghttpget - see sghttp.h).
++// Publishes got/total for mapstreamprogress() and is the one place that
++// notices a cancel request and turns it into sghttpget's own -1 return.
++struct mapstreamprogresscb : sghttpprogress
++{
++    bool tick(int got, int total)
++    {
++        SDL_AtomicSet(&mapstreamgotatom, got);
++        SDL_AtomicSet(&mapstreamtotalatom, total);
++        return SDL_AtomicGet(&mapstreamcancelatom) == 0;
++    }
++};
++
++// Splits mapstreamurl ("http://host[:port][/path]", no trailing slash) into
++// its parts. Only plain http is supported, matching sghttpget's own
++// signature (no TLS) - returns false if the scheme isn't "http://" or the
++// host portion is empty.
++static bool mapstreamparseurl(const char *url, char *host, char *pathprefix, int &port)
++{
++    if(strncmp(url, "http://", 7)) return false;
++    const char *p = url + 7;
++    const char *slash = strchr(p, '/');
++    size_t hostportlen = slash ? size_t(slash - p) : strlen(p);
++    if(hostportlen == 0 || hostportlen >= size_t(MAXSTRLEN)) return false;
++
++    string hostport;
++    memcpy(hostport, p, hostportlen);
++    hostport[hostportlen] = '\0';
++
++    char *colon = strchr(hostport, ':');
++    if(colon)
++    {
++        *colon = '\0';
++        port = atoi(colon+1);
++        if(port <= 0) port = 80;
++    }
++    else port = 80;
++    if(!hostport[0]) return false;
++
++    copystring(host, hostport, MAXSTRLEN);
++    copystring(pathprefix, slash ? slash : "", MAXSTRLEN);
++    return true;
++}
++
++static void mapstreamsizetext(int bytes, char *out)
++{
++    if(bytes >= 1024*1024) nformatstring(out, MAXSTRLEN, "%.1f MB", bytes/1048576.0f);
++    else nformatstring(out, MAXSTRLEN, "%.1f KB", bytes/1024.0f);
++}
++
++enum { MSFETCH_OK = 0, MSFETCH_HTTPFAIL, MSFETCH_CANCELLED, MSFETCH_MISMATCH };
++
++// Fetches host:port+urlpath into `out`, verifying against `expectedsha`
++// (case-insensitive hex compare) with exactly one silent retry on a
++// mismatch (still bad on the second attempt -> MSFETCH_MISMATCH). Updates
++// the shared statustext once per attempt (so a retry is visible to anything
++// polling statustext, eg the /mapstreamwait debug command) and the shared
++// progress atomics throughout. Worker-thread only.
++static int mapstreamfetchfile(const char *host, int port, const char *urlpath,
++                               const char *name, const char *ext, int sizehint,
++                               const char *expectedsha, vector<uchar> &out)
++{
++    string sizetext;
++    mapstreamsizetext(sizehint, sizetext);
++
++    for(int attempt = 1; attempt <= 2; attempt++)
++    {
++        out.setsize(0);
++        SDL_AtomicSet(&mapstreamgotatom, 0);
++        SDL_AtomicSet(&mapstreamtotalatom, sizehint > 0 ? sizehint : -1);
++
++        defformatstring(text, "downloading %s%s (%s, attempt %d)", name, ext, sizetext, attempt);
++        mapstreamsettext(text);
++
++        mapstreamprogresscb cb;
++        int status = sghttpget(host, port, urlpath, out, MAPSTREAM_TIMEOUTMS, &cb);
++
++        if(status == -1) return MSFETCH_CANCELLED;
++        if(status != 200) { mapstreamlasthttpstatus = status; return MSFETCH_HTTPFAIL; }
++
++        char digest[65];
++        sgsha256hex(out.length() ? out.getbuf() : (const uchar *)"", out.length(), digest);
++        if(!strcasecmp(digest, expectedsha)) return MSFETCH_OK;
++        // mismatch - loop around for the one silent retry
++    }
++    return MSFETCH_MISMATCH;
++}
++
++static void mapstreamoutcometext(int outcome, char *out)
++{
++    switch(outcome)
++    {
++        case MSFETCH_CANCELLED: copystring(out, "cancelled", MAXSTRLEN); break;
++        case MSFETCH_MISMATCH:  copystring(out, "checksum mismatch", MAXSTRLEN); break;
++        case MSFETCH_HTTPFAIL:
++            if(mapstreamlasthttpstatus == 0)
++            {
++                int phase = sghttperrphase();
++                const char *reason =
++                    phase == SGHTTP_ERR_RESOLVE  ? "could not resolve host" :
++                    phase == SGHTTP_ERR_CONNECT  ? "could not connect" :
++                    phase == SGHTTP_ERR_SEND     ? "send failed" :
++                    phase == SGHTTP_ERR_RECV     ? "receive failed" :
++                    phase == SGHTTP_ERR_BADREPLY ? "bad reply" : "network error";
++                copystring(out, reason, MAXSTRLEN);
++            }
++            else nformatstring(out, MAXSTRLEN, "download failed (HTTP %d)", mapstreamlasthttpstatus);
++            break;
++        default: copystring(out, "unknown error", MAXSTRLEN); break;
++    }
++}
++
++// Best-effort removal of a stale .part - never fatal if there isn't one.
++// findfile(rel, "w") never returns NULL (see shared/stream.cpp): with a
++// homedir set it always returns a path (creating missing parent dirs as a
++// side effect); without one it returns the relative name unchanged.
++static void mapstreamremovepart(const char *rel)
++{
++    remove(findfile(rel, "w"));
++}
++
++// Writes `data` to partrel, flushes+closes, then renames it onto finalrel.
++// Cleans up the .part on every failure path - the .part never survives past
++// this call except while the write is actually in flight, inside this one
++// function. finalrel/partrel are engine-relative paths (eg
++// "packages/base/fdm6.ogz(.part)") - always resolved through findfile(),
++// never a hardcoded absolute path, so the mac datadir (patch 13) and any
++// -q<homedir> setup both work unchanged.
++static bool mapstreamwritefile(const char *partrel, const char *finalrel, vector<uchar> &data)
++{
++    const char *resolved = findfile(partrel, "w");
++    if(!resolved) return false;
++    string partpath;
++    copystring(partpath, resolved);
++    remove(partpath); // clear any stale .part immediately before we (re)create it
++
++    stream *f = openrawfile(partrel, "wb");
++    if(!f) return false;
++
++    bool ok = true;
++    if(data.length() > 0 && f->write(data.getbuf(), data.length()) != size_t(data.length())) ok = false;
++    if(!f->flush()) ok = false;
++    f->close();
++    delete f;
++
++    if(!ok) { remove(partpath); return false; }
++
++    resolved = findfile(finalrel, "w");
++    if(!resolved) { remove(partpath); return false; }
++    string finalpath;
++    copystring(finalpath, resolved);
++
++    remove(finalpath); // rename() replaces an existing destination on POSIX anyway; explicit for clarity, and for platforms whose rename() refuses to replace an existing file
++    if(rename(partpath, finalpath) != 0) { remove(partpath); return false; }
++    return true;
++}
++
++static void mapstreamfail(const char *text)
++{
++    mapstreamsettext(text);
++    SDL_AtomicSet(&mapstreamstateatom, MS_FAILED);
++}
++
++static int mapstreamthreadfn(void *)
++{
++    string name;
++    copystring(name, mapstreamcurname);
++
++    // Guaranteed non-NULL: mapstreambegin() already found this entry on the
++    // main thread before spawning this thread, and the manifest is loaded
++    // once at startup and never mutated afterwards.
++    const mapmanifestentry *entry = mapmanifestfind(name);
++    if(!entry) { mapstreamfail("map stream: internal error (manifest entry vanished)"); return 0; }
++
++    string host, pathprefix; int port;
++    if(!mapstreamparseurl(mapstreamurl, host, pathprefix, port))
++    {
++        defformatstring(buf, "%s: invalid mapstreamurl", name);
++        mapstreamfail(buf);
++        return 0;
++    }
++
++    defformatstring(ogzurl, "%s/%s.ogz", pathprefix, name);
++    defformatstring(ogzrel, "packages/base/%s.ogz", name);
++    defformatstring(ogzpartrel, "packages/base/%s.ogz.part", name);
++    mapstreamremovepart(ogzpartrel);
++
++    vector<uchar> ogzdata;
++    int outcome = mapstreamfetchfile(host, port, ogzurl, name, ".ogz", entry->ogzsize, entry->ogzsha, ogzdata);
++    if(outcome != MSFETCH_OK)
++    {
++        string reason; mapstreamoutcometext(outcome, reason);
++        defformatstring(buf, "%s: %s", name, reason);
++        mapstreamfail(buf);
++        return 0;
++    }
++
++    if(!mapstreamwritefile(ogzpartrel, ogzrel, ogzdata))
++    {
++        defformatstring(buf, "%s: could not write %s", name, ogzrel);
++        mapstreamfail(buf);
++        return 0;
++    }
++
++    bool wptfailed = false;
++    string wptreason; wptreason[0] = '\0';
++    if(entry->wptsize > 0)
++    {
++        defformatstring(wpturl, "%s/%s.wpt", pathprefix, name);
++        defformatstring(wptrel, "packages/base/%s.wpt", name);
++        defformatstring(wptpartrel, "packages/base/%s.wpt.part", name);
++        mapstreamremovepart(wptpartrel);
++
++        vector<uchar> wptdata;
++        int wptoutcome = mapstreamfetchfile(host, port, wpturl, name, ".wpt", entry->wptsize, entry->wptsha, wptdata);
++        if(wptoutcome != MSFETCH_OK)
++        {
++            wptfailed = true;
++            mapstreamoutcometext(wptoutcome, wptreason);
++        }
++        else if(!mapstreamwritefile(wptpartrel, wptrel, wptdata))
++        {
++            wptfailed = true;
++            copystring(wptreason, "could not write wpt");
++        }
++    }
++
++    // wpt failure is non-fatal - the map itself is already verified+in
++    // place, so this still finishes as MS_DONE; the reason is folded into
++    // the final statustext (the one console line the mechanics ask for -
++    // see mapstreamwaitloop()'s diff-and-log below, which prints every
++    // statustext transition including this final one).
++    string donetext;
++    if(wptfailed) formatstring(donetext, "%s: done (wpt fetch failed: %s)", name, wptreason);
++    else formatstring(donetext, "%s: done", name);
++    mapstreamsettext(donetext);
++    SDL_AtomicSet(&mapstreamstateatom, MS_DONE);
++    return 0;
++}
++
++bool mapstreambegin(const char *name)
++{
++    if(!name || !name[0]) return false;
++    if(mapstreamstate() == MS_ACTIVE) return false;   // one fetch at a time
++
++    const mapmanifestentry *entry = mapmanifestfind(name);
++    if(!entry) return false;
++
++    defformatstring(ogzrel, "packages/base/%s.ogz", name);
++    if(findfile(ogzrel, "e")) return false;   // already have it
++
++    // Reap a finished (MS_DONE/MS_FAILED) thread from a previous run before
++    // starting a new one - by the time state is anything but MS_ACTIVE the
++    // thread function has already set that state as its last act before
++    // returning, so this join completes immediately.
++    if(mapstreamthread) { SDL_WaitThread(mapstreamthread, NULL); mapstreamthread = NULL; }
++
++    copystring(mapstreamcurname, name);
++    SDL_AtomicSet(&mapstreamcancelatom, 0);
++    SDL_AtomicSet(&mapstreamgotatom, 0);
++    SDL_AtomicSet(&mapstreamtotalatom, 0);
++    defformatstring(starttext, "%s: starting", name);
++    mapstreamsettext(starttext);
++    SDL_AtomicSet(&mapstreamstateatom, MS_ACTIVE);
++
++    mapstreamthread = SDL_CreateThread(mapstreamthreadfn, "map stream", NULL);
++    if(!mapstreamthread)
++    {
++        defformatstring(buf, "%s: could not start download thread", name);
++        mapstreamsettext(buf);
++        SDL_AtomicSet(&mapstreamstateatom, MS_FAILED);
++        return false;
++    }
++    return true;
++}
++
++// Blocks the caller with renderprogress until the active fetch reaches
++// MS_DONE/MS_FAILED, logging (via conoutf, main-thread only) every observed
++// statustext change - one line per fetch attempt (so eg a checksum-mismatch
++// retry shows up as two distinct "downloading ..." lines) plus one final
++// line for the outcome. Test-only surface, harmless to ship.
++static void mapstreamwaitloop()
++{
++    if(mapstreamstate() == MS_IDLE) { conoutf(CON_ERROR, "map stream: nothing in progress"); return; }
++
++    string lasttext; lasttext[0] = '\0';
++    while(mapstreamstate() == MS_ACTIVE)
++    {
++        const char *text = mapstreamstatustext();
++        if(strcmp(text, lasttext))
++        {
++            copystring(lasttext, text);
++            conoutf("map stream: %s", text);
++        }
++        renderprogress(mapstreamprogress(), text);
++        SDL_Delay(20);
++    }
++
++    int state = mapstreamstate();
++    if(state == MS_DONE) conoutf("map stream: %s", mapstreamstatustext());
++    else if(state == MS_FAILED) conoutf(CON_ERROR, "map stream: %s", mapstreamstatustext());
++}
++
++// /mapstreamfetch <name> - starts a fetch (fire and forget; poll state/
++// progress/statustext yourself, or follow up with /mapstreamwait).
++ICOMMAND(mapstreamfetch, "s", (char *n),
++{
++    if(!n[0]) { conoutf(CON_ERROR, "mapstreamfetch: no map name given"); return; }
++    if(!mapstreambegin(n)) conoutf(CON_ERROR, "mapstreamfetch: could not start fetching %s (already have it, no manifest entry, or a fetch is already active)", n);
++});
++
++// /mapstreamwait - blocks until the active fetch finishes; see mapstreamwaitloop() above.
++ICOMMAND(mapstreamwait, "", (), mapstreamwaitloop());
++
++// /mapstreamcancel - async-safe; the worker thread notices within one wait tick (~250ms).
++ICOMMAND(mapstreamcancel, "", (), mapstreamcancel());
 --- /dev/null
 +++ b/fpsgame/sgsha256.h
 @@ -0,0 +1,30 @@
