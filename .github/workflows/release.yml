@@ -71,7 +71,7 @@ jobs:
           V=0.29.0
           curl -fsSL -o /tmp/rc.tgz "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F$V/apple-codesign-$V-x86_64-unknown-linux-musl.tar.gz"
           tar -C /tmp -xzf /tmp/rc.tgz && sudo cp /tmp/apple-codesign-*/rcodesign /usr/local/bin/
-      - name: Assemble the three bundles from official data
+      - name: Assemble the six bundles from official data (slim, then fat)
         run: |
           set -euo pipefail
           mkdir -p dist/engines/linux-x86_64 dist/engines/win64
@@ -79,12 +79,33 @@ jobs:
           cp /tmp/arts/native-bins/win64/sauerbraten.exe dist/engines/win64/
           chmod +x dist/engines/linux-x86_64/sauer_client
           DATA=$(build/fetch-official-data.sh)
-          INSTALL="$DATA" build/make-bundle-win.sh
-          INSTALL="$DATA" build/make-bundle-linux.sh
-          APP_ZIP=/tmp/arts/mac-app/SwiftGibs-app-code.zip INSTALL="$DATA" RCODESIGN=rcodesign build/make-bundle-mac.sh
+          echo "-- disk before slim pass --"; df -h /
+          # Slim pass (MAPS=none): keeps today's exact asset names, maps stream on demand.
+          INSTALL="$DATA" MAPS=none build/make-bundle-win.sh
+          INSTALL="$DATA" MAPS=none build/make-bundle-linux.sh
+          APP_ZIP=/tmp/arts/mac-app/SwiftGibs-app-code.zip INSTALL="$DATA" RCODESIGN=rcodesign MAPS=none build/make-bundle-mac.sh
+          echo "-- disk after slim pass, before fat-pass cleanup --"; df -h /
+          # The two variants MUST run sequentially, never in parallel on one runner: each bundle
+          # script's STAGE dir is a fixed path (not namespaced by $MAPS), so a concurrent slim+fat
+          # invocation for the same platform would race on the same stage directory. Each script
+          # already rm -rf's its OWN stage/output the next time IT runs, but that only fires
+          # per-platform as that platform's fat pass starts - so the slim pass's stage + output
+          # trees for all three platforms would otherwise sit on disk through the entire fat pass.
+          # Their archives are already built at this point, so clear all three explicitly here to
+          # keep peak disk headroom down ahead of the much larger fat pass.
+          rm -rf /tmp/swiftgibs-stage /tmp/swiftgibs-linux-stage /tmp/swiftgibs-mac-stage \
+                 dist/swiftgibs-win64 dist/SwiftGibs-linux-x86_64 dist/SwiftGibs.app
+          echo "-- disk after fat-pass cleanup --"; df -h /
+          # Fat pass (MAPS=all): every stock map baked in, archive names get an -allmaps suffix.
+          INSTALL="$DATA" MAPS=all build/make-bundle-win.sh
+          INSTALL="$DATA" MAPS=all build/make-bundle-linux.sh
+          APP_ZIP=/tmp/arts/mac-app/SwiftGibs-app-code.zip INSTALL="$DATA" RCODESIGN=rcodesign MAPS=all build/make-bundle-mac.sh
+          echo "-- disk after fat pass --"; df -h /
+          ls -lh dist/*.zip dist/*.tar.gz
       - name: Publish GitHub Release
         env: { GH_TOKEN: '${{ github.token }}' }
         run: |
           gh release create "${{ github.ref_name }}" \
             --title "SwiftGibs ${{ github.ref_name }}" --notes-file docs/RELEASE_NOTES.md \
-            dist/swiftgibs-win64.zip dist/SwiftGibs-linux-x86_64.tar.gz dist/SwiftGibs-mac.zip
+            dist/swiftgibs-win64.zip dist/SwiftGibs-linux-x86_64.tar.gz dist/SwiftGibs-mac.zip \
+            dist/swiftgibs-win64-allmaps.zip dist/SwiftGibs-linux-x86_64-allmaps.tar.gz dist/SwiftGibs-mac-allmaps.zip
