@@ -15,6 +15,45 @@
  	fpsgame/waypoint.o \
  	fpsgame/weapon.o
  
+--- a/fpsgame/client.cpp
++++ b/fpsgame/client.cpp
+@@ -1,5 +1,16 @@
+ #include "game.h"
+ #include "processpipe.h" // SwiftGibs clip export (Task 3): found via -Iengine on the include path (Makefile); a plain, self-contained header (no engine.h needed for the processpipe TYPE itself - see shared/iengine.h for the recorder:: functions this file also calls)
++#include "mapstream.h"   // SwiftGibs map streaming (Task 6): changemap hook - manifest lookup + downloader contract. Must be included before "namespace game" opens (mirrors fps.cpp/Task 4) - the whole rest of this file is one namespace game block, and an include placed inside it would declare these as game::* instead of the real global symbols mapstream.cpp defines.
++
++// Forward-declared rather than #include "engine.h" (mirrors mapstream.cpp's
++// own precedent, same reasoning) - client.cpp only needs these two debug-UI
++// hooks, for the map-download progress loop below (Task 6). Both are real
++// symbols (engine/main.cpp), already linked into the same client binary;
++// GLuint/SDLK_ESCAPE come from cube.h's own SDL_opengl.h/SDL.h includes.
++// Must also live outside "namespace game" for the same reason as the
++// include above.
++extern void renderprogress(float bar, const char *text, GLuint tex = 0, bool background = false);
++extern bool interceptkey(int sym);
+ 
+ namespace game
+ {
+@@ -547,6 +558,19 @@
+         nextmode = mode;
+         if(editmode) toggleedit();
+         if(m_demo) { entities::resetspawns(); return; }
++        // SwiftGibs map streaming: fetch a missing stock map before load_world falls
++        // back to an empty world. Never triggers for maps we have or don't know.
++        if(!m_edit && name[0] && !fileexists(findfile(mapstreamogzpath(name), "r"), "r")
++           && mapmanifestfind(name) && mapstreambegin(name))
++        {
++            while(mapstreamstate() == MS_ACTIVE)
++            {
++                renderprogress(mapstreamprogress(), mapstreamstatustext());
++                if(interceptkey(SDLK_ESCAPE)) { mapstreamcancel(); break; }
++            }
++            if(mapstreamstate() != MS_DONE) conoutf(CON_ERROR, "map download failed: %s", mapstreamstatustext());
++            // fall through: load_world now finds the file, or the vanilla emptymap path runs
++        }
+         if((m_edit && !name[0]) || !load_world(name))
+         {
+             emptymap(0, true, name);
 --- a/fpsgame/fps.cpp
 +++ b/fpsgame/fps.cpp
 @@ -1,5 +1,6 @@
@@ -35,7 +74,7 @@
  
 --- /dev/null
 +++ b/fpsgame/mapstream.h
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,55 @@
 +// mapstream.h: shipped map manifest (format, load, lookup) plus the
 +// background downloader that fetches a missing map's .ogz (+.wpt) from
 +// mapstreamurl on demand.
@@ -59,6 +98,14 @@
 +
 +void loadmapmanifest();                                   // reads data/mapmanifest.cfg, silent no-op if absent
 +const mapmanifestentry *mapmanifestfind(const char *name);
++
++// mapstreamogzpath(name): engine-relative "packages/<pak>/<map>.ogz" path
++// for `name`, using the exact same name-handling as engine/worldio.cpp's
++// setmapfilenames() (getmapfilenames(), "base/" prefixing when name has no
++// slash) - so this always names the file load_world() will actually look
++// for. Used by the changemap hook (Task 6, fpsgame/client.cpp) to check
++// whether a map is already present before consulting the manifest.
++const char *mapstreamogzpath(const char *name);
 +
 +// --- Task 5: background map downloader ---------------------------------
 +// mapstreamurl: host+path the streamer fetches <name>.ogz/<name>.wpt from,
@@ -85,7 +132,7 @@
 +#endif
 --- /dev/null
 +++ b/fpsgame/mapstream.cpp
-@@ -0,0 +1,480 @@
+@@ -0,0 +1,495 @@
 +// mapstream.cpp: load + look up the shipped map manifest (data/mapmanifest.cfg),
 +// plus (Task 5) the background downloader that fetches a missing map's .ogz
 +// (+.wpt) from mapstreamurl on demand. See mapstream.h for the on-disk
@@ -142,6 +189,21 @@
 +    if(!e) { conoutf("%d maps, %s: not found", mapmanifest.length(), lookup); return; }
 +    conoutf("%d maps, %s: %.1fMB%s", mapmanifest.length(), lookup, e->ogzsize/1048576.0f, e->wptsize > 0 ? "+wpt" : "");
 +});
++
++// mapstreamogzpath(name): see mapstream.h. Mirrors engine/worldio.cpp's
++// setmapfilenames() exactly (same getmapfilenames() call, same static-
++// result-buffer discipline as its ogzname/bakname/cfgname) rather than
++// hardcoding "packages/base/%s.ogz", so a manifest entry with a slash in
++// its name would still resolve to the file load_world() actually looks for.
++const char *mapstreamogzpath(const char *name)
++{
++    static string ogzpath;
++    string pakname, mapname, mcfgname;
++    getmapfilenames(name, NULL, pakname, mapname, mcfgname);
++    formatstring(ogzpath, "packages/%s.ogz", mapname);
++    path(ogzpath);
++    return ogzpath;
++}
 +
 +// ==========================================================================
 +// Task 5: background map downloader

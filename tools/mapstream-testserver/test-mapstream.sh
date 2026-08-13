@@ -135,6 +135,25 @@ run_harness()
     echo "$hlog"
 }
 
+# Task 6: runs the harness in --hook mode (mimics the changemap seam's own
+# orchestration sequence - see harness-main.cpp's runhookscenario()). Unlike
+# run_harness() above, this does NOT wipe packages/base/ first - the "already
+# present" scenario below needs a pre-seeded file to survive the call.
+# Writes to $WORK/hook-<name>-<mode>.log and echoes that path.
+run_hook_harness()
+{
+    local mode="$1" name="$2" cancelafter="${3:-0}"
+    local hlog="$WORK/hook-$name-$mode.log"
+    ( cd "$BUNDLE" && MAPSTREAM_TEST_URL="http://127.0.0.1:$PORT" "$HARNESS" --hook "$name" "$cancelafter" > "$hlog" 2>&1 ) || true
+    echo "$hlog"
+}
+
+clean_bundle_maps()
+{
+    rm -rf "${BUNDLE:?}/packages/base"
+    mkdir -p "$BUNDLE/packages/base"
+}
+
 assert_no_files()
 {
     local name="$1" desc="$2"
@@ -240,6 +259,86 @@ hlog="$(run_harness ok shindou)"
 stop_server
 assert_count_eq "shindou: done" 1 "$hlog" "bonus: shindou MS_DONE outcome line logged exactly once"
 [ -f "$BUNDLE/packages/base/shindou.ogz" ] && pass "bonus: shindou (a different manifest entry) streams cleanly too" || fail "bonus: shindou.ogz missing"
+
+# --- Task 6: changemap-hook orchestration (harness --hook) -------------------
+# Route taken per task-6-report.md: the real client cannot boot headless in
+# this environment (same pre-existing WSL crash, re-confirmed the same way as
+# Tasks 2-5 earlier the same day). These scenarios drive harness-main.cpp's
+# runhookscenario(), which mirrors the fpsgame/client.cpp seam's own
+# precondition chain and while(MS_ACTIVE)/interceptkey-simulated-cancel loop
+# line for line - proving the hook's LOGIC; the seam's wiring into
+# fpsgame/client.cpp itself is proven by the compile-proof above (Route 1).
+
+echo "== hook: map already present -> never touches the network =="
+clean_bundle_maps
+echo "not a real map, just a marker the hook must not overwrite" > "$BUNDLE/packages/base/fdm6.ogz"
+MARKERSHA="$(sha256sum "$BUNDLE/packages/base/fdm6.ogz" | cut -d' ' -f1)"
+start_server ok
+hlog="$(run_hook_harness ok fdm6)"
+stop_server
+assert_count_eq "present=yes" 1 "$hlog" "hook/present: reports present=yes"
+assert_count_eq "skip (already present)" 1 "$hlog" "hook/present: skip line logged"
+if grep -q "downloading" "$hlog"; then fail "hook/present: should never contact the network, but a download line was logged"; else pass "hook/present: no download attempted"; fi
+AFTERSHA="$(sha256sum "$BUNDLE/packages/base/fdm6.ogz" | cut -d' ' -f1)"
+[ "$AFTERSHA" = "$MARKERSHA" ] && pass "hook/present: existing file left untouched" || fail "hook/present: existing file was overwritten"
+
+echo "== hook: unknown map name -> skip, no manifest entry =="
+clean_bundle_maps
+start_server ok
+hlog="$(run_hook_harness ok notarealmapname)"
+stop_server
+assert_count_eq "present=no" 1 "$hlog" "hook/unknown: reports present=no"
+assert_count_eq "skip (no manifest entry)" 1 "$hlog" "hook/unknown: skip line logged"
+assert_no_files notarealmapname "hook/unknown"
+
+echo "== hook: success flow (ok mode, file absent) =="
+clean_bundle_maps
+start_server ok
+hlog="$(run_hook_harness ok fdm6)"
+stop_server
+assert_count_eq "present=no" 1 "$hlog" "hook/ok: reports present=no"
+assert_count_eq "RESULT state=MS_DONE" 1 "$hlog" "hook/ok: RESULT line logged exactly once"
+if grep -q "map download failed" "$hlog"; then fail "hook/ok: unexpected failure line on a successful fetch"; else pass "hook/ok: no failure line"; fi
+GOTSHA="$(sha256sum "$BUNDLE/packages/base/fdm6.ogz" 2>/dev/null | cut -d' ' -f1)"
+WANTSHA="$(grep '^fdm6 ' "$BUNDLE/data/mapmanifest.cfg" | awk '{print $3}')"
+[ "$GOTSHA" = "$WANTSHA" ] && pass "hook/ok: hash matches manifest (load_world would now find it)" || fail "hook/ok: hash mismatch ($GOTSHA vs $WANTSHA)"
+[ ! -e "$BUNDLE/packages/base/fdm6.ogz.part" ] && pass "hook/ok: no .part left behind" || fail "hook/ok: stray .part"
+
+echo "== hook: ESC mid-download (stall mode) -> immediate empty-world degrade =="
+clean_bundle_maps
+start_server stall
+STARTMS=$(($(date +%s%N)/1000000))
+hlog="$(run_hook_harness stall fdm6 500)"
+ENDMS=$(($(date +%s%N)/1000000))
+stop_server
+ELAPSED=$((ENDMS - STARTMS))
+assert_count_eq "interceptkey(ESC) -> cancel" 1 "$hlog" "hook/esc: simulated ESC cancel logged exactly once"
+assert_count_eq "map download failed" 1 "$hlog" "hook/esc: outcome line (same text the real seam's conoutf would print) logged exactly once"
+# RESULT here can legitimately read MS_FAILED or MS_OTHER (still MS_ACTIVE):
+# the hook (both the harness's copy and the real seam) calls mapstreamcancel()
+# then breaks and reads state again on the very next line, with no
+# synchronization point in between - the worker thread settles to MS_FAILED
+# within one wait tick (~250ms, same latency Task 5 measured/documented),
+# which can be a few ms after this immediate read. Harmless: the file-state
+# and no-hang guarantees below are unaffected either way, and the console
+# text printed is real (whatever mapstreamstatustext() held at that instant).
+if grep -q "RESULT state=MS_FAILED" "$hlog" || grep -q "RESULT state=MS_OTHER" "$hlog"; then
+    pass "hook/esc: RESULT reflects the cancel (MS_FAILED, or MS_ACTIVE-at-the-instant-of-break)"
+else
+    fail "hook/esc: unexpected RESULT line: $(grep RESULT "$hlog")"
+fi
+if [ "$ELAPSED" -lt 2000 ]; then pass "hook/esc: loop exited (no hang) within 2s (${ELAPSED}ms)"; else fail "hook/esc: took ${ELAPSED}ms, expected < 2000ms (looks hung)"; fi
+assert_no_files fdm6 "hook/esc"
+
+echo "== hook: 404 -> failure outcome without any cancel =="
+clean_bundle_maps
+start_server missing
+hlog="$(run_hook_harness missing fdm6)"
+stop_server
+assert_count_eq "map download failed" 1 "$hlog" "hook/404: outcome line logged exactly once"
+grep -q "404" "$hlog" && pass "hook/404: outcome text carries the HTTP status" || fail "hook/404: expected \"404\" in the outcome text"
+assert_count_eq "RESULT state=MS_FAILED" 1 "$hlog" "hook/404: RESULT line logged exactly once"
+assert_no_files fdm6 "hook/404"
 
 # --- Summary --------------------------------------------------------------
 

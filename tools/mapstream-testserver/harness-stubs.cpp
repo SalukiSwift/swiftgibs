@@ -25,6 +25,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <ctype.h>
 
 // --- console -------------------------------------------------------------
 
@@ -97,6 +98,68 @@ const char *findfile(const char *filename, const char *mode)
     struct stat st;
     if(stat(s, &st) == 0) return s;
     return NULL;
+}
+
+// Task 6: fileexists() stub - findfile() above already stat()s non-w/a modes
+// and returns NULL on a miss, so this only needs to be NULL-safe plus do its
+// own existence check on whatever path a caller resolved itself (matching
+// the "fileexists(findfile(x, mode), mode)" call shape the changemap hook
+// uses - see mapstreamogzpath() below and fpsgame/client.cpp's seam).
+bool fileexists(const char *path, const char *mode)
+{
+    (void)mode;
+    if(!path) return false;
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+// Task 6: path() stub - the real one (shared/stream.cpp) also normalizes
+// "\\" to PATHDIV and handles cube's "<...>"/"&" texture-part markup;
+// irrelevant for the plain engine-relative map paths mapstreamogzpath()
+// ever builds (eg "packages/base/fdm6.ogz"), and PATHDIV is already '/' on
+// Linux, so a no-op is faithful for this harness's domain - not a general
+// port of the real function.
+char *path(char *s) { return s; }
+
+// Task 6: getmapfilenames() stub, standing in for engine/worldio.cpp's real
+// one (not linked here - it pulls in world.h/octa.h/the full renderer, same
+// reasoning as the renderprogress forward-declare below). Mirrors
+// worldio.cpp's getmapfilenames()/validmapname() logic (same "base/"
+// prefixing when the name has no slash) closely enough for this harness's
+// own map names (fdm6/shindou/reissen: plain ASCII, no slashes) - uses
+// isalnum() rather than the real iscubealnum()/cubectype table (shared/
+// stream.cpp, also not linked here), which is equivalent for that domain.
+static void harnessvalidmapname(char *dst, const char *src, const char *prefix, const char *alt)
+{
+    if(prefix) while(*prefix) *dst++ = *prefix++;
+    char *start = dst;
+    if(src) for(int i = 0; i < 100 && src[i]; i++)
+    {
+        char c = src[i];
+        if(isalnum((uchar)c) || c == '_' || c == '-' || c == '/' || c == '\\') *dst++ = c;
+        else break;
+    }
+    if(dst > start) *dst = '\0';
+    else if(dst != alt) copystring(dst, alt, 100);
+}
+
+void getmapfilenames(const char *fname, const char *cname, char *pakname, char *mapname, char *cfgname)
+{
+    if(!cname) cname = fname;
+    string name;
+    harnessvalidmapname(name, cname, NULL, "");
+    char *slash = strpbrk(name, "/\\");
+    if(slash)
+    {
+        copystring(pakname, name, slash-name+1);
+        copystring(cfgname, slash+1, MAXSTRLEN);
+    }
+    else
+    {
+        copystring(pakname, "base", MAXSTRLEN);
+        copystring(cfgname, name, MAXSTRLEN);
+    }
+    harnessvalidmapname(mapname, fname, strpbrk(fname, "/\\") ? NULL : "base/", "untitled");
 }
 
 struct harnessfilestream : stream
