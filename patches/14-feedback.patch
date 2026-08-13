@@ -268,7 +268,7 @@
 +#endif
 --- /dev/null
 +++ b/fpsgame/sghttp.cpp
-@@ -0,0 +1,393 @@
+@@ -0,0 +1,398 @@
 +// sghttp.cpp: minimal blocking HTTP/1.1 GET/POST transport over raw enet
 +// sockets. Shared by the in-game feedback POST and the launch-time
 +// update-check GET (see engine/serverbrowser.cpp) - previously each hand-rolled
@@ -300,7 +300,12 @@
 +#include "sghttp.h"
 +
 +// Last failure phase, per calling thread - see sghttp.h for the contract.
-+static thread_local int sghttplasterr = SGHTTP_ERR_NONE;
++// __thread, not C++11 thread_local: the vendor Makefile sets no -std=, and
++// Apple Clang's flagless default dialect lacks thread_local under that
++// setup; __thread is a GCC/Clang storage-class extension that works for a
++// plain int on Linux g++, mingw-w64 g++, and Apple Clang alike, with no
++// C++11 requirement.
++static __thread int sghttplasterr = SGHTTP_ERR_NONE;
 +
 +int sghttperrphase() { return sghttplasterr; }
 +
