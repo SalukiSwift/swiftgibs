@@ -172,6 +172,18 @@ run_all_harness()
     echo "$hlog"
 }
 
+# Task 7 round-2 fix: runs the harness in --staleness mode (proves the idle
+# "N/331 downloaded" count reflects a single organic download via
+# mapstreamallrefresh(), WITHOUT ever calling mapstreamall). Does NOT wipe
+# packages/base/ first - callers control that themselves.
+run_staleness_harness()
+{
+    local name="$1"
+    local hlog="$WORK/staleness-$name.log"
+    ( cd "$BUNDLE" && MAPSTREAM_TEST_URL="http://127.0.0.1:$PORT" "$HARNESS" --staleness "$name" > "$hlog" 2>&1 ) || true
+    echo "$hlog"
+}
+
 assert_no_files()
 {
     local name="$1" desc="$2"
@@ -431,19 +443,41 @@ stop_server
 ELAPSED=$((ENDMS - STARTMS))
 assert_count_eq "cancel requested" 1 "$hlog" "bulk/cancel: cancel logged exactly once"
 if [ "$ELAPSED" -lt 2000 ]; then pass "bulk/cancel: sweep stopped within 2s (${ELAPSED}ms)"; else fail "bulk/cancel: took ${ELAPSED}ms, expected < 2000ms"; fi
-RESULTLINE="$(grep "RESULT" "$hlog" || true)"
-DONE="$(echo "$RESULTLINE" | grep -oP 'done=\K[0-9]+' || echo -1)"
-FAILED="$(echo "$RESULTLINE" | grep -oP 'failed=\K[0-9]+' || echo -1)"
-TOTAL="$(echo "$RESULTLINE" | grep -oP 'total=\K[0-9]+' || echo -1)"
-ACTIVE="$(echo "$RESULTLINE" | grep -oP 'active=\K[0-9]+' || echo -1)"
-if [ "$ACTIVE" = "0" ] && [ $((DONE + FAILED)) -le "$TOTAL" ]; then
-    pass "bulk/cancel: counters sane after cancel (done=$DONE failed=$FAILED total=$TOTAL active=$ACTIVE)"
-else
-    fail "bulk/cancel: counters not sane: $RESULTLINE"
-fi
+# Code-review fix (round 2): this scenario's setup is fully deterministic
+# (clean bundle, mode=stall so nothing ever completes, cancel fired at a
+# fixed 400ms) - the ORIGINAL loose check here (`active==0 &&
+# done+failed<=total`) would also pass on obviously-wrong states like
+# total=0 or a spurious done=1, so it couldn't actually catch a counter
+# regression. Asserting the exact expected RESULT line (same style as the
+# mixed/retry scenarios above) is the real regression guard.
+assert_count_eq "RESULT done=0 total=3 failed=0 active=0" 1 "$hlog" "bulk/cancel: exact final counters (nothing completed, nothing failed, active=0)"
 assert_no_files fdm6 "bulk/cancel"
 assert_no_files reissen "bulk/cancel"
 assert_no_files shindou "bulk/cancel"
+
+# --- Task 7 round-2 fix: idle-counter staleness -----------------------------
+# The idle "N/331 downloaded" count used to latch after its first computation
+# and never update again - a single-file download completing (eg a player
+# picking up a map organically via server rotation, the changemap hook,
+# fpsgame/client.cpp) never touched the bulk atomics, so the count stayed
+# frozen until a sweep ran or the client restarted. Fixed by dropping the
+# latch: mapstreamallrefresh() (a real presence rescan) now runs on every
+# menu OPEN instead of once ever, while the per-frame sync path
+# (mapstreamallsync) stays scan-free. This scenario proves the fix using the
+# exact mechanism a real organic download uses (mapstreambegin(), NOT
+# mapstreamall()) - never running a sweep at any point.
+
+echo "== staleness: organic single-file download is picked up by refresh, not by the per-frame sync =="
+clean_bundle_maps
+start_server ok
+hlog="$(run_staleness_harness fdm6)"
+stop_server
+assert_count_eq "baseline done=0 total=3" 1 "$hlog" "staleness: baseline (nothing downloaded yet) is 0/3"
+assert_count_eq "after-single-download no-refresh done=0" 1 "$hlog" "staleness: WITHOUT a refresh call, the count is still stale right after the organic download (expected - the per-frame path never scans)"
+assert_count_eq "after-refresh done=1 total=3" 1 "$hlog" "staleness: WITH a refresh call (what the menu does on every open), the count correctly reflects the organic download - the bug is fixed"
+GOTSHA="$(sha256sum "$BUNDLE/packages/base/fdm6.ogz" 2>/dev/null | cut -d' ' -f1)"
+WANTSHA="$(grep '^fdm6 ' "$BUNDLE/data/mapmanifest.cfg" | awk '{print $3}')"
+[ "$GOTSHA" = "$WANTSHA" ] && pass "staleness: the organic download itself is a real, verified fetch (hash matches manifest)" || fail "staleness: fdm6 hash mismatch ($GOTSHA vs $WANTSHA)"
 
 # --- Summary --------------------------------------------------------------
 

@@ -48,6 +48,19 @@
 // cancel-after-ms is given and the sweep is still active once that much time
 // has passed, calls mapstreamallcancel() once - mirrors the plain scenario's
 // own cancel-after-ms timer above.
+//
+// usage: harness --staleness <mapname>
+// Task 7 round-2 fix: proves the idle "N/331 downloaded" staleness bug is
+// gone WITHOUT ever running a sweep. Sequence: mapstreamallrefresh() + print
+// the baseline done count; mapstreambegin(mapname) (a single-file download -
+// exactly what the changemap hook does when a player picks up a map
+// organically via server rotation) run to completion; print the done count
+// again with NO refresh call (proves the bulk atomics still correctly do
+// NOT auto-update from a single download - that is by design, not the bug -
+// the per-frame sync path stays cheap precisely because it never scans);
+// mapstreamallrefresh() again + print the done count a third time (must now
+// be baseline+1, proving a menu-open-triggered refresh picks up the
+// organically-downloaded file without ever calling mapstreamallbegin()).
 
 #include "cube.h"
 #include "mapstream.h"
@@ -160,6 +173,44 @@ static int runallscenario(int cancelafterms)
     return 0;
 }
 
+// Task 7 round-2 fix: staleness scenario - see the usage comment above.
+static int runstalenessscenario(const char *name)
+{
+    mapstreamallrefresh();
+    int baseline = mapstreamalldonecount();
+    printf("HARNESS: baseline done=%d total=%d\n", baseline, mapstreamalltotalcount());
+    fflush(stdout);
+
+    if(!mapmanifestfind(name))
+    {
+        fprintf(stderr, "HARNESS: no manifest entry for %s (check data/mapmanifest.cfg in CWD)\n", name);
+        return 2;
+    }
+    if(!mapstreambegin(name))
+    {
+        printf("HARNESS: begin-failed\n");
+        fflush(stdout);
+        return 1;
+    }
+    while(mapstreamstate() == MS_ACTIVE) SDL_Delay(20);
+    if(mapstreamstate() != MS_DONE)
+    {
+        printf("HARNESS: single-download failed: %s\n", mapstreamstatustext());
+        fflush(stdout);
+        return 1;
+    }
+
+    int nosync = mapstreamalldonecount();
+    printf("HARNESS: after-single-download no-refresh done=%d\n", nosync);
+    fflush(stdout);
+
+    mapstreamallrefresh();
+    int refreshed = mapstreamalldonecount();
+    printf("HARNESS: after-refresh done=%d total=%d\n", refreshed, mapstreamalltotalcount());
+    fflush(stdout);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if(argc < 2)
@@ -167,14 +218,17 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: %s <mapname> [cancel-after-ms]\n", argv[0]);
         fprintf(stderr, "       %s --hook <mapname> [cancel-after-ms]\n", argv[0]);
         fprintf(stderr, "       %s --all [cancel-after-ms]\n", argv[0]);
+        fprintf(stderr, "       %s --staleness <mapname>\n", argv[0]);
         return 2;
     }
 
     bool hookmode = !strcmp(argv[1], "--hook");
     bool allmode = !hookmode && !strcmp(argv[1], "--all");
-    if(hookmode && argc < 3)
+    bool stalemode = !hookmode && !allmode && !strcmp(argv[1], "--staleness");
+    if((hookmode || stalemode) && argc < 3)
     {
         fprintf(stderr, "usage: %s --hook <mapname> [cancel-after-ms]\n", argv[0]);
+        fprintf(stderr, "       %s --staleness <mapname>\n", argv[0]);
         return 2;
     }
 
@@ -188,6 +242,8 @@ int main(int argc, char **argv)
         int cancelafter = argc > 2 ? atoi(argv[2]) : 0;
         return runallscenario(cancelafter);
     }
+
+    if(stalemode) return runstalenessscenario(argv[2]);
 
     const char *name = hookmode ? argv[2] : argv[1];
     int cancelafter = hookmode ? (argc > 3 ? atoi(argv[3]) : 0) : (argc > 2 ? atoi(argv[2]) : 0);

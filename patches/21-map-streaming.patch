@@ -74,7 +74,7 @@
  
 --- /dev/null
 +++ b/fpsgame/mapstream.h
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,80 @@
 +// mapstream.h: shipped map manifest (format, load, lookup) plus the
 +// background downloader that fetches a missing map's .ogz (+.wpt) from
 +// mapstreamurl on demand.
@@ -144,10 +144,20 @@
 +int mapstreamallfailedcount();     // failed count, this run
 +void mapstreamallcancel();         // == mapstreamcancel(); async-safe, same one-wait-tick latency
 +
++// Refreshes mapstreamalldonecount()'s figure from a fresh on-disk presence
++// scan (never touches the failed count - see mapstream.cpp). No-op while a
++// sweep is active. Called on menu OPEN (not per frame) so the idle "N/331
++// downloaded" line can never go stale from maps picked up organically via
++// the changemap hook, which correctly never touches these bulk atomics
++// itself. Cheap (~331 stat() calls, no hashing) but still not free, which is
++// exactly why it's an explicit menu-open call rather than folded into the
++// per-frame sync below.
++void mapstreamallrefresh();
++
 +#endif
 --- /dev/null
 +++ b/fpsgame/mapstream.cpp
-@@ -0,0 +1,714 @@
+@@ -0,0 +1,747 @@
 +// mapstream.cpp: load + look up the shipped map manifest (data/mapmanifest.cfg),
 +// plus (Task 5) the background downloader that fetches a missing map's .ogz
 +// (+.wpt) from mapstreamurl on demand. See mapstream.h for the on-disk
@@ -713,16 +723,21 @@
 +// ==========================================================================
 +
 +// Presence-only scan of the WHOLE manifest (main thread only; ~331 cheap
-+// stat()s via fileexists()/findfile(), run at most once per process - see
-+// mapstreamallscanned below). This is what makes the idle-state "N/331
-+// downloaded" status line correct the very first time the maps page is
-+// opened, before any sweep has ever run this session. Uses mapstreamogzpath()
-+// + fileexists() - the EXACT same presence check the Task 6 changemap hook
-+// uses (fpsgame/client.cpp) - not the bulk sweep's own hardcoded
-+// "packages/base/%s.ogz" existence check below, per the brief's explicit
-+// instruction to reuse that pairing for presence checks.
-+static bool mapstreamallscanned = false;   // main-thread only: has an idle-state count ever been published (by this scan, or by a completed/started sweep, whose own atomics are equally authoritative)?
-+
++// stat()s via fileexists()/findfile() - no hashing, no network - see
++// mapstreamallrefresh() below for when this actually runs). Uses
++// mapstreamogzpath() + fileexists() - the EXACT same presence check the
++// Task 6 changemap hook uses (fpsgame/client.cpp) - not the bulk sweep's
++// own hardcoded "packages/base/%s.ogz" existence check below, per the
++// brief's explicit instruction to reuse that pairing for presence checks.
++//
++// Only touches mapstreamalldoneatom/mapstreamalltotalatom - NEVER
++// mapstreamallfailedatom. "done" (how many of the 331 are actually present
++// right now) is the figure the idle status line promises to keep honest;
++// "failed" is a different, deliberately session-sticky concept ("how many
++// did the LAST sweep attempt fail on") that this scan has no business
++// overwriting - a rescan that also zeroed "failed" would silently erase a
++// legitimate "retry failed" prompt every time the player merely reopened
++// the page.
 +static void mapstreamallscan()
 +{
 +    int total = mapmanifest.length(), present = 0;
@@ -732,8 +747,30 @@
 +    }
 +    SDL_AtomicSet(&mapstreamalldoneatom, present);
 +    SDL_AtomicSet(&mapstreamalltotalatom, total);
-+    SDL_AtomicSet(&mapstreamallfailedatom, 0);   // nothing attempted yet
-+    mapstreamallscanned = true;
++}
++
++// Code-review fix (round 2): the original design latched a "scanned once
++// ever" bool and never rescanned again - so a player who picked up maps
++// organically via server rotation (the changemap hook, fpsgame/client.cpp,
++// which correctly never touches these bulk atomics - it's a single-file
++// download, not a sweep) saw a permanently frozen "N/331 downloaded" count
++// until they either ran a sweep or restarted the client. Fixed via the
++// "rescan on menu open" option: the latch is gone entirely: mapstreamallrefresh()
++// is called explicitly by the "download maps.." button (overlay/
++// menus_settings.cfg), BEFORE showgui, every single time the page is
++// opened - not just the first time - so the idle count is always freshly
++// honest the moment the player looks at it. This keeps the cost bounded to
++// "once per menu open" (a few hundred stat() calls, negligible - see the
++// harness timing proof in this round's fix report) rather than "once per
++// frame" (mapstreamallsync() below still does zero scanning, unchanged -
++// the coordinator's explicit requirement that the per-frame path stay
++// cheap). No-op while a sweep is active: the sweep's own atomics are
++// already live and more authoritative than a stale scan would be, and
++// scanning during a sweep would be redundant work racing the sweep's own
++// writes to the same atom for no benefit.
++void mapstreamallrefresh()
++{
++    if(!mapstreamallisactive()) mapstreamallscan();
 +}
 +
 +static SDL_Thread *mapstreamallthread = NULL;
@@ -823,7 +860,6 @@
 +    SDL_AtomicSet(&mapstreamalltotalatom, mapmanifest.length());
 +    SDL_AtomicSet(&mapstreamallfailedatom, 0);
 +    SDL_AtomicSet(&mapstreamallactiveatom, 1);
-+    mapstreamallscanned = true;   // the sweep's own atomics are authoritative now - no idle rescan needed again this session, even after it finishes (see mapstreamallsync())
 +
 +    mapstreamallthread = SDL_CreateThread(mapstreamallthreadfn, "map stream all", NULL);
 +    if(!mapstreamallthread) { SDL_AtomicSet(&mapstreamallactiveatom, 0); return false; }
@@ -846,14 +882,21 @@
 +// /mapstreamallcancel - see mapstreamallcancel() above.
 +ICOMMAND(mapstreamallcancel, "", (), mapstreamallcancel());
 +
++// /mapstreamallrefresh - see mapstreamallrefresh() above. Called explicitly
++// by the "download maps.." button (overlay/menus_settings.cfg), before
++// showgui, so the idle "N/331 downloaded" line is always freshly correct
++// the moment the page opens - never per frame (see mapstreamallsync below).
++ICOMMAND(mapstreamallrefresh, "", (), mapstreamallrefresh());
++
 +// /mapstreamallsync - publishes mapstreamalldone/mapstreamalltotal/
 +// mapstreamallfailed/mapstreamallactive (see the alias-pushing note in the
 +// Task 7 banner above). The maps menu page calls this once per frame it is
-+// shown; it is a no-op-cheap read of 4 atomics plus (at most once per
-+// process) the presence scan above.
++// shown; it is a cheap read of 4 atomics ONLY - no scan, no filesystem
++// access, ever (round-2 fix: scanning used to sneak in here on the first
++// idle frame - moved out entirely to mapstreamallrefresh() above, which
++// only runs on menu-open, so this per-frame path stays cheap unconditionally).
 +ICOMMAND(mapstreamallsync, "", (),
 +{
-+    if(!mapstreamallisactive() && !mapstreamallscanned) mapstreamallscan();
 +    defformatstring(donebuf, "%d", mapstreamalldonecount());
 +    defformatstring(totalbuf, "%d", mapstreamalltotalcount());
 +    defformatstring(failedbuf, "%d", mapstreamallfailedcount());
