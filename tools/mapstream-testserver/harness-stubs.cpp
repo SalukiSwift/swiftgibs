@@ -238,3 +238,14 @@ void renderprogress(float bar, const char *text, GLuint tex, bool background)
 {
     (void)bar; (void)text; (void)tex; (void)background;
 }
+
+// Task 7: alias()/result() stubs - not called by the harness's own driver
+// (it calls mapstreamallbegin()/mapstreamalldonecount()/etc. directly), but
+// still need to be linkable: mapstreamallsync()'s and mapstreamstatustext()'s
+// ICOMMAND macro expansions in mapstream.cpp emit real, address-taken
+// functions that reference them regardless of whether this harness's own
+// (nonexistent) script interpreter ever calls those commands - same
+// addcommand/svariable reasoning as the rest of this file's "cube scripting
+// registration" section above.
+void alias(const char *name, const char *action) { (void)name; (void)action; }
+void result(const char *s) { (void)s; }

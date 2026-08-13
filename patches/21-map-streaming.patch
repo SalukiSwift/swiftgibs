@@ -74,7 +74,7 @@
  
 --- /dev/null
 +++ b/fpsgame/mapstream.h
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,70 @@
 +// mapstream.h: shipped map manifest (format, load, lookup) plus the
 +// background downloader that fetches a missing map's .ogz (+.wpt) from
 +// mapstreamurl on demand.
@@ -129,10 +129,25 @@
 +const char *mapstreamstatustext();           // "downloading fdm6 (0.6 MB)" / failure reason
 +void mapstreamcancel();                      // async-safe; thread notices within one wait tick
 +
++// --- Task 7: bulk "download all maps" sweep -----------------------------
++// Downloads every manifest entry not already present, sequentially, on its
++// OWN background thread - a second, separate mechanism from the single-file
++// thread above (mapstreambegin()/mapstreamthread), never running at the
++// same time as it (see mapstream.cpp's Task 7 banner comment for exactly
++// how the two stay mutually exclusive). mapstreamallcancel() shares
++// mapstreamcancel()'s underlying flag rather than adding a second one -
++// safe precisely because of that mutual exclusion.
++bool mapstreamallbegin();          // false if unable to start (a single fetch is active, or a sweep is already running)
++bool mapstreamallisactive();
++int mapstreamalldonecount();       // present-on-disk + newly fetched OK count, this run (or the idle scan - see mapstream.cpp)
++int mapstreamalltotalcount();      // manifest size (fixed)
++int mapstreamallfailedcount();     // failed count, this run
++void mapstreamallcancel();         // == mapstreamcancel(); async-safe, same one-wait-tick latency
++
 +#endif
 --- /dev/null
 +++ b/fpsgame/mapstream.cpp
-@@ -0,0 +1,495 @@
+@@ -0,0 +1,714 @@
 +// mapstream.cpp: load + look up the shipped map manifest (data/mapmanifest.cfg),
 +// plus (Task 5) the background downloader that fetches a missing map's .ogz
 +// (+.wpt) from mapstreamurl on demand. See mapstream.h for the on-disk
@@ -244,9 +259,18 @@
 +
 +static SDL_Thread *mapstreamthread = NULL;
 +static SDL_atomic_t mapstreamstateatom;    // MS_*
-+static SDL_atomic_t mapstreamcancelatom;   // 0/1, set by mapstreamcancel()
++static SDL_atomic_t mapstreamcancelatom;   // 0/1, set by mapstreamcancel() - ALSO the bulk sweep's cancel flag, see the Task 7 banner comment near the bottom of this file
 +static SDL_atomic_t mapstreamgotatom;      // bytes received, current fetch
 +static SDL_atomic_t mapstreamtotalatom;    // bytes expected, current fetch (<=0 = unknown/none)
++
++// Task 7's own atomics, declared up here (rather than down with the rest of
++// the bulk-sweep code, at the end of this file) purely so mapstreambegin()
++// below can see mapstreamallactiveatom for its own mutual-exclusion guard.
++// See the "Task 7" banner further down for the full bulk-sweep design.
++static SDL_atomic_t mapstreamallactiveatom;   // 0/1
++static SDL_atomic_t mapstreamalldoneatom;     // count
++static SDL_atomic_t mapstreamalltotalatom;    // count
++static SDL_atomic_t mapstreamallfailedatom;   // count
 +
 +static SDL_SpinLock mapstreamtextlock = 0;
 +static string mapstreamtextbuf = "";
@@ -543,6 +567,7 @@
 +{
 +    if(!name || !name[0]) return false;
 +    if(mapstreamstate() == MS_ACTIVE) return false;   // one fetch at a time
++    if(SDL_AtomicGet(&mapstreamallactiveatom)) return false;   // Task 7: a bulk sweep owns the thread while it runs - same "another fetch already active" contract, just extended to cover the second kind of fetch
 +
 +    const mapmanifestentry *entry = mapmanifestfind(name);
 +    if(!entry) return false;
@@ -628,6 +653,215 @@
 +
 +// /mapstreamcancel - async-safe; the worker thread notices within one wait tick (~250ms).
 +ICOMMAND(mapstreamcancel, "", (), mapstreamcancel());
++
++// /mapstreamstatustext - cubescript-callable wrapper around the same
++// mapstreamstatustext() contract function every route above already uses;
++// there was previously no script-visible way to read it (only C++ callers
++// like mapstreamwaitloop()). Needed by the maps menu (Task 7) to show the
++// CURRENT FILE's progress text ("downloading fdm6.ogz (0.6 MB, attempt 1)")
++// while a bulk sweep is active - see the Task 7 section below, which
++// reuses mapstreamfetchfile() (and therefore mapstreamsettext()) unchanged,
++// so this one accessor serves both the single-fetch and bulk-sweep cases.
++ICOMMAND(mapstreamstatustext, "", (), result(mapstreamstatustext()));
++
++// ==========================================================================
++// Task 7: bulk "download all maps" sweep
++//
++// Ownership/thread-sharing decision (documented per the task brief's
++// instruction to decide this cleanly): bulk and single-file downloads are
++// two SEPARATE SDL_Thread mechanisms (mapstreamallthread here vs.
++// mapstreamthread above) that are never allowed to run at the same time.
++// mapstreambegin() (Task 5, used by the changemap hook - see fpsgame/
++// client.cpp) already refuses to start "while another fetch is already
++// active"; that guard now also checks mapstreamallactiveatom (see above),
++// so a bulk sweep owns the thread/network for its whole run and begin()
++// simply refuses during it - exactly the existing MS_ACTIVE refusal,
++// mirrored for the second kind of fetch. mapstreamallbegin() (below) is
++// symmetric: it refuses to start while a single fetch is MS_ACTIVE. This
++// keeps "one file in flight at a time" true across BOTH paths combined,
++// not just within each one alone. The one edge case this creates - a
++// server-forced changemap arriving while the maps menu is mid-sweep - just
++// degrades exactly like an unknown manifest entry already does: begin()
++// returns false, the hook's `&&` chain never enters its block, and
++// load_world() falls through to the vanilla empty-map path. No crash, no
++// second concurrent download.
++//
++// mapstreamallcancel() below is literally mapstreamcancel() - the SAME
++// mapstreamcancelatom, not a second flag. This is safe (and not confusing
++// in practice) precisely BECAUSE of the mutual exclusion above: whichever
++// of the two fetch kinds is active is the only one reading that atom at any
++// given moment. Both begin() functions reset it to 0 on their own start, so
++// a cancel left over from one kind of fetch can never bleed into the next.
++// This also means "cancel checked inside tick" comes for free: the bulk
++// loop below reuses mapstreamfetchfile() unchanged, which already builds a
++// mapstreamprogresscb that checks this exact atom on every network read.
++//
++// Alias pushing: the worker thread below (mapstreamallthreadfn) ONLY ever
++// touches SDL atomics, never alias()/conoutf/any cubescript entry point -
++// same discipline as Task 5's single-file worker. alias() mutates the
++// global cubescript ident table and is main-thread-only. mapstreamallsync()
++// (an ICOMMAND, so always invoked by the main-thread script interpreter) is
++// what actually calls alias() to publish mapstreamalldone/mapstreamalltotal/
++// mapstreamallfailed/mapstreamallactive - the menu page calls it once per
++// drawn frame while sgMapsGui is open (the same "call a C++ accessor once
++// per frame the gui is open" idiom fpsstatscount()/clipfilecount() already
++// use elsewhere in this codebase for their own live-updating gui content).
++// Since the underlying atomics only ever change once per completed file
++// (never per network tick), each frame's alias() call just republishes
++// whatever the worker last wrote - satisfying "updates after each file,
++// no per-tick alias spam" without the worker ever touching script state.
++// ==========================================================================
++
++// Presence-only scan of the WHOLE manifest (main thread only; ~331 cheap
++// stat()s via fileexists()/findfile(), run at most once per process - see
++// mapstreamallscanned below). This is what makes the idle-state "N/331
++// downloaded" status line correct the very first time the maps page is
++// opened, before any sweep has ever run this session. Uses mapstreamogzpath()
++// + fileexists() - the EXACT same presence check the Task 6 changemap hook
++// uses (fpsgame/client.cpp) - not the bulk sweep's own hardcoded
++// "packages/base/%s.ogz" existence check below, per the brief's explicit
++// instruction to reuse that pairing for presence checks.
++static bool mapstreamallscanned = false;   // main-thread only: has an idle-state count ever been published (by this scan, or by a completed/started sweep, whose own atomics are equally authoritative)?
++
++static void mapstreamallscan()
++{
++    int total = mapmanifest.length(), present = 0;
++    loopv(mapmanifest)
++    {
++        if(fileexists(findfile(mapstreamogzpath(mapmanifest[i].name), "r"), "r")) present++;
++    }
++    SDL_AtomicSet(&mapstreamalldoneatom, present);
++    SDL_AtomicSet(&mapstreamalltotalatom, total);
++    SDL_AtomicSet(&mapstreamallfailedatom, 0);   // nothing attempted yet
++    mapstreamallscanned = true;
++}
++
++static SDL_Thread *mapstreamallthread = NULL;
++
++// Sweeps the whole manifest, one file at a time, reusing mapstreamfetchfile()/
++// mapstreamwritefile()/mapstreamremovepart()/mapstreamparseurl() (Task 5)
++// completely unchanged - this function is just the loop + bookkeeping around
++// them, mirroring mapstreamthreadfn()'s own ogz-then-optional-wpt shape for
++// each entry. Skip-existing is presence-only (mapstreamogzpath()+fileexists(),
++// same as the idle scan above and the Task 6 hook); a skipped or successfully
++// fetched entry counts as "done", any other outcome counts as "failed" -
++// EXCEPT a cancellation, which stops the sweep immediately without counting
++// that entry either way (it was never actually attempted to completion), so
++// the published counters always stay internally consistent
++// (done+failed <= total) and no stray partial credit is given.
++static int mapstreamallthreadfn(void *)
++{
++    int total = mapmanifest.length();
++    int done = 0, failed = 0;
++
++    for(int i = 0; i < total; i++)
++    {
++        if(SDL_AtomicGet(&mapstreamcancelatom)) break;   // cancel checked BETWEEN files - catches a cancel while breezing through already-present entries, which never reach the tick-checked fetch below
++
++        const mapmanifestentry &entry = mapmanifest[i];
++
++        if(fileexists(findfile(mapstreamogzpath(entry.name), "r"), "r"))
++        {
++            done++;
++            SDL_AtomicSet(&mapstreamalldoneatom, done);
++            continue;   // skip-existing, presence only - never touches the network for this entry
++        }
++
++        string host, pathprefix; int port;
++        bool ok = false;
++        if(mapstreamparseurl(mapstreamurl, host, pathprefix, port))
++        {
++            defformatstring(ogzurl, "%s/%s.ogz", pathprefix, entry.name);
++            defformatstring(ogzrel, "packages/base/%s.ogz", entry.name);
++            defformatstring(ogzpartrel, "packages/base/%s.ogz.part", entry.name);
++            mapstreamremovepart(ogzpartrel);
++
++            vector<uchar> ogzdata;
++            int outcome = mapstreamfetchfile(host, port, ogzurl, entry.name, ".ogz", entry.ogzsize, entry.ogzsha, ogzdata);
++            if(outcome == MSFETCH_CANCELLED) break;   // cancel noticed INSIDE the tick - stop the sweep now; this entry counts as neither done nor failed
++
++            ok = (outcome == MSFETCH_OK) && mapstreamwritefile(ogzpartrel, ogzrel, ogzdata);
++
++            if(ok && entry.wptsize > 0)
++            {
++                // wpt is best-effort, exactly like the single-file path
++                // (Task 5) - never turns an otherwise-successful ogz into a
++                // failure. A cancel landing here is silently non-fatal to
++                // this entry's "done" credit; the NEXT loop iteration's
++                // top-of-loop check (above) is what actually stops the sweep.
++                defformatstring(wpturl, "%s/%s.wpt", pathprefix, entry.name);
++                defformatstring(wptrel, "packages/base/%s.wpt", entry.name);
++                defformatstring(wptpartrel, "packages/base/%s.wpt.part", entry.name);
++                mapstreamremovepart(wptpartrel);
++                vector<uchar> wptdata;
++                int wptoutcome = mapstreamfetchfile(host, port, wpturl, entry.name, ".wpt", entry.wptsize, entry.wptsha, wptdata);
++                if(wptoutcome == MSFETCH_OK) mapstreamwritefile(wptpartrel, wptrel, wptdata);
++            }
++        }
++
++        if(ok) { done++; SDL_AtomicSet(&mapstreamalldoneatom, done); }
++        else { failed++; SDL_AtomicSet(&mapstreamallfailedatom, failed); }
++    }
++
++    SDL_AtomicSet(&mapstreamallactiveatom, 0);
++    return 0;
++}
++
++bool mapstreamallbegin()
++{
++    if(mapstreamstate() == MS_ACTIVE) return false;             // a single fetch (eg the changemap hook) owns the thread right now
++    if(SDL_AtomicGet(&mapstreamallactiveatom)) return false;    // a sweep is already running
++
++    // Reap a finished sweep thread from a previous run, same reasoning as
++    // mapstreambegin()'s own reap: by the time mapstreamallactiveatom reads
++    // 0 the thread function has already made that its last act before
++    // returning, so this join completes immediately.
++    if(mapstreamallthread) { SDL_WaitThread(mapstreamallthread, NULL); mapstreamallthread = NULL; }
++
++    SDL_AtomicSet(&mapstreamcancelatom, 0);
++    SDL_AtomicSet(&mapstreamalldoneatom, 0);
++    SDL_AtomicSet(&mapstreamalltotalatom, mapmanifest.length());
++    SDL_AtomicSet(&mapstreamallfailedatom, 0);
++    SDL_AtomicSet(&mapstreamallactiveatom, 1);
++    mapstreamallscanned = true;   // the sweep's own atomics are authoritative now - no idle rescan needed again this session, even after it finishes (see mapstreamallsync())
++
++    mapstreamallthread = SDL_CreateThread(mapstreamallthreadfn, "map stream all", NULL);
++    if(!mapstreamallthread) { SDL_AtomicSet(&mapstreamallactiveatom, 0); return false; }
++    return true;
++}
++
++bool mapstreamallisactive() { return SDL_AtomicGet(&mapstreamallactiveatom) != 0; }
++int mapstreamalldonecount() { return SDL_AtomicGet(&mapstreamalldoneatom); }
++int mapstreamalltotalcount() { return SDL_AtomicGet(&mapstreamalltotalatom); }
++int mapstreamallfailedcount() { return SDL_AtomicGet(&mapstreamallfailedatom); }
++void mapstreamallcancel() { mapstreamcancel(); }   // shared flag - see the Task 7 banner comment above
++
++// /mapstreamall - starts (or retries) the bulk sweep; skip-existing makes a
++// second call after a partial-failure run naturally a "retry failed".
++ICOMMAND(mapstreamall, "", (),
++{
++    if(!mapstreamallbegin()) conoutf(CON_ERROR, "mapstreamall: could not start (a single-map download is active, or a sweep is already running)");
++});
++
++// /mapstreamallcancel - see mapstreamallcancel() above.
++ICOMMAND(mapstreamallcancel, "", (), mapstreamallcancel());
++
++// /mapstreamallsync - publishes mapstreamalldone/mapstreamalltotal/
++// mapstreamallfailed/mapstreamallactive (see the alias-pushing note in the
++// Task 7 banner above). The maps menu page calls this once per frame it is
++// shown; it is a no-op-cheap read of 4 atomics plus (at most once per
++// process) the presence scan above.
++ICOMMAND(mapstreamallsync, "", (),
++{
++    if(!mapstreamallisactive() && !mapstreamallscanned) mapstreamallscan();
++    defformatstring(donebuf, "%d", mapstreamalldonecount());
++    defformatstring(totalbuf, "%d", mapstreamalltotalcount());
++    defformatstring(failedbuf, "%d", mapstreamallfailedcount());
++    alias("mapstreamalldone", donebuf);
++    alias("mapstreamalltotal", totalbuf);
++    alias("mapstreamallfailed", failedbuf);
++    alias("mapstreamallactive", mapstreamallisactive() ? "1" : "0");
++});
 --- /dev/null
 +++ b/fpsgame/sgsha256.h
 @@ -0,0 +1,30 @@

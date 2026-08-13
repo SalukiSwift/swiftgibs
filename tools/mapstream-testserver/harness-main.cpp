@@ -35,6 +35,19 @@
 // the seam's actual wiring into fpsgame/client.cpp is proven by compile-proof
 // only. See harness-stubs.cpp for the getmapfilenames()/path()/fileexists()
 // stubs mapstreamogzpath() needs that this mode newly pulls in.
+//
+// usage: harness --all [cancel-after-ms]
+// Task 7: drives the bulk "download all maps" sweep directly through its own
+// public contract (mapstreamallbegin/allisactive/alldonecount/alltotalcount/
+// allfailedcount/allcancel - see mapstream.h) - the same functions the
+// mapstreamall/mapstreamallsync/mapstreamallcancel ICOMMANDs wrap for the
+// menu. Polls once per 20ms tick (same cadence mapstreamwaitloop() and the
+// --hook scenario above use) printing "HARNESS: done=D total=T failed=F"
+// whenever any of the three counts change, then a final "HARNESS: RESULT
+// done=... total=... failed=... active=... elapsed_ms=..." line. If
+// cancel-after-ms is given and the sweep is still active once that much time
+// has passed, calls mapstreamallcancel() once - mirrors the plain scenario's
+// own cancel-after-ms timer above.
 
 #include "cube.h"
 #include "mapstream.h"
@@ -104,28 +117,80 @@ static int runhookscenario(const char *name, int cancelafterms)
     return 0;
 }
 
+// Task 7: bulk-sweep scenario - see the usage comment above.
+static int runallscenario(int cancelafterms)
+{
+    Uint32 startticks = SDL_GetTicks();
+    if(!mapstreamallbegin())
+    {
+        printf("HARNESS: begin-failed\n");
+        fflush(stdout);
+        return 1;
+    }
+
+    int lastdone = -1, lasttotal = -1, lastfailed = -1;
+    bool cancelsent = false;
+    while(mapstreamallisactive())
+    {
+        int done = mapstreamalldonecount(), total = mapstreamalltotalcount(), failed = mapstreamallfailedcount();
+        if(done != lastdone || total != lasttotal || failed != lastfailed)
+        {
+            lastdone = done; lasttotal = total; lastfailed = failed;
+            printf("HARNESS: done=%d total=%d failed=%d\n", done, total, failed);
+            fflush(stdout);
+        }
+
+        Uint32 elapsed = SDL_GetTicks() - startticks;
+        if(cancelafterms > 0 && !cancelsent && (int)elapsed >= cancelafterms)
+        {
+            cancelsent = true;
+            mapstreamallcancel();
+            printf("HARNESS: cancel requested at %ums\n", elapsed);
+            fflush(stdout);
+        }
+
+        SDL_Delay(20);
+    }
+
+    Uint32 totalelapsed = SDL_GetTicks() - startticks;
+    printf("HARNESS: RESULT done=%d total=%d failed=%d active=%d elapsed_ms=%u\n",
+           mapstreamalldonecount(), mapstreamalltotalcount(), mapstreamallfailedcount(),
+           mapstreamallisactive() ? 1 : 0, (unsigned)totalelapsed);
+    fflush(stdout);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if(argc < 2)
     {
         fprintf(stderr, "usage: %s <mapname> [cancel-after-ms]\n", argv[0]);
         fprintf(stderr, "       %s --hook <mapname> [cancel-after-ms]\n", argv[0]);
+        fprintf(stderr, "       %s --all [cancel-after-ms]\n", argv[0]);
         return 2;
     }
 
     bool hookmode = !strcmp(argv[1], "--hook");
+    bool allmode = !hookmode && !strcmp(argv[1], "--all");
     if(hookmode && argc < 3)
     {
         fprintf(stderr, "usage: %s --hook <mapname> [cancel-after-ms]\n", argv[0]);
         return 2;
     }
-    const char *name = hookmode ? argv[2] : argv[1];
-    int cancelafter = hookmode ? (argc > 3 ? atoi(argv[3]) : 0) : (argc > 2 ? atoi(argv[2]) : 0);
 
     const char *url = getenv("MAPSTREAM_TEST_URL");
     if(url && url[0]) mapstreamurl = newstring(url);
 
     loadmapmanifest();
+
+    if(allmode)
+    {
+        int cancelafter = argc > 2 ? atoi(argv[2]) : 0;
+        return runallscenario(cancelafter);
+    }
+
+    const char *name = hookmode ? argv[2] : argv[1];
+    int cancelafter = hookmode ? (argc > 3 ? atoi(argv[3]) : 0) : (argc > 2 ? atoi(argv[2]) : 0);
 
     if(hookmode) return runhookscenario(name, cancelafter);
 

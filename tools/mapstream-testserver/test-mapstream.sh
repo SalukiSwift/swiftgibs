@@ -101,14 +101,19 @@ LOG=""
 
 start_server()
 {
-    local mode="$1"
+    local mode="$1" dir="${2:-$MAPSUBSET}"
     LOG="$WORK/serve-$mode.log"
     # A single simple command, not "cd dir && python3 ... &" - backgrounding a
     # compound list captures $! for a subshell wrapper, not the real server
     # PID (found the hard way during development: the wrapper PID's `kill`
     # left the actual python3 process running and the next mode's bind failed
     # with "address already in use"). Absolute paths avoid needing cd at all.
-    python3 "$HERE/serve.py" "$MAPSUBSET" "$PORT" "$mode" > "$LOG" 2>&1 &
+    # Task 7: optional 2nd arg lets a scenario serve a DIFFERENT directory
+    # than the shared 3-map $MAPSUBSET (eg one with a file deliberately
+    # missing, to make that one manifest entry 404 while the others serve
+    # normally) without mutating $MAPSUBSET itself, which every other
+    # section of this script also reuses.
+    python3 "$HERE/serve.py" "$dir" "$PORT" "$mode" > "$LOG" 2>&1 &
     SERVER_PID=$!
     echo "$SERVER_PID" > "$WORK/serve-$mode.pid"
     sleep 0.3
@@ -152,6 +157,19 @@ clean_bundle_maps()
 {
     rm -rf "${BUNDLE:?}/packages/base"
     mkdir -p "$BUNDLE/packages/base"
+}
+
+# Task 7: runs the harness in --all mode (the bulk sweep) against the
+# currently-running server, with an optional cancel-after-ms. Does NOT touch
+# packages/base/ - callers set that up themselves (pre-seeding a file for the
+# skip-existing case is part of what these scenarios are proving). Writes to
+# $WORK/all-<label>.log and echoes that path.
+run_all_harness()
+{
+    local label="$1" cancelafter="${2:-0}"
+    local hlog="$WORK/all-$label.log"
+    ( cd "$BUNDLE" && MAPSTREAM_TEST_URL="http://127.0.0.1:$PORT" "$HARNESS" --all "$cancelafter" > "$hlog" 2>&1 ) || true
+    echo "$hlog"
 }
 
 assert_no_files()
@@ -339,6 +357,93 @@ assert_count_eq "map download failed" 1 "$hlog" "hook/404: outcome line logged e
 grep -q "404" "$hlog" && pass "hook/404: outcome text carries the HTTP status" || fail "hook/404: expected \"404\" in the outcome text"
 assert_count_eq "RESULT state=MS_FAILED" 1 "$hlog" "hook/404: RESULT line logged exactly once"
 assert_no_files fdm6 "hook/404"
+
+# --- Task 7: bulk "download all maps" sweep (harness --all) -----------------
+# Route taken per task-5/6-report.md: the real client cannot boot headless in
+# this environment (same pre-existing WSL crash, re-confirmed the same way
+# earlier the same day - see this task's own report). These scenarios drive
+# harness-main.cpp's runallscenario(), which calls mapstreamallbegin()/
+# mapstreamallisactive()/mapstreamalldonecount()/mapstreamalltotalcount()/
+# mapstreamallfailedcount()/mapstreamallcancel() directly - the exact same
+# public contract the mapstreamall/mapstreamallsync/mapstreamallcancel
+# ICOMMANDs (and therefore the menu) wrap.
+
+echo "== bulk: 1 pre-present + 1 ok + 1 404 -> exact final counters =="
+clean_bundle_maps
+# ALLSUBSET is a SEPARATE serving directory from the shared $MAPSUBSET (which
+# every earlier section in this script also reuses) with shindou's files
+# deliberately absent, so a request for shindou 404s while fdm6/reissen still
+# serve normally - the manifest itself (already generated from the full
+# 3-map $MAPSUBSET above) still lists all three.
+ALLSUBSET="$WORK/allsubset/packages/base"
+mkdir -p "$ALLSUBSET"
+cp "$MAPSUBSET/fdm6.ogz" "$MAPSUBSET/fdm6.wpt" "$MAPSUBSET/reissen.ogz" "$MAPSUBSET/reissen.wpt" "$ALLSUBSET/"
+# fdm6 pre-seeded as deliberate garbage (not a real map) - proves skip-
+# existing is presence-only and genuinely never touches the network for it
+# (same style as the "hook: map already present" scenario above).
+echo "not a real map, just a marker the sweep must not overwrite" > "$BUNDLE/packages/base/fdm6.ogz"
+MARKERSHA="$(sha256sum "$BUNDLE/packages/base/fdm6.ogz" | cut -d' ' -f1)"
+start_server ok "$ALLSUBSET"
+hlog="$(run_all_harness mixed)"
+stop_server
+assert_count_eq "RESULT done=2 total=3 failed=1 active=0" 1 "$hlog" "bulk/mixed: exact final counters (1 pre-present + 1 fetched + 1 failed, active=0)"
+AFTERSHA="$(sha256sum "$BUNDLE/packages/base/fdm6.ogz" | cut -d' ' -f1)"
+[ "$AFTERSHA" = "$MARKERSHA" ] && pass "bulk/mixed: pre-present fdm6 left byte-for-byte untouched (skip-existing never re-fetches)" || fail "bulk/mixed: pre-present fdm6 was overwritten"
+if [ -f "$BUNDLE/packages/base/reissen.ogz" ] && [ ! -e "$BUNDLE/packages/base/reissen.ogz.part" ]; then
+    GOTSHA="$(sha256sum "$BUNDLE/packages/base/reissen.ogz" | cut -d' ' -f1)"
+    WANTSHA="$(grep '^reissen ' "$BUNDLE/data/mapmanifest.cfg" | awk '{print $3}')"
+    [ "$GOTSHA" = "$WANTSHA" ] && pass "bulk/mixed: reissen fetched, hash matches manifest, no .part" || fail "bulk/mixed: reissen hash mismatch ($GOTSHA vs $WANTSHA)"
+else
+    fail "bulk/mixed: reissen.ogz missing or .part left behind"
+fi
+[ -f "$BUNDLE/packages/base/reissen.wpt" ] && pass "bulk/mixed: reissen wpt also fetched" || fail "bulk/mixed: reissen wpt missing"
+assert_no_files shindou "bulk/mixed (the 404'd entry)"
+
+echo "== bulk: retry after failure -> skip-existing makes it a natural retry =="
+# Re-running against a server where shindou now serves too (same ALLSUBSET,
+# topped up) should skip the two already-downloaded maps by presence and
+# only fetch the previously-failed one - proving "retry failed" (the menu's
+# retry button is literally mapstreamall again) actually converges.
+cp "$MAPSUBSET/shindou.ogz" "$MAPSUBSET/shindou.wpt" "$ALLSUBSET/"
+start_server ok "$ALLSUBSET"
+hlog="$(run_all_harness retry)"
+stop_server
+assert_count_eq "RESULT done=3 total=3 failed=0 active=0" 1 "$hlog" "bulk/retry: all 3 present after retry, 0 failed"
+GOTSHA="$(sha256sum "$BUNDLE/packages/base/shindou.ogz" 2>/dev/null | cut -d' ' -f1)"
+WANTSHA="$(grep '^shindou ' "$BUNDLE/data/mapmanifest.cfg" | awk '{print $3}')"
+[ "$GOTSHA" = "$WANTSHA" ] && pass "bulk/retry: shindou fetched this time, hash matches manifest" || fail "bulk/retry: shindou hash mismatch ($GOTSHA vs $WANTSHA)"
+# fdm6 is still the ORIGINAL garbage marker - a retry must never re-verify or
+# re-fetch an already-present file, only ever check presence.
+AFTERSHA="$(sha256sum "$BUNDLE/packages/base/fdm6.ogz" | cut -d' ' -f1)"
+[ "$AFTERSHA" = "$MARKERSHA" ] && pass "bulk/retry: fdm6 still untouched (skip-existing, not skip-if-successful-before)" || fail "bulk/retry: fdm6 was touched on retry"
+
+echo "== bulk: cancel mid-sweep -> clean state, sane counters =="
+clean_bundle_maps
+# mode=stall holds every request open past a half-body write (see serve.py's
+# own comment) - the sweep's first file never completes, giving the cancel
+# something real to interrupt (same reasoning as the single-file stall test
+# above).
+start_server stall "$ALLSUBSET"
+STARTMS=$(($(date +%s%N)/1000000))
+hlog="$(run_all_harness cancel 400)"
+ENDMS=$(($(date +%s%N)/1000000))
+stop_server
+ELAPSED=$((ENDMS - STARTMS))
+assert_count_eq "cancel requested" 1 "$hlog" "bulk/cancel: cancel logged exactly once"
+if [ "$ELAPSED" -lt 2000 ]; then pass "bulk/cancel: sweep stopped within 2s (${ELAPSED}ms)"; else fail "bulk/cancel: took ${ELAPSED}ms, expected < 2000ms"; fi
+RESULTLINE="$(grep "RESULT" "$hlog" || true)"
+DONE="$(echo "$RESULTLINE" | grep -oP 'done=\K[0-9]+' || echo -1)"
+FAILED="$(echo "$RESULTLINE" | grep -oP 'failed=\K[0-9]+' || echo -1)"
+TOTAL="$(echo "$RESULTLINE" | grep -oP 'total=\K[0-9]+' || echo -1)"
+ACTIVE="$(echo "$RESULTLINE" | grep -oP 'active=\K[0-9]+' || echo -1)"
+if [ "$ACTIVE" = "0" ] && [ $((DONE + FAILED)) -le "$TOTAL" ]; then
+    pass "bulk/cancel: counters sane after cancel (done=$DONE failed=$FAILED total=$TOTAL active=$ACTIVE)"
+else
+    fail "bulk/cancel: counters not sane: $RESULTLINE"
+fi
+assert_no_files fdm6 "bulk/cancel"
+assert_no_files reissen "bulk/cancel"
+assert_no_files shindou "bulk/cancel"
 
 # --- Summary --------------------------------------------------------------
 
