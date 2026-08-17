@@ -213,6 +213,18 @@ surgeries = [
     ) + nl, b""),
 ]
 
+# NOT surgered, deliberately: data/menus.cfg's own `spmaps`/`allmaps` alias definitions (used by
+# `showcustommaps` to decide whether the current map counts as "custom") still list all 11
+# campaign map names (lost/skrsp1/crnsp1/level9/mpsp6a-c/mpsp9a-c/mpsp10) even though the actual
+# .ogz/.wpt/.jpg/.cfg files for them are stripped from the bundle by tools/strip-assets.sh. This
+# is intentional, not an oversight: an upgrader's existing install can still have the OLD campaign
+# map files sitting on disk (the updater only adds/changes files, never deletes - see
+# docs/RELEASE_NOTES.md's v1.3.0 note), and if `spmaps`/`allmaps` no longer listed those 11 names,
+# `showcustommaps` would start flagging that stale leftover clutter as "custom maps" and surfacing
+# it in the custom-maps browser. Keeping the names in the list keeps that browser clean for
+# upgraders without needing to touch stock menus.cfg further. A future cleanup that wants to strip
+# these too should only do so once no supported install can still be carrying the old files.
+
 for label, old, new in surgeries:
     n = b.count(old)
     assert n == 1, ("integrate-menus: surgery target missing or ambiguous (%d matches) for: %s, "

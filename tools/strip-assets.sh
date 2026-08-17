@@ -37,7 +37,10 @@ if [ -n "$(find "$SRC/packages/base" -mindepth 1 -type d)" ]; then
   exit 1
 fi
 cp -a "$SRC/packages/base/." "$STAGE/packages/base/"
-while read -r cmap; do
+# `|| [ -n "$cmap" ]` keeps the loop body running on a final line that has no trailing
+# newline (read still populates $cmap but returns nonzero at EOF in that case, which would
+# otherwise silently drop the last entry in campaign-maps.txt).
+while read -r cmap || [ -n "$cmap" ]; do
   [ -z "$cmap" ] && continue
   rm -f "$STAGE/packages/base/$cmap.ogz" "$STAGE/packages/base/$cmap.wpt" \
         "$STAGE/packages/base/$cmap.jpg" "$STAGE/packages/base/$cmap.cfg"
@@ -71,7 +74,8 @@ find "$STAGE/packages" -iname '*.ogg' -not -path '*/sounds/*' -delete
 find "$STAGE/packages" -iname '*.dds' -delete
 
 # 6) drop sound files nothing references (list maintained by tools/scan-dead-sounds.sh)
-while read -r dead; do
+# same trailing-newline hardening as the campaign-maps loop above.
+while read -r dead || [ -n "$dead" ]; do
   [ -z "$dead" ] && continue
   rm -f "$STAGE/$dead"
 done < "$(dirname "$0")/dead-sounds.txt"

@@ -1,6 +1,6 @@
 --- a/engine/serverbrowser.cpp
 +++ b/engine/serverbrowser.cpp
-@@ -749,3 +749,197 @@
+@@ -749,3 +749,220 @@
      delete f;
  }
  
@@ -153,10 +153,14 @@
 +
 +// --- SwiftGibs: launch-time update check (autoexec: checkupdate $swiftgibsversion) ---
 +// Asks the relay for the latest release tag (GET /version - the engine cannot
-+// reach GitHub's HTTPS itself). Deliberately SILENT and short-budget: it runs
-+// during init, so no progress UI and no error spam - a dead relay or an
-+// offline box just means no update banner (passing no sghttpprogress to
-+// sghttpget below is what keeps it silent - sghttp never renders on its own).
++// reach GitHub's HTTPS itself). Still silent ON FAILURE - a dead relay or an
++// offline box just means no update banner, same as before. But the resolve step
++// can otherwise block the window for CHECKUPDLIMIT's full worst case on a
++// DNS-blackholed network with nothing on screen and no way to back out of it.
++// checkupdprogress (below, same shape as feedbackprogress above) fixes that:
++// passing it to sghttpget pumps the window via renderprogress every tick and
++// makes ESC an actual skip via interceptkey, exactly like the feedback POST
++// above does - sghttp itself still never touches either function directly.
 +// Results land in the aliases swiftgibsupdate (0/1) + swiftgibslatest, which
 +// the main-menu gui reads.
 +// Same single-budget-covers-everything change as FEEDBACKLIMIT above: old
@@ -173,13 +177,32 @@
 +    return sscanf(s, "%d.%d.%d", &major, &minor, &patch) >= 2;
 +}
 +
++// Drives sghttpget's progress bar for the check below - the SAME
++// renderprogress/interceptkey loop feedbackprogress (above) uses, so the
++// window stays pumped and ESC-cancellable instead of the old bare poll.
++// sghttp itself is unchanged; only this caller-side struct is new.
++struct checkupdprogress : sghttpprogress
++{
++    const char *text;
++    checkupdprogress(const char *text) : text(text) {}
++    bool tick(int got, int total)
++    {
++        renderprogress(total > 0 ? float(got)/total : 0.0f, text);
++        return !interceptkey(SDLK_ESCAPE);
++    }
++};
++
 +void checkupdate(const char *current)
 +{
 +    alias("swiftgibsupdate", "0");
 +    alias("swiftgibslatest", "");
 +
++    const char *progresstext = "checking for updates.. (esc to skip)";
++    checkupdprogress cp(progresstext);
++    renderprogress(0, progresstext);
++
 +    vector<uchar> out;
-+    if(sghttpget(feedbackhost, feedbackport, "/version", out, CHECKUPDLIMIT) != 200) return;
++    if(sghttpget(feedbackhost, feedbackport, "/version", out, CHECKUPDLIMIT, &cp) != 200) return;
 +    out.add('\0');
 +
 +    char *tag = (char *)out.getbuf();
@@ -268,7 +291,7 @@
 +#endif
 --- /dev/null
 +++ b/fpsgame/sghttp.cpp
-@@ -0,0 +1,398 @@
+@@ -0,0 +1,404 @@
 +// sghttp.cpp: minimal blocking HTTP/1.1 GET/POST transport over raw enet
 +// sockets. Shared by the in-game feedback POST and the launch-time
 +// update-check GET (see engine/serverbrowser.cpp) - previously each hand-rolled
@@ -652,6 +675,12 @@
 +    return status;
 +}
 +
++// Both request-header buffers below (sghttpget's and sghttppost's, each "char head[1024]")
++// are filled via snprintf, which is bounds-checked and never overflows: if host/path (or,
++// for the POST below, contenttype/Content-Length too) combine to exceed 1024 bytes, snprintf
++// just truncates the header text - the request sent is malformed HTTP, not a stack overwrite.
++// feedbackhost is the one field a player can set arbitrarily long (SVAR, no length cap); an
++// oversize value degrades to "update check/feedback send fails cleanly", never a crash.
 +int sghttpget(const char *host, int port, const char *path, vector<uchar> &out, int timeoutms, sghttpprogress *progress)
 +{
 +    char head[1024];

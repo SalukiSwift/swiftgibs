@@ -41,6 +41,19 @@
 # CLIENT_OBJS) and every sound it names (aard/jump, aard/land, free/splash1,
 # free/splash2) is already registered in data/sounds.cfg regardless, so widening
 # the code scan there would not change the result.
+#
+# CAVEAT: the cfg pattern above only looks AT the registersound/altsound/mapsound/
+# altmapsound command positions themselves - any OTHER cfg command that happens to
+# take a sound path as one of its own arguments is invisible to this scan, since it
+# never runs, just greps for those four literal command names. Known accepted
+# example: data/game_rpg.cfg's r_spell alias takes a sound path as a positional arg
+# (eg. `spawn_fireball = [ r_spell 7 500 10 256 [...] "awesund/flaunch" [...] ]`),
+# which this scan cannot see. Zero impact in practice: rpggame is the only thing
+# that ever execs game_rpg.cfg, and rpggame is not compiled into the client (same
+# CLIENT_OBJS-absence reasoning as the rpg.cpp note above) - so a sound this scan
+# could not prove "live" via r_spell is still correctly unreferenced by anything
+# that actually runs. Flagging for any future cfg command added to this codebase
+# that also carries a sound-path argument outside the four this scan checks.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="${SRC:-$("$ROOT/build/fetch-official-data.sh")}"
@@ -64,7 +77,9 @@ find "$SRC/packages/sounds" -type f \( -iname '*.ogg' -o -iname '*.wav' \) | whi
   base="${rel#packages/sounds/}"; base="${base%.*}"   # author/file  (cfg refs omit dir+ext)
   if grep -qF "$base" "$REFS"; then continue; fi
   dyn=0
-  while read -r dir; do
+  # `|| [ -n "$dir" ]` guards against $DYNDIRS' last line lacking a trailing newline (same
+  # hardening as tools/strip-assets.sh's campaign-maps.txt/dead-sounds.txt loops).
+  while read -r dir || [ -n "$dir" ]; do
     [ -z "$dir" ] && continue
     case "$base" in "$dir"*) dyn=1; break ;; esac
   done < "$DYNDIRS"
