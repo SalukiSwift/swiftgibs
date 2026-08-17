@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Stage a minimal, low-res Sauerbraten data tree for SwiftGibs.
-# Usage: [MAPS=none|all] strip-assets.sh <stage-dir>
+# Usage: strip-assets.sh <stage-dir>
 set -euo pipefail
 SRC="${SRC:-$HOME/repos/sauerbraten}"
 STAGE="${1:?usage: strip-assets.sh <stage-dir>}"
@@ -22,23 +22,26 @@ for d in "$SRC"/packages/*/; do
   cp -a "$d" "$STAGE/packages/$name"
 done
 
-# 3) base maps. MAPS=all ships every map (fat variant); MAPS=none (slim, default)
-#    ships only mapshots + map cfgs - .ogz/.wpt stream on demand (patch 21).
+# 3) base maps: ship everything under packages/base EXCEPT the 11 campaign/SP
+#    mission maps (tools/campaign-maps.txt) - their menus were gutted (Task 1),
+#    so nothing in-game can reach them, and fetching them on demand instead of
+#    shipping them was a scrapped feature this script no longer supports (see
+#    the map-streaming archive doc for the abandoned slim/fat variant split).
 #    Guard first: the extraction logic below is a flat, non-recursive file
 #    copy/find, so a subdirectory appearing under packages/base (none exist in
 #    the 2020 official release as of writing) would silently vanish from the
-#    stage in the none case, or copy correctly-but-unnoticed in the all case.
-#    Fail loudly instead of guessing.
+#    stage. Fail loudly instead of guessing.
 if [ -n "$(find "$SRC/packages/base" -mindepth 1 -type d)" ]; then
   echo "strip-assets: unexpected subdirectory under packages/base - update this script to handle it explicitly" >&2
   find "$SRC/packages/base" -mindepth 1 -type d >&2
   exit 1
 fi
-case "${MAPS:-none}" in
-  all)  cp -a "$SRC/packages/base/." "$STAGE/packages/base/" ;;
-  none) find "$SRC/packages/base" -maxdepth 1 -type f \( -iname '*.jpg' -o -iname '*.png' -o -iname '*.cfg' -o -iname '*.txt' \) -exec cp {} "$STAGE/packages/base/" \; ;;
-  *) echo "strip-assets: MAPS must be none|all" >&2; exit 1 ;;
-esac
+cp -a "$SRC/packages/base/." "$STAGE/packages/base/"
+while read -r cmap; do
+  [ -z "$cmap" ] && continue
+  rm -f "$STAGE/packages/base/$cmap.ogz" "$STAGE/packages/base/$cmap.wpt" \
+        "$STAGE/packages/base/$cmap.jpg" "$STAGE/packages/base/$cmap.cfg"
+done < "$(dirname "$0")/campaign-maps.txt"
 
 # make the stage writable: copies off a Windows mount (/mnt/c) come read-only,
 # which would block the downscale below and the overlay copy later.

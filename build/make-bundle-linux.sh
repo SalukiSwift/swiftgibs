@@ -6,14 +6,6 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 INSTALL="${INSTALL:-$("$ROOT/build/fetch-official-data.sh")}"
 STAGE="${STAGE:-/tmp/swiftgibs-linux-stage}"
 OUT="$ROOT/dist/SwiftGibs-linux-x86_64"
-# MAPS=none (slim, default): mapshots + map cfgs only, .ogz/.wpt stream on demand (patch 21).
-# MAPS=all (fat): every stock map baked in, for public-server compat / zero-network play.
-# The archive filename carries an -allmaps suffix for the fat variant, but the folder INSIDE
-# the archive is always "SwiftGibs-linux-x86_64" (see the tar line below) so both variants
-# extract to, and update-swiftgibs.sh overlays onto, the same install directory.
-MAPS="${MAPS:-none}"
-ARCHIVE="SwiftGibs-linux-x86_64"
-[ "$MAPS" = all ] && ARCHIVE="SwiftGibs-linux-x86_64-allmaps"
 
 # Use a prebuilt client if present (CI supplies it from the native-binaries job); else build it.
 if [ ! -f "$ROOT/dist/engines/linux-x86_64/sauer_client" ]; then
@@ -22,15 +14,8 @@ fi
 rm -rf "$OUT"; mkdir -p "$OUT/bin"
 cp "$ROOT/dist/engines/linux-x86_64/sauer_client" "$OUT/bin/swiftgibs"
 
-SRC="$INSTALL" MAPS="$MAPS" "$ROOT/tools/strip-assets.sh" "$STAGE"
+SRC="$INSTALL" "$ROOT/tools/strip-assets.sh" "$STAGE"
 cp -a "$STAGE/data" "$OUT/data"; cp -a "$STAGE/packages" "$OUT/packages"
-
-# Map manifest (patch 21's streaming downloader reads this): every bundle ships it, slim AND
-# fat alike, so the client always knows the full 331-map catalogue (name/size/hash) even when
-# most of those maps aren't physically present yet. Generated from the SAME install the maps
-# themselves were staged from, so hashes always match what's actually on disk for MAPS=all.
-"$ROOT/build/make-map-manifest.sh" "$INSTALL" > "$OUT/data/mapmanifest.cfg"
-
 cp -a "$ROOT/overlay/." "$OUT/"; rm -f "$OUT/autoexec.source.cfg"
 "$ROOT/build/integrate-menus.sh" "$OUT"
 rm -f "$OUT/config.cfg" "$OUT/init.cfg"
@@ -53,6 +38,6 @@ SH
 cp "$ROOT/updater/update-swiftgibs.sh" "$OUT/update-swiftgibs.sh"
 chmod +x "$OUT/swiftgibs.sh" "$OUT/bin/swiftgibs" "$OUT/update-swiftgibs.sh"
 
-cd "$ROOT/dist"; rm -f "$ARCHIVE.tar.gz"
-tar -czf "$ARCHIVE.tar.gz" SwiftGibs-linux-x86_64
-echo "linux bundle (MAPS=$MAPS): $(du -sh "$OUT" | cut -f1) | tgz: $(du -sh "$ARCHIVE.tar.gz" | cut -f1)"
+cd "$ROOT/dist"; rm -f SwiftGibs-linux-x86_64.tar.gz
+tar -czf SwiftGibs-linux-x86_64.tar.gz SwiftGibs-linux-x86_64
+echo "linux bundle: $(du -sh "$OUT" | cut -f1) | tgz: $(du -sh SwiftGibs-linux-x86_64.tar.gz | cut -f1)"
