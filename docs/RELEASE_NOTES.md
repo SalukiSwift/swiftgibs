@@ -1,35 +1,35 @@
-# SwiftGibs v1.3.0
+# SwiftGibs v1.3.1
 
-A smaller download, shorter clips by default, and steadier feedback/update networking under
-the hood.
+A robustness release: Linux now runs out of the box, a startup crash on broken graphics
+drivers is fixed, and some build/CI hardening went in alongside. No gameplay changes.
 
-## Campaign content removed
+## Linux runs out of the box
 
-- **The single-player campaign is gone.** The campaign menu, the 11 campaign maps, and sounds
-  that were only used by them are out of the bundle. Multiplayer instagib maps are untouched -
-  nothing you actually play on has changed.
-- **Smaller download:** about 569MB zipped for Windows.
-- Upgrading from an older version keeps roughly 23MB of now-unused campaign files on disk (the
-  updater only adds and changes files, it never deletes them) - a fresh install does not have
-  them at all.
+- **No system SDL packages needed.** The Linux download now bundles its own lean copies of
+  the three SDL2 runtime libraries it needs (SDL2, SDL2_image, SDL2_mixer), built from the
+  official SDL source with everything except what SwiftGibs actually uses stripped out. A
+  fresh machine with nothing installed can just run the game.
+- Already have a newer SDL2 on your system and want to use it instead? Set
+  `SWIFTGIBS_SYSTEM_SDL=1` before launching to opt back into your distro's copies.
+- If a previous download only partly extracted (interrupted transfer, disk full, etc.), the
+  launcher now says so clearly instead of failing with a confusing error.
 
-## Clips default to 20 seconds
+## Fixed a startup crash on broken or software-only graphics drivers
 
-- **F10 clips are 20 seconds by default now, not a minute**, and the setting is in seconds
-  (5-600) instead of minutes.
-- Existing configs and saved settings profiles are migrated automatically to the new default
-  the first time they load under v1.3.0. If you had already tuned your own clip length, set it
-  once more after updating and it will stick from then on.
-- You may see one harmless red "valid range" line in the console on first launch while your old
-  config is read - the correct 20-second default is applied right after it.
+- Machines with broken or software-only OpenGL (some VMs, remote desktop sessions, old or
+  misconfigured drivers) could crash immediately on startup with a stack overflow. A
+  reentrancy guard now breaks the recursion that caused it, and the one texture load that
+  triggered it in the first place has been fixed at the source. Everything renders exactly
+  the same as before on a normal, working graphics setup.
 
-## Feedback and update checks reworked
+## Small build and CI hardening
 
-- The plain-HTTP networking behind in-game feedback (F8) and the launch-time update check was
-  rebuilt internally: clearer failure messages, and a fix for a macOS build issue that had been
-  silently blocking new mac releases.
-- The update check now shows "checking for updates.. (esc to skip)" instead of possibly hanging
-  silently on a bad connection - press Esc to skip it if it's ever slow.
+- The release build now checks that the bundled SDL libraries actually cover every symbol
+  the client needs, so a version bump or repin that breaks compatibility fails the build
+  instead of shipping something broken.
+- The SDL version pins used across the Linux and macOS builds are now checked for agreement,
+  and downloads that fail partway through clean up after themselves instead of leaving a
+  truncated file behind.
 
 ## Download
 
