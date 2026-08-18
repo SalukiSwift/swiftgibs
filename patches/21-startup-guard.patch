@@ -1,0 +1,39 @@
+--- a/engine/texture.cpp
++++ b/engine/texture.cpp
+@@ -1434,7 +1434,35 @@
+         else if(matchstring(cmd, len, "stub")) return canloadsurface(file);
+     }
+ 
+-    if(msg) renderprogress(loadprogress, file);
++    // patch 21: texturedata()'s own progress report is the return edge of a
++    // startup recursion cycle (texturedata -> renderprogress -> restorebackground
++    // -> renderbackground -> textureload("data/swiftgibs-logo.png") -> texturedata
++    // -> ...), proven by ASAN stack-overflow on broken/software GL (mesa_swap_bug
++    // forces renderprogress() to re-enter renderbackground() on every call while
++    // totalmillis==1, and renderbackground() unconditionally reloads the logo with
++    // msg=true). Every iteration of the cycle passes through this exact call, no
++    // matter which of the many renderprogress() call sites started it, so guarding
++    // it here breaks the cycle regardless of entry point. Zero effect when nothing
++    // is reentrant: the guard only trips on the second, recursive call.
++    static bool texdatarenderprogressing = false;
++    if(msg)
++    {
++        if(texdatarenderprogressing)
++        {
++            static bool texdatarenderprogresswarned = false;
++            if(!texdatarenderprogresswarned)
++            {
++                conoutf(CON_ERROR, "renderbackground: texture load failed during startup - skipping background render (%s)", file);
++                texdatarenderprogresswarned = true;
++            }
++        }
++        else
++        {
++            texdatarenderprogressing = true;
++            renderprogress(loadprogress, file);
++            texdatarenderprogressing = false;
++        }
++    }
+ 
+     if(flen >= 4 && (!strcasecmp(file + flen - 4, ".dds") || (dds && !raw)))
+     {
