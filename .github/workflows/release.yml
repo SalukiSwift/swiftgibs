@@ -7,7 +7,46 @@ permissions:
   contents: write        # create releases + upload assets
 
 jobs:
+  # Cheap, fast-failing sanity check: the SDL2/SDL2_image/SDL2_mixer version pins are repeated
+  # in four places (this file's mac-binary job, mac.yml, build/fetch-sdl-linux.sh, and
+  # docs/sdl-provenance.md) because the mac and Linux builds fetch SDL two different ways. This
+  # job asserts they still agree so a repin that only touches one place fails loudly in seconds,
+  # instead of shipping a release where the platforms silently vendor different SDL versions.
+  check-sdl-pins:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert SDL version pins agree across all four places
+        run: |
+          set -euo pipefail
+          get() { grep -oP "$2" "$1" | head -1; }
+          SDL_A=$(get build/fetch-sdl-linux.sh 'SDL_VER=\K[0-9.]+')
+          IMG_A=$(get build/fetch-sdl-linux.sh 'IMG_VER=\K[0-9.]+')
+          MIX_A=$(get build/fetch-sdl-linux.sh 'MIX_VER=\K[0-9.]+')
+          SDL_B=$(get docs/sdl-provenance.md '\| SDL2 \| \K[0-9.]+')
+          IMG_B=$(get docs/sdl-provenance.md '\| SDL2_image \| \K[0-9.]+')
+          MIX_B=$(get docs/sdl-provenance.md '\| SDL2_mixer \| \K[0-9.]+')
+          SDL_C=$(get .github/workflows/release.yml 'SDL=\K[0-9.]+')
+          IMG_C=$(get .github/workflows/release.yml 'IMG=\K[0-9.]+')
+          MIX_C=$(get .github/workflows/release.yml 'MIX=\K[0-9.]+')
+          SDL_D=$(get .github/workflows/mac.yml 'SDL=\K[0-9.]+')
+          IMG_D=$(get .github/workflows/mac.yml 'IMG=\K[0-9.]+')
+          MIX_D=$(get .github/workflows/mac.yml 'MIX=\K[0-9.]+')
+          fail=0
+          for lib in SDL IMG MIX; do
+            a_var="${lib}_A"; b_var="${lib}_B"; c_var="${lib}_C"; d_var="${lib}_D"
+            a="${!a_var}"; b="${!b_var}"; c="${!c_var}"; d="${!d_var}"
+            if [ "$a" != "$b" ] || [ "$a" != "$c" ] || [ "$a" != "$d" ]; then
+              echo "SDL VERSION PIN MISMATCH for $lib: fetch-sdl-linux.sh=$a docs/sdl-provenance.md=$b release.yml(mac-binary)=$c mac.yml=$d" >&2
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
+          echo "SDL version pins agree: SDL2 $SDL_A / SDL2_image $IMG_A / SDL2_mixer $MIX_A"
+
   mac-binary:
+    needs: [check-sdl-pins]
     runs-on: macos-14
     timeout-minutes: 25
     steps:
@@ -59,11 +98,18 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [mac-binary, native-binaries]
+    needs: [check-sdl-pins, mac-binary, native-binaries]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y imagemagick zip bzip2
+      # the second line is the SDL source-build deps for build/fetch-sdl-linux.sh (the bundled
+      # lean SDL runtime); its configure-summary check fails the build if one goes missing.
+      - run: |
+          sudo apt-get update && sudo apt-get install -y imagemagick zip bzip2 \
+            pkg-config libx11-dev libxext-dev libxcursor-dev libxi-dev libxfixes-dev libxrandr-dev \
+            libxss-dev libxinerama-dev libxxf86vm-dev libxkbcommon-dev libwayland-dev wayland-protocols \
+            libegl-dev libgles-dev libdrm-dev libgbm-dev libdecor-0-dev libdbus-1-dev libudev-dev \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev libsamplerate0-dev
       - uses: actions/download-artifact@v4
         with: { path: /tmp/arts }
       - name: Install rcodesign
@@ -71,6 +117,17 @@ jobs:
           V=0.29.0
           curl -fsSL -o /tmp/rc.tgz "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F$V/apple-codesign-$V-x86_64-unknown-linux-musl.tar.gz"
           tar -C /tmp -xzf /tmp/rc.tgz && sudo cp /tmp/apple-codesign-*/rcodesign /usr/local/bin/
+      - name: Resolve the SDL pin cache key
+        id: sdlpins
+        run: |
+          set -euo pipefail
+          KEY="$(grep -oP '^(SDL|IMG|MIX)_SHA256=\K\S+' build/fetch-sdl-linux.sh | tr '\n' '-')"
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+      - name: Cache the built SDL2 runtime (skips the ~3-6min source build unless the pins change)
+        uses: actions/cache@v4
+        with:
+          path: /tmp/sg-sdl-cache/out
+          key: sdl-linux-${{ steps.sdlpins.outputs.key }}
       - name: Assemble the three bundles from official data
         run: |
           set -euo pipefail
@@ -82,6 +139,22 @@ jobs:
           INSTALL="$DATA" build/make-bundle-win.sh
           INSTALL="$DATA" build/make-bundle-linux.sh
           APP_ZIP=/tmp/arts/mac-app/SwiftGibs-app-code.zip INSTALL="$DATA" RCODESIGN=rcodesign build/make-bundle-mac.sh
+      - name: Verify the Linux client's SDL symbol needs are covered by the bundled libraries
+        run: |
+          set -euo pipefail
+          BIN=dist/SwiftGibs-linux-x86_64/bin/swiftgibs
+          LIBDIR=dist/SwiftGibs-linux-x86_64/lib
+          NEEDED="$(nm -D --undefined-only "$BIN" | awk '{print $NF}' | grep '^SDL_' | sort -u)"
+          PROVIDED="$(for so in "$LIBDIR"/libSDL2*.so.0; do nm -D --defined-only "$so" | awk '{print $NF}'; done | sort -u)"
+          MISSING="$(comm -23 <(printf '%s\n' "$NEEDED") <(printf '%s\n' "$PROVIDED"))"
+          if [ -n "$MISSING" ]; then
+            echo "SDL SYMBOL COVERAGE FAILED: the Linux client needs these SDL_* symbols but the" >&2
+            echo "bundled libSDL2/libSDL2_image/libSDL2_mixer do not export them (a repin or a" >&2
+            echo "runner-image change likely mismatched the client build against the bundled libs):" >&2
+            echo "$MISSING" >&2
+            exit 1
+          fi
+          echo "SDL symbol coverage OK: $(printf '%s\n' "$NEEDED" | grep -c .) undefined SDL_* symbols, all covered."
       - name: Publish GitHub Release
         env: { GH_TOKEN: '${{ github.token }}' }
         run: |
