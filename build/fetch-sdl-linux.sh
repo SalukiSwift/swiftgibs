@@ -31,6 +31,20 @@
 # Prints (on stdout, last line): the directory containing the three .so files + NOTICE.txt,
 # ready to copy straight into a bundle's lib/ folder.
 set -euo pipefail
+
+# Our bundle scripts (make-bundle-linux.sh etc.) pass INSTALL as the game-data directory
+# (our own convention, unrelated to autotools) and export it for the whole pipeline step in
+# release.yml, so it is present in this script's environment too. autoconf-generated Makefiles
+# read INSTALL as the path to the install(1) PROGRAM ("make install" runs "$INSTALL -m 755 ...");
+# with our INSTALL set, that becomes our game-data directory, which "make install" then tries to
+# execute -> "Is a directory" -> Error 126. Unset it here so SDL's build never sees it. (No other
+# variable this pipeline exports - DATA, STAGE, SRC - is both exported to this script AND
+# meaningful to autotools/make: DATA and STAGE are plain shell vars in make-bundle-linux.sh,
+# never exported; SRC is exported only for the separate strip-assets.sh call, and inside this
+# script SRC is unconditionally reassigned below before its first use, so an ambient SRC would
+# never be read anyway.)
+unset INSTALL
+
 CACHE="${SG_SDL_CACHE:-/tmp/sg-sdl-cache}"
 
 SDL_VER=2.30.9
