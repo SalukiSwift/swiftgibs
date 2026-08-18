@@ -22,7 +22,10 @@
 # backend was silently dropped because a dev header was missing on the build machine.
 #
 # Full provenance (providers, hash cross-verification, licence) lives in docs/sdl-provenance.md;
-# this script is the executable source of truth. If you ever repin, update both together.
+# this script is the executable source of truth. If you ever repin, update all four places that
+# carry these version numbers: this script (SDL_VER/IMG_VER/MIX_VER + the SHA-256s),
+# docs/sdl-provenance.md, the mac-binary job in .github/workflows/release.yml, and
+# .github/workflows/mac.yml - release.yml's check-sdl-pins job fails the build if they disagree.
 #
 # Usage: build/fetch-sdl-linux.sh
 # Prints (on stdout, last line): the directory containing the three .so files + NOTICE.txt,
@@ -53,8 +56,9 @@ fetch() { # fetch <url> <dest> <sha256>
   local url="$1" dest="$2" want="$3" got
   if [ ! -f "$dest" ]; then
     echo "fetch-sdl-linux: downloading $url" >&2
-    if command -v curl >/dev/null 2>&1; then curl -fL --retry 3 -o "$dest" "$url"
-    else wget -q -O "$dest" "$url"; fi
+    if command -v curl >/dev/null 2>&1; then curl -fL --retry 3 -o "$dest" "$url" || { rm -f "$dest"; echo "fetch-sdl-linux: download failed/truncated - removed partial file, re-run" >&2; exit 1; }
+    else wget -q -O "$dest" "$url" || { rm -f "$dest"; echo "fetch-sdl-linux: download failed/truncated - removed partial file, re-run" >&2; exit 1; }
+    fi
   fi
   got="$(sha256sum "$dest" | cut -d' ' -f1)"
   if [ "$got" != "$want" ]; then
@@ -88,16 +92,18 @@ tar -xzf "$CACHE/SDL2_mixer-$MIX_VER.tar.gz" -C "$SRC"
 
 JOBS="$(nproc)"
 
-# --- SDL2. Default feature detection; the summary check below is what makes "a dev header was
-# missing so configure silently dropped a backend" a build failure instead of a broken bundle.
-echo "fetch-sdl-linux: building SDL2 $SDL_VER" >&2
-( cd "$SRC/SDL2-$SDL_VER" && ./configure --prefix="$PREFIX" --disable-static \
-    > "$CACHE/configure-sdl2.log" 2>&1 && make -j"$JOBS" >/dev/null 2>&1 && make install >/dev/null 2>&1 ) \
-  || { echo "fetch-sdl-linux: SDL2 build failed - see $CACHE/configure-sdl2.log" >&2; tail -20 "$CACHE/configure-sdl2.log" >&2; exit 1; }
+# --- SDL2. Default feature detection; the summary check below (run right after configure, before
+# the multi-minute build) is what makes "a dev header was missing so configure silently dropped a
+# backend" a build failure instead of a broken bundle.
+echo "fetch-sdl-linux: configuring SDL2 $SDL_VER" >&2
+( cd "$SRC/SDL2-$SDL_VER" && ./configure --prefix="$PREFIX" --disable-static ) \
+    > "$CACHE/configure-sdl2.log" 2>&1 \
+  || { echo "fetch-sdl-linux: SDL2 configure failed - see $CACHE/configure-sdl2.log" >&2; tail -20 "$CACHE/configure-sdl2.log" >&2; exit 1; }
 
 # require the backends a Linux desktop actually uses; each maps to a -dev package on the builder
 # (see the apt list in .github/workflows/release.yml and docs/sdl-provenance.md). The tokens are
-# exactly how SDL2's configure summary names them ("pulse", not "pulseaudio").
+# exactly how SDL2's configure summary names them ("pulse", not "pulseaudio"). Checked immediately
+# after configure so a missing dev header fails in seconds, not after the full build.
 video_line="$(grep -i '^Video drivers' "$CACHE/configure-sdl2.log" || true)"
 audio_line="$(grep -i '^Audio drivers' "$CACHE/configure-sdl2.log" || true)"
 for want in x11 wayland; do
@@ -117,6 +123,10 @@ for want in alsa pulse pipewire; do
   esac
 done
 
+echo "fetch-sdl-linux: building SDL2 $SDL_VER" >&2
+( cd "$SRC/SDL2-$SDL_VER" && make -j"$JOBS" > "$CACHE/make-sdl2.log" 2>&1 && make install >> "$CACHE/make-sdl2.log" 2>&1 ) \
+  || { echo "fetch-sdl-linux: SDL2 build failed - see $CACHE/make-sdl2.log" >&2; tail -20 "$CACHE/make-sdl2.log" >&2; exit 1; }
+
 export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" SDL2_CONFIG="$PREFIX/bin/sdl2-config"
 
 # --- SDL2_image: stb_image handles the PNG/JPG the game data actually contains; every external
@@ -124,8 +134,10 @@ export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" SDL2_CONFIG="$PREFIX/bin/sdl2-con
 echo "fetch-sdl-linux: building SDL2_image $IMG_VER" >&2
 ( cd "$SRC/SDL2_image-$IMG_VER" && ./configure --prefix="$PREFIX" --disable-static \
     --enable-stb-image --disable-avif --disable-jxl --disable-tif --disable-webp \
-    > "$CACHE/configure-img.log" 2>&1 && make -j"$JOBS" >/dev/null 2>&1 && make install >/dev/null 2>&1 ) \
-  || { echo "fetch-sdl-linux: SDL2_image build failed - see $CACHE/configure-img.log" >&2; tail -20 "$CACHE/configure-img.log" >&2; exit 1; }
+    > "$CACHE/configure-img.log" 2>&1 && make -j"$JOBS" > "$CACHE/make-img.log" 2>&1 && make install >> "$CACHE/make-img.log" 2>&1 ) \
+  || { echo "fetch-sdl-linux: SDL2_image build failed - see $CACHE/configure-img.log and $CACHE/make-img.log" >&2;
+       if [ -s "$CACHE/make-img.log" ]; then tail -20 "$CACHE/make-img.log" >&2; else tail -20 "$CACHE/configure-img.log" >&2; fi
+       exit 1; }
 
 # --- SDL2_mixer: sound effects are .ogg and .wav; wave support is built in and stb_vorbis
 # (the default ogg backend) is vendored in the source. Everything else off - the game ships
@@ -135,19 +147,25 @@ echo "fetch-sdl-linux: building SDL2_mixer $MIX_VER" >&2
 ( cd "$SRC/SDL2_mixer-$MIX_VER" && ./configure --prefix="$PREFIX" --disable-static \
     --disable-music-mod --disable-music-midi --disable-music-flac --disable-music-mp3 \
     --disable-music-opus --disable-music-wavpack --disable-music-cmd \
-    > "$CACHE/configure-mix.log" 2>&1 && make -j"$JOBS" >/dev/null 2>&1 && make install >/dev/null 2>&1 ) \
-  || { echo "fetch-sdl-linux: SDL2_mixer build failed - see $CACHE/configure-mix.log" >&2; tail -20 "$CACHE/configure-mix.log" >&2; exit 1; }
+    > "$CACHE/configure-mix.log" 2>&1 && make -j"$JOBS" > "$CACHE/make-mix.log" 2>&1 && make install >> "$CACHE/make-mix.log" 2>&1 ) \
+  || { echo "fetch-sdl-linux: SDL2_mixer build failed - see $CACHE/configure-mix.log and $CACHE/make-mix.log" >&2;
+       if [ -s "$CACHE/make-mix.log" ]; then tail -20 "$CACHE/make-mix.log" >&2; else tail -20 "$CACHE/configure-mix.log" >&2; fi
+       exit 1; }
 
 # --- Collect the three libraries under their SONAME filenames (what the client binary's
-# NEEDED entries ask the loader for), then enforce the leanness contract.
+# NEEDED entries ask the loader for), then enforce the leanness contract. SONAMES is the single
+# source of truth for which libraries this script produces - make-bundle-linux.sh copies by glob
+# from $OUT instead of naming them again, so the two can never drift apart.
+SONAMES=(libSDL2-2.0.so.0 libSDL2_image-2.0.so.0 libSDL2_mixer-2.0.so.0)
+
 mkdir -p "$OUT"
-for so in libSDL2-2.0.so.0 libSDL2_image-2.0.so.0 libSDL2_mixer-2.0.so.0; do
+for so in "${SONAMES[@]}"; do
   cp -L "$PREFIX/lib/$so" "$OUT/$so"
   strip --strip-unneeded "$OUT/$so"   # debug symbols are ~10MB of the unstripped libSDL2 alone
 done
 
 ALLOW='libSDL2-2.0.so.0|libc.so.6|libm.so.6|libdl.so.2|libpthread.so.0|librt.so.1|ld-linux-x86-64.so.2'
-for so in libSDL2-2.0.so.0 libSDL2_image-2.0.so.0 libSDL2_mixer-2.0.so.0; do
+for so in "${SONAMES[@]}"; do
   bad="$(readelf -d "$OUT/$so" | awk '/\(NEEDED\)/{gsub(/[\[\]]/,""); print $NF}' | grep -Ev "^($ALLOW)$" || true)"
   if [ -n "$bad" ]; then
     echo "fetch-sdl-linux: $so grew unexpected dependencies - it would NOT run on a bare machine:" >&2
@@ -158,6 +176,9 @@ for so in libSDL2-2.0.so.0 libSDL2_image-2.0.so.0 libSDL2_mixer-2.0.so.0; do
   fi
 done
 echo "fetch-sdl-linux: dependency allowlist check passed" >&2
+# (a separate, complementary check lives in the release workflow: it diffs the client binary's
+# undefined SDL_* symbols against what these libraries actually export, catching a repin or
+# runner-image bump that changes symbol versions without changing NEEDED entries.)
 
 # --- Licence notice: all three are zlib-licensed; ship their licence texts verbatim.
 {

@@ -2,9 +2,13 @@
 
 The Linux bundle ships lean, source-built copies of the three SDL2 runtime libraries the client
 links (`libSDL2`, `libSDL2_image`, `libSDL2_mixer`) in its `lib/` folder, so the tarball runs
-out of the box on a machine with no SDL packages installed. The launcher (`swiftgibs.sh`)
-prefers the system's own SDL when all three libraries resolve - distro copies get security and
-compatibility updates - and only puts `lib/` on the library path when something is missing.
+out of the box on a machine with no SDL packages installed. The launcher (`swiftgibs.sh`) is
+bundled-first: it always puts `lib/` on the library path via `LD_LIBRARY_PATH`, the same
+precedent the mac build sets with its vendored frameworks. This is deliberate, not a fallback -
+`ldd`-style soname resolution cannot tell whether a system SDL2 is new enough (the soname hasn't
+changed since 2.0.0, so an old system copy resolves fine and then fails at runtime with a symbol
+lookup error) and can misfire on an unrelated missing library. Set `SWIFTGIBS_SYSTEM_SDL=1`
+before launching to opt back into the distro's SDL2 if you know it's new enough.
 
 This file is the human-readable record of exactly what ships and why. The executable source of
 truth is `build/fetch-sdl-linux.sh` (URLs, SHA-256 pins, configure flags, and the dependency

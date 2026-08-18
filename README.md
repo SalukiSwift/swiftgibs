@@ -49,8 +49,9 @@ Grab the latest build for your platform from the **[Releases](../../releases)** 
 ### Linux (x86-64)
 1. Download `SwiftGibs-linux-x86_64.tar.gz` and extract it.
 2. Run `./swiftgibs.sh`.
-   No packages to install: if your system has SDL2 the game uses it, and if not it falls back
-   to the lean copies bundled in `lib/` (see `docs/sdl-provenance.md`).
+   No packages to install: it runs on the lean SDL2 copies bundled in `lib/` (see
+   `docs/sdl-provenance.md`). To use your distro's SDL2 instead, run
+   `SWIFTGIBS_SYSTEM_SDL=1 ./swiftgibs.sh`.
 
 Your settings and saved friends live in your user config directory and persist between updates.
 

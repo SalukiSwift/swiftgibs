@@ -33,22 +33,38 @@ chmod +x "$OUT/ffmpeg/ffmpeg"
 
 # Bundled SDL2 runtime (lean, source-built - see build/fetch-sdl-linux.sh and
 # docs/sdl-provenance.md): lets the bundle run out of the box on a machine with no SDL
-# packages installed. The launcher below only puts lib/ on the library path when the
-# system's own SDL is missing, so a normal desktop keeps using its distro libraries.
+# packages installed. The launcher below always prefers lib/ (bundled-first: a resolvable
+# system SDL2 is no guarantee of symbol coverage, since SDL2's soname hasn't changed since
+# 2.0.0); SWIFTGIBS_SYSTEM_SDL=1 is the escape hatch back to the distro's copy.
+# Copied by glob (not named individually) so this can never drift from the SONAMES array
+# that is the actual source of truth in fetch-sdl-linux.sh.
 SDL_DIR="$("$ROOT/build/fetch-sdl-linux.sh")"
 mkdir -p "$OUT/lib"
-cp "$SDL_DIR"/libSDL2-2.0.so.0 "$SDL_DIR"/libSDL2_image-2.0.so.0 "$SDL_DIR"/libSDL2_mixer-2.0.so.0 \
-   "$SDL_DIR/NOTICE.txt" "$OUT/lib/"
+cp "$SDL_DIR"/libSDL2*.so.0 "$SDL_DIR/NOTICE.txt" "$OUT/lib/"
+
+# Build-time sentinel assert: the launcher's half-extraction guard below hardcodes these two
+# paths so it can check them without depending on anything that could itself be missing. Assert
+# here that they actually exist in the bundle we just built, so the guard can never silently
+# drift from what the bundle contains.
+for sentinel in packages/textures/notexture.png data/glsl.cfg; do
+  if [ ! -f "$OUT/$sentinel" ]; then
+    echo "make-bundle-linux: sentinel file missing from the bundle: $sentinel" >&2
+    echo "  the launcher's half-extraction guard checks for this exact path - fix the bundle" >&2
+    echo "  contents or update both the guard in this script and this assert together." >&2
+    exit 1
+  fi
+done
 
 cat > "$OUT/swiftgibs.sh" <<'SH'
 #!/usr/bin/env bash
 # SwiftGibs launcher. Besides starting the game it catches the two ways a fresh install
 # used to fail with a cryptic error (or not start at all):
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || { echo "SwiftGibs: could not cd to the launcher's own directory" >&2; exit 1; }
 
 # 1) Half-extracted archive: notexture.png is the first file the engine hard-requires, and
 # packages/ sorts late in the tarball, so a truncated extraction loses it. Fail with an
-# explanation instead of the engine's "could not find core textures".
+# explanation instead of the engine's "could not find core textures". (make-bundle-linux.sh
+# asserts at build time that these two paths exist in every bundle it produces.)
 if [ ! -f packages/textures/notexture.png ] || [ ! -f data/glsl.cfg ]; then
   echo "SwiftGibs: game data is missing or incomplete."
   echo "This usually means the archive was only partly extracted."
@@ -56,11 +72,15 @@ if [ ! -f packages/textures/notexture.png ] || [ ! -f data/glsl.cfg ]; then
   exit 1
 fi
 
-# 2) No SDL2 on the system: prefer the distro's libraries when they are all present (they
-# get distro fixes and updates), otherwise fall back to the lean copies bundled in lib/,
-# so the game runs with zero packages installed. If ldd itself is unavailable we can't
-# tell, so use the bundled copies - the safe default either way.
-if ! command -v ldd >/dev/null 2>&1 || ldd bin/swiftgibs 2>/dev/null | grep -q 'not found'; then
+# 2) SDL2 runtime: always prefer the bundled lean copies in lib/. Checking with ldd whether the
+# system already resolves libSDL2/libSDL2_image/libSDL2_mixer is NOT a safe way to decide this -
+# SDL2's soname hasn't changed since 2.0.0, so an old-but-present system SDL2 resolves fine and
+# then dies at runtime with "symbol lookup error", and an unrelated "not found" (e.g. libGL,
+# which is deliberately not bundled - see docs/sdl-provenance.md) would wrongly flip this to the
+# bundled path anyway. Bundled-first matches the mac build's vendored-frameworks precedent.
+# Set SWIFTGIBS_SYSTEM_SDL=1 to opt back into the distro's SDL2 (gets distro security/compat
+# updates) if you know it's new enough.
+if [ "${SWIFTGIBS_SYSTEM_SDL:-0}" != "1" ]; then
   export LD_LIBRARY_PATH="$PWD/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 
