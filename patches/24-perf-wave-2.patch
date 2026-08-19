@@ -1,5 +1,5 @@
---- a/engine/main.cpp	2026-08-19 13:46:46.128120086 +0100
-+++ b/engine/main.cpp	2026-08-19 13:57:51.760783236 +0100
+--- a/engine/main.cpp
++++ b/engine/main.cpp
 @@ -936,6 +936,7 @@
  
  void checkinput()
@@ -17,8 +17,8 @@
      int limit = (mainmenu || minimized) && menufps ? (maxfps ? min(maxfps, menufps) : menufps) : maxfps;
      if(!limit) return;
      static int fpserror = 0;
---- a/fpsgame/client.cpp	2026-08-19 13:46:46.130198575 +0100
-+++ b/fpsgame/client.cpp	2026-08-19 13:57:51.758805442 +0100
+--- a/fpsgame/client.cpp
++++ b/fpsgame/client.cpp
 @@ -12,14 +12,23 @@
  #include <dirent.h>
  #endif
@@ -54,7 +54,7 @@
  
  namespace game
  {
-@@ -2999,6 +3010,18 @@
+@@ -2999,6 +3010,19 @@
      static const double BENCHSTARTTIMEOUTMS = 10000.0;   // give up waiting for playback to start after this long
      VAR(benchdumpframes, 0, 1, 1);             // write benchframes-<row>.csv alongside the CSV row (not persisted)
  
@@ -69,11 +69,12 @@
 +                                                // benchframes_ms above, same BENCHCAP capacity reasoning
 +    static int benchinputgapcount = 0;
 +    static Uint64 benchlastinputticks = 0;     // last checkinput()-entry perf-counter timestamp seen this run (0 = no sample yet)
++    static bool benchinputtruncated = false;   // mirrors benchtruncated above - set once benchinputgaps_ms fills (see benchinputtick() below)
 +
      struct benchstats { float p50, p95, p99, onepctlow, worst; int stutters; };
  
      // p(k) on an already-sorted array: nearest-rank, truncating (not rounding) the index - the
-@@ -3036,7 +3059,8 @@
+@@ -3036,7 +3060,8 @@
          delete[] sorted;
      }
  
@@ -83,7 +84,7 @@
  
      // Called unconditionally from the main loop (engine/main.cpp, right after
      // getclockmillis()) - a no-op before sgbench arms a run and forever after that run reports.
-@@ -3059,6 +3083,8 @@
+@@ -3059,6 +3084,8 @@
                  benchmeasuring = true;
                  benchstartticks = now;
                  benchlastticks = 0;
@@ -92,7 +93,7 @@
                  return;
              }
              double waitedms = double(now - benchpendingticks) * 1000.0 / double(freq);
-@@ -3077,12 +3103,15 @@
+@@ -3077,12 +3104,15 @@
          {
              bencharmed = false;
              benchmeasuring = false;
@@ -109,7 +110,7 @@
          if(sincestart >= 2000.0 && benchlastticks)
          {
              if(minimized)
-@@ -3185,6 +3214,8 @@
+@@ -3185,6 +3215,8 @@
          benchtruncated = false;
          benchlastticks = 0;
          benchmeasuring = false;
@@ -118,7 +119,7 @@
          copystring(benchdemofile, file);
          benchpendingticks = SDL_GetPerformanceCounter();
          bencharmed = true;
-@@ -3208,6 +3239,240 @@
+@@ -3208,6 +3240,246 @@
      });
      // ---- end SwiftGibs benchmark mode ----
  
@@ -199,6 +200,7 @@
 +        {
 +            double gapms = double(now - benchlastinputticks) * 1000.0 / double(freq);
 +            if(benchinputgapcount < BENCHCAP) benchinputgaps_ms[benchinputgapcount++] = float(gapms);
++            else benchinputtruncated = true;   // mirrors benchframe()'s benchtruncated handling above
 +        }
 +        benchlastinputticks = now;
 +    }
@@ -269,7 +271,8 @@
 +        conoutf("BENCHPACED: demo=%s capfps=%d frames=%d seconds=%.2f avgfps=%.2f%s", benchdemofile, benchcapfps, benchcount, seconds, avgfps, benchtruncated ? " TRUNCATED" : "");
 +        conoutf("BENCHPACED: p50=%.2fms p99=%.2fms p999=%.2fms jitter_stddev=%.2fms", st.p50, st.p99, st.p999, st.jitterstddev);
 +        conoutf("BENCHPACED: late15_count=%d late20_count=%d", st.late15count, st.late20count);
-+        conoutf("BENCHPACED: maxgap_input=%.2fms p99gap_input=%.2fms%s", maxgapinput, p99gapinput, benchinputgapcount ? "" : " (no input samples)");
++        conoutf("BENCHPACED: maxgap_input=%.2fms p99gap_input=%.2fms%s%s", maxgapinput, p99gapinput,
++                benchinputgapcount ? "" : " (no input samples)", benchinputtruncated ? " TRUNCATED" : "");
 +
 +        const char *fname = "benchpacing.csv";
 +        bool existed = fileexists(findfile(fname, "r"), "r");   // same idiom as fpsstatswritelog() (fpsgame/fps.cpp) / benchreport() above
@@ -318,9 +321,13 @@
 +        benchcapactive = true;         // limitfps (patch 24): do not bypass while this paced run is armed
 +        benchinputgapcount = 0;
 +        benchlastinputticks = 0;
++        benchinputtruncated = false;   // mirrors benchtruncated's reset above
 +        benchinputgatearmed = false;   // becomes true once the measured window opens - see benchframe() above
 +        copystring(benchdemofile, file);
 +        setvar("maxfps", benchcapfps); // forced in memory for this run - see the module comment above for why this is never persisted in any sense that matters
++        benchcapfps = maxfps;          // review fix: setvar() clamps to maxfps's own VARP range (0..1000) - read back
++                                        // the ENFORCED value so the CSV capfps column and the late15/late20 thresholds
++                                        // below always reflect what actually ran, never a raw out-of-range request
 +        benchpendingticks = SDL_GetPerformanceCounter();
 +        bencharmed = true;
 +        defformatstring(cmd, "stopdemo; mode -1; map \"%s\"", file);
@@ -359,8 +366,8 @@
      // === SwiftGibs clip POV scan (QoL batch: export from another player's POV) ==============
      //
      // Bounded, read-only scan of a clip/recording's opening keyframe (writeclipwelcome(),
---- a/shared/iengine.h	2026-08-19 13:46:46.132259665 +0100
-+++ b/shared/iengine.h	2026-08-19 13:57:51.761387833 +0100
+--- a/shared/iengine.h
++++ b/shared/iengine.h
 @@ -582,6 +582,8 @@
  extern int bilinear;
  extern int clips;                                               // SwiftGibs instant replay on/off
@@ -370,8 +377,8 @@
  
  // SwiftGibs preload pass (patch 23, slate C): sgpreloadstats (0/1, VAR) counts what got
  // warmed at map start (sgpreload_*) vs what still loaded lazily during play (sglazy_*),
---- a/shared/igame.h	2026-08-19 13:46:46.132398964 +0100
-+++ b/shared/igame.h	2026-08-19 13:57:51.761897732 +0100
+--- a/shared/igame.h
++++ b/shared/igame.h
 @@ -52,6 +52,7 @@
      extern void updateworld();
      extern void fpsstatsframe(int elapsed);  // SwiftGibs per-match fps stats: called once per frame with the frame time the engine already computed
