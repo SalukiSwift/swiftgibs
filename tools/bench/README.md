@@ -14,8 +14,10 @@ This directory ships everything needed to run that benchmark the same way every 
 - `workload-v1.dmo` - the canonical workload (see **Workload immutability**, below).
 - `bench-home/autoexec.cfg` - the pinned profile of overrides (fpsstats off, fullscreen on,
   sound on, uncapped fps) layered on top of the shipped config.
-- `run-benchmark.sh` / `run-benchmark.bat` - the runner, shipped at the root of every platform
-  bundle (Linux/Mac/Windows) next to the game binary.
+- `run-benchmark.sh` / `run-benchmark.bat` - the runner, shipped at the root of the Linux and
+  Windows bundles next to the game binary. The Mac bundle deliberately ships WITHOUT the
+  benchmark: running it inside the signed .app would modify sealed Resources and break the
+  app's code signature.
 - `test-bench.sh` - the automated regression gate: builds the current patch stack, assembles a
   bundle, and asserts every result exactly. This is what to run before/after any performance
   change to prove nothing broke.
