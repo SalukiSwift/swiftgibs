@@ -323,7 +323,7 @@
      // Exposed via shared/igame.h so the raw packet tap in engine/client.cpp's
      // localservertoclient() can suppress capture while playing back a .dmo (Task 3, addressing
      // the Task 1 review note): playback is driven by the local embedded server replaying the
-@@ -2223,6 +2240,370 @@
+@@ -2223,6 +2240,442 @@
          result(base);
      });
  
@@ -408,6 +408,10 @@
 +        string label;                      // RECOPEN/RECCLOSE: "manual"/"auto"
 +        string reason;                     // RECCLOSE: "stopped"/"map change"/"intermission"/"disconnect"
 +        int basems, lastms;                // duration reporting
++        int gen;                           // hardening: RECOPEN/RECAPPEND/RECCLOSE only - the
++                                            // issuing slot's generation at enqueue time (see
++                                            // sgcliprecgen above); SAVECLIP leaves this at its
++                                            // aggregate-init zero, unused
 +    };
 +
 +    struct sgclipresult
@@ -417,6 +421,9 @@
 +        bool ok;
 +        string relpath, label, reason;
 +        int basems, lastms;
++        int gen;                           // hardening: RECOPEN/RECCLOSE only - copied straight
++                                            // from job.gen by sgclipprocessjob(); compared against
++                                            // sgcliprecgen[slot] by sgclipreport() below
 +    };
 +
 +    static SDL_Thread *sgclipthread = NULL;
@@ -429,6 +436,22 @@
 +    // only ever sees "is this slot recording" via cliprecorder::active, set/cleared by the frame
 +    // thread itself). No lock needed: exactly one thread (the worker) ever touches this array.
 +    static gzFile sgcliprecfiles[CLIPSINKCOUNT] = { NULL, NULL };
++
++    // FRAME-THREAD-OWNED ONLY (hardening pass, post-review): per-slot generation counter, bumped
++    // by startcliprecorder() every time a NEW recording attempt begins in a slot (see its own
++    // job.gen assignment below). Stamped into every RECOPEN/RECAPPEND/RECCLOSE job (sgclipjob::gen)
++    // and copied back into the RECOPEN/RECCLOSE results (sgclipresult::gen) by the worker
++    // (sgclipprocessjob() below) - the worker itself never reads or interprets this value, it
++    // only carries it through unchanged. Closes the stale-slot race: a RECOPEN can fail
++    // (gzopen()) and its result may not be drained until several frames later; if the player
++    // stopped and restarted recording on the SAME slot in between (a new, independent attempt
++    // that may already have succeeded), the stale failure result must never roll back or
++    // clipsinkstop() the SUCCESSOR's state. sgclipreport()'s RECOPEN failure branch below
++    // compares r.gen against this array's CURRENT value for the slot and ignores the result if
++    // they no longer match - see cliprecordmarkopenfailed()'s call site. No lock needed: only
++    // the frame thread ever reads or writes this array (increment in startcliprecorder(),
++    // compare in sgclipreport(), both frame-thread-only per the threading contract above).
++    static int sgcliprecgen[CLIPSINKCOUNT] = { 0, 0 };
 +
 +    static void cliprecordmarkopenfailed(int slot);   // fwd decl - defined near cliprecorder below;
 +                                                        // called only from sgclipreport() (this module)
@@ -541,7 +564,7 @@
 +                else if(gz) gzclose(gz);
 +                delete[] job.buf;
 +                sgclipresult &r = results.add();
-+                r.kind = SGCLIPRESULT_RECOPEN; r.slot = job.slot; r.ok = ok;
++                r.kind = SGCLIPRESULT_RECOPEN; r.slot = job.slot; r.ok = ok; r.gen = job.gen;
 +                copystring(r.relpath, job.relpath); copystring(r.label, job.label);
 +                break;
 +            }
@@ -558,7 +581,7 @@
 +                if(gz) { gzclose(gz); sgcliprecfiles[job.slot] = NULL; }
 +                if(job.prune) sgclipprunescan(job.prunedir1, job.prunedir2, job.prunekeep);
 +                sgclipresult &r = results.add();
-+                r.kind = SGCLIPRESULT_RECCLOSE; r.slot = job.slot; r.ok = true;
++                r.kind = SGCLIPRESULT_RECCLOSE; r.slot = job.slot; r.ok = true; r.gen = job.gen;
 +                copystring(r.relpath, job.relpath); copystring(r.label, job.label); copystring(r.reason, job.reason);
 +                r.basems = job.basems; r.lastms = job.lastms;
 +                break;
@@ -599,6 +622,19 @@
 +            }
 +            if(quitting) break;
 +        }
++
++        // Hardening (post-review): defensive close of any still-open recording gzFile before
++        // this thread returns. Not reachable via the normal, orderly quit - cliprecordfinalizeall()
++        // always enqueues a RECCLOSE for both slots (see finishcliprecorder()) before
++        // clipworkerjoin() ever enqueues QUIT, so by the time this code runs sgcliprecfiles[]
++        // should already be all-NULL. Kept as a backstop so that ANY path that reaches this QUIT
++        // branch without every slot having been closed first - an abnormal exit, or a future
++        // change to the quit ordering - can never leave a gzFile open (and its trailer/tail data
++        // unwritten) once the worker itself has stopped running. Plain zlib gzclose() per slot -
++        // zlib-only, no engine call, matches the worker's own touch-boundary (see the threading
++        // contract above); loopi(CLIPSINKCOUNT) mirrors the same idiom clipsinkappend()'s own
++        // fan-out uses elsewhere in this file.
++        loopi(CLIPSINKCOUNT) if(sgcliprecfiles[i]) { gzclose(sgcliprecfiles[i]); sgcliprecfiles[i] = NULL; }
 +        return 0;
 +    }
 +
@@ -608,6 +644,31 @@
 +        sgclipmutex = SDL_CreateMutex();
 +        sgclipcond = SDL_CreateCond();
 +        sgclipthread = SDL_CreateThread(sgclipworkerthread, "clip writer", NULL);
++        if(!sgclipthread)
++        {
++            // Hardening (post-review): SDL_CreateThread() can fail (platform thread-creation
++            // limits, exhausted resources). Without this branch the old code left sgclipmutex/
++            // sgclipcond valid (freshly created just above) while sgclipthread stayed NULL -
++            // sgclipenqueue() would then happily lock that mutex and push jobs into sgclipqueue
++            // with no worker ever going to drain it, reporting SUCCESS (queue not yet full) for
++            // the first SGCLIP_QUEUE_CAP jobs while their buffers silently leaked forever - and
++            // every SUBSEQUENT call here would recreate ANOTHER mutex+cond pair without ever
++            // destroying the previous one, leaking a handle per retry. Destroy+NULL what THIS
++            // attempt just created so the module's state is exactly "never started" again -
++            // sgclipenqueue()'s own no-thread check (below) then treats the job as a visible
++            // drop instead of a silent one, and a LATER retry (once whatever resource pressure
++            // caused this to fail has cleared) starts clean rather than reusing or re-leaking
++            // handles. Printed once (a static latch), not once per retry - sgclipensurethread()
++            // runs on every single enqueue attempt while the thread has never been started.
++            static bool warned = false;
++            if(!warned)
++            {
++                conoutf("clip writer: could not start the background thread - clips/recordings will be dropped until this is retried successfully");
++                warned = true;
++            }
++            SDL_DestroyCond(sgclipcond); sgclipcond = NULL;
++            SDL_DestroyMutex(sgclipmutex); sgclipmutex = NULL;
++        }
 +    }
 +
 +    // Enqueues one job. Returns false if the job was DROPPED (queue already at SGCLIP_QUEUE_CAP
@@ -617,6 +678,14 @@
 +    static bool sgclipenqueue(const sgclipjob &job)
 +    {
 +        sgclipensurethread();
++        if(!sgclipthread) return false;   // hardening: no worker thread exists (see
++            // sgclipensurethread() above) - sgclipmutex/sgclipcond are NULL too (destroyed
++            // there). Treat this exactly like a full-queue drop (return false) rather than
++            // locking a NULL mutex or silently pushing the job into a queue nothing will ever
++            // drain. Every existing caller (saveclip()/startcliprecorder()/flushcliprecorder())
++            // already frees job.buf and prints its own visible drop message on a false return -
++            // the SAME uniform contract covers this case too, so nothing double-frees and
++            // nothing is left silently queued forever.
 +        bool bypass = job.kind == SGCLIPJOB_RECCLOSE || job.kind == SGCLIPJOB_QUIT;
 +        SDL_LockMutex(sgclipmutex);
 +        bool full = !bypass && sgclipqueue.length() >= SGCLIP_QUEUE_CAP;
@@ -639,7 +708,10 @@
 +                break;
 +            case SGCLIPRESULT_RECOPEN:
 +                if(r.ok) conoutf("recording started (%s): %s", r.label, r.relpath);
-+                else
++                else if(r.gen == sgcliprecgen[r.slot])   // hardening: a stale failure - a newer
++                    // attempt on this slot has already superseded it (see sgcliprecgen's own
++                    // comment above) - ignore entirely, both the message and the state rollback,
++                    // rather than confuse/clobber whatever the current attempt is doing
 +                {
 +                    conoutf("record: could not write %s", r.relpath);
 +                    cliprecordmarkopenfailed(r.slot);
@@ -694,7 +766,7 @@
      // saveclip: writes <clipdir>/<timestamp>_<map>_<mode>.dmo, gzipped in the stock demo
      // format (24-byte demoheader, then lilswapped {ms,chan,len} stamps + raw payload,
      // mirroring writedemo()/setupdemorecord() in fpsgame/server.cpp field-for-field), reading
-@@ -2250,6 +2631,11 @@
+@@ -2250,6 +2703,11 @@
          // explicitly instead, same idiom as togglerecord()'s own demoplayback check below.
          if(demoplayback) { conoutf("saveclip: can't save while playing back a demo"); return; }
  
@@ -706,7 +778,7 @@
          vector<clipentry> idx;
          if(!clipindex(idx)) { conoutf("saveclip: nothing recorded yet"); return; }
  
-@@ -2279,18 +2665,37 @@
+@@ -2279,18 +2737,37 @@
  
          defformatstring(relpath, "%s%s%s_%s_%s.dmo", clipdir, clipdir[0] ? "/" : "", sstime, mapname, mode);
  
@@ -749,7 +821,7 @@
          for(int i = starti; i < idx.length(); i++)
          {
              // Only the STARTING keyframe carries the full synthesised welcome bundle - a
-@@ -2305,15 +2710,146 @@
+@@ -2305,15 +2782,146 @@
              stamp[1] = idx[i].chan == CLIPCHAN_KEYFRAME ? 1 : idx[i].chan;
              stamp[2] = idx[i].len;
              lilswap(stamp, 3);
@@ -900,7 +972,7 @@
      // === end SwiftGibs instant replay: keyframes + clip writing =============================
  
      // ---- SwiftGibs benchmark mode (patch 22) ----
-@@ -2802,14 +3338,21 @@
+@@ -2802,14 +3410,21 @@
  
      struct cliprecorder
      {
@@ -925,7 +997,7 @@
      static bool cliprecordarmed = false;   // set by cliprecordarmmatchstart() (fpsgame/fps.cpp startgame()
                                              // hook); consumed on the very next c2sinfo() tick, once the
                                              // whole welcome bundle for a fresh match (incl. the item list,
-@@ -2830,10 +3373,22 @@
+@@ -2830,10 +3445,22 @@
      // cliprecordwasactivematch() below - never on the per-frame path.
      static bool cliprecordseenthismatch = false;
  
@@ -950,7 +1022,7 @@
      // Opens <clipdir>/<timestamp>_<map>_<mode>_rec-<label>.dmo (same gzipped stock demo format
      // saveclip() writes: 24-byte header, then {ms,chan,len} stamps + payload), starts the
      // engine-side sink buffer for `slot`, and seeds it with ONE synthesised opening keyframe
-@@ -2844,7 +3399,7 @@
+@@ -2844,7 +3471,7 @@
      // ordinary capture path (cliprecord()'s fan-out), same as the ring.
      static void startcliprecorder(cliprecorder &r, int slot, const char *label)
      {
@@ -959,7 +1031,7 @@
  
          string mapname, mode, sstime;
          clipsanitize(mapname, sizeof(mapname), clientmap, "map");
-@@ -2854,17 +3409,35 @@
+@@ -2854,17 +3481,39 @@
          sstime[min(tlen, sizeof(sstime)-1)] = '\0';
          defformatstring(relpath, "%s%s%s_%s_%s_rec-%s.dmo", clipdir, clipdir[0] ? "/" : "", sstime, mapname, mode, label);
  
@@ -978,7 +1050,8 @@
 -        f->write(&hdr, sizeof(demoheader));
 +        uchar *hdrbuf = new uchar[sizeof(demoheader)];
 +        memcpy(hdrbuf, &hdr, sizeof(demoheader));
-+
+ 
+-        r.f = f;
 +        sgclipjob job = {};
 +        job.kind = SGCLIPJOB_RECOPEN;
 +        job.slot = slot;
@@ -988,19 +1061,22 @@
 +        job.level = 6;
 +        copystring(job.relpath, relpath);
 +        copystring(job.label, label);
++        job.gen = ++sgcliprecgen[slot];   // hardening: a NEW attempt for this slot - bump the
++                                           // generation and stamp it into the job so a later
++                                           // (possibly stale) result can be matched back against
++                                           // this specific attempt (see sgcliprecgen's comment)
 +        if(!sgclipenqueue(job))
 +        {
 +            delete[] hdrbuf;
 +            conoutf("record: writer busy, could not start (%s)", label);
 +            return;
 +        }
- 
--        r.f = f;
++
 +        r.active = true;
          copystring(r.relpath, relpath);
          r.basems = -1;
          r.lastms = 0;
-@@ -2876,7 +3449,8 @@
+@@ -2876,7 +3525,8 @@
          writeclipwelcome(p);
          clipsinkput(slot, CLIPCHAN_KEYFRAME, p.buf, p.len);
  
@@ -1010,7 +1086,7 @@
      }
  
      // A map-change finalise (cliprecordfinalizeall("map change"), called from the TOP of
-@@ -2910,7 +3484,7 @@
+@@ -2910,7 +3560,7 @@
      // that caused this finalise in the first place, never legitimate history.
      static void flushcliprecorder(cliprecorder &r, int slot, bool trimtrailingmapchange = false)
      {
@@ -1019,7 +1095,7 @@
          vector<clipentry> idx;
          if(!clipsinkindex(slot, idx)) return;   // nothing buffered since the last flush - normal, no IO
          const uchar *data = clipsinkdata(slot);
-@@ -2920,23 +3494,64 @@
+@@ -2920,23 +3570,67 @@
              clipentry &last = idx[count-1];
              if(last.chan == 1 && isleadingmapchange(&data[last.offset], last.len)) count--;
          }
@@ -1076,6 +1152,9 @@
 +            job.slot = slot;
 +            job.buf = buf;
 +            job.len = totalbytes;
++            job.gen = sgcliprecgen[slot];   // hardening: stamped for consistency with
++                                             // RECOPEN/RECCLOSE - RECAPPEND produces no result,
++                                             // so nothing currently reads this back
 +            if(!sgclipenqueue(job))
 +            {
 +                delete[] buf;
@@ -1095,7 +1174,7 @@
          clipsinkreset(slot);   // the trimmed trailing record (if any) is simply discarded, never
                                  // written anywhere - correct: it belongs to the NEXT match, which
                                  // gets its own proper (synthesised-keyframe) opening instead, and
-@@ -2983,25 +3598,12 @@
+@@ -2983,25 +3677,12 @@
          }
      }
  
@@ -1127,7 +1206,7 @@
  
      // === SwiftGibs instant replay: clip folder listing (playback discoverability fix) =======
      // April's playtest-1 bug: clips land in clipdir, but neither the stock `demo` command nor
-@@ -3111,13 +3713,39 @@
+@@ -3111,13 +3792,44 @@
      // through here rather than leaving a file open, unflushed, or lost.
      static void finishcliprecorder(cliprecorder &r, int slot, const char *label, const char *reason)
      {
@@ -1154,6 +1233,11 @@
 +        copystring(job.reason, reason);
 +        job.basems = r.basems;
 +        job.lastms = r.lastms;
++        job.gen = sgcliprecgen[slot];   // hardening: stamped for consistency with RECOPEN -
++                                         // RECCLOSE's result never mutates cliprecorder state
++                                         // (r.active is already false by the time this is
++                                         // enqueued), so nothing gates on it, but it is present
++                                         // for any future consumer and for audit symmetry
 +        job.prune = true;
 +        job.prunekeep = cliprecordkeep;
 +        // Mirrors listfiles()'s own two real candidate locations for a writable clipdir (CWD-
@@ -1172,7 +1256,7 @@
      }
  
      // Finalises WHATEVER is currently running (manual and/or auto - each no-ops independently
-@@ -3133,7 +3761,7 @@
+@@ -3133,7 +3845,7 @@
      // Manual start/stop (a named, bindable action - F9 by default, see overlay/autoexec.cfg).
      void togglerecord()
      {
