@@ -1,0 +1,382 @@
+--- a/engine/main.cpp	2026-08-19 13:46:46.128120086 +0100
++++ b/engine/main.cpp	2026-08-19 13:57:51.760783236 +0100
+@@ -936,6 +936,7 @@
+ 
+ void checkinput()
+ {
++    if(benchinputgatearmed) game::benchinputtick();   // SwiftGibs paced benchmark mode (patch 24): perf-counter timestamp for the input-gap latency proxy - armed-only, one bool check otherwise
+     if(interceptkeysym) clearinterceptkey();
+     //int lasttype = 0, lastbut = 0;
+     bool mousemoved = false;
+@@ -1063,7 +1064,7 @@
+ 
+ void limitfps(int &millis, int curmillis)
+ {
+-    if(benchmeasuring) return;   // sgbench: uncapped while measuring (patch 22)
++    if(benchmeasuring && !benchcapactive) return;   // sgbench: uncapped while measuring (patch 22); a PACED run (patch 24) sets benchcapactive so the cap stays active instead of being bypassed
+     int limit = (mainmenu || minimized) && menufps ? (maxfps ? min(maxfps, menufps) : menufps) : maxfps;
+     if(!limit) return;
+     static int fpserror = 0;
+--- a/fpsgame/client.cpp	2026-08-19 13:46:46.130198575 +0100
++++ b/fpsgame/client.cpp	2026-08-19 13:57:51.758805442 +0100
+@@ -12,14 +12,23 @@
+ #include <dirent.h>
+ #endif
+ 
+-// SwiftGibs benchmark mode (patch 22): two pieces of state that must live at TRUE global
+-// scope, not inside namespace game (which this whole file lives inside from here down).
++// SwiftGibs benchmark mode (patch 22; extended by patch 24's capped-pacing mode): pieces of
++// state that must live at TRUE global scope, not inside namespace game (which this whole file
++// lives inside from here down).
+ // - quit() is engine/main.cpp's plain global-scope exit function; forward-declared here so
+ //   the unqualified quit() calls in the bench module below resolve to it instead of
+ //   (re)declaring a separate, undefined game::quit.
+ // - benchmeasuring is read by limitfps() (engine/main.cpp, also global scope) via the
+ //   `extern bool benchmeasuring;` in shared/iengine.h; defining it inside namespace game
+ //   would silently create a distinct game::benchmeasuring and fail to link.
++// - benchcapactive (patch 24) is also read by limitfps(): benchmeasuring alone always
++//   bypassed the cap outright (sgbench's whole point), but a PACED run must NOT bypass it -
++//   limitfps checks `benchmeasuring && !benchcapactive`, so a paced run's forced maxfps (set
++//   via setvar(), see sgbenchpaced below) actually governs the loop instead of being skipped.
++// - benchinputgatearmed (patch 24) is read by checkinput() (engine/main.cpp, also global
++//   scope): true only while a paced run's measured window is open, so checkinput() can
++//   timestamp its own entry for the input-gap latency proxy at a cost of one bool check on
++//   every call where a paced run isn't doing that (armed-only, per the design spec).
+ // - minimized is engine/main.cpp's own global-scope flag (true while the window is
+ //   minimized); benchframe() below polls it directly during MEASURING to poison, not
+ //   silently record, a pass captured while minimized. Same file-scope-extern reasoning as
+@@ -28,6 +37,8 @@
+ extern void quit();
+ extern bool minimized;
+ bool benchmeasuring = false;
++bool benchcapactive = false;        // SwiftGibs paced benchmark mode (patch 24): see limitfps() in engine/main.cpp
++bool benchinputgatearmed = false;   // SwiftGibs paced benchmark mode (patch 24): see checkinput() in engine/main.cpp
+ 
+ namespace game
+ {
+@@ -2999,6 +3010,18 @@
+     static const double BENCHSTARTTIMEOUTMS = 10000.0;   // give up waiting for playback to start after this long
+     VAR(benchdumpframes, 0, 1, 1);             // write benchframes-<row>.csv alongside the CSV row (not persisted)
+ 
++    // ---- SwiftGibs paced benchmark mode (patch 24): shared arm-time state ----
++    // Extends the classic sgbench state above rather than duplicating it - bencharmed,
++    // benchpendingticks, benchstartticks, BENCHCAP, benchframes_ms, benchcount,
++    // benchtruncated, benchlastticks, benchdemofile and BENCHSTARTTIMEOUTMS are ALL reused
++    // as-is by a paced run; only these are new.
++    static bool benchpaced = false;            // is the currently-armed run sgbenchpaced (vs classic sgbench)?
++    static int benchcapfps = 0;                // the requested cap - CSV capfps column + late15/late20 thresholds
++    static float *benchinputgaps_ms = NULL;    // allocated once on arm, paced runs only - preallocated like
++                                                // benchframes_ms above, same BENCHCAP capacity reasoning
++    static int benchinputgapcount = 0;
++    static Uint64 benchlastinputticks = 0;     // last checkinput()-entry perf-counter timestamp seen this run (0 = no sample yet)
++
+     struct benchstats { float p50, p95, p99, onepctlow, worst; int stutters; };
+ 
+     // p(k) on an already-sorted array: nearest-rank, truncating (not rounding) the index - the
+@@ -3036,7 +3059,8 @@
+         delete[] sorted;
+     }
+ 
+-    static void benchreport();   // forward decl - defined below; benchframe() below is the only caller
++    static void benchreport();        // forward decl - defined below; benchframe() below is the only caller
++    static void benchreportpaced();   // forward decl (patch 24) - defined below; benchframe() below is the only caller
+ 
+     // Called unconditionally from the main loop (engine/main.cpp, right after
+     // getclockmillis()) - a no-op before sgbench arms a run and forever after that run reports.
+@@ -3059,6 +3083,8 @@
+                 benchmeasuring = true;
+                 benchstartticks = now;
+                 benchlastticks = 0;
++                benchlastinputticks = 0;   // SwiftGibs paced benchmark mode (patch 24): fresh input-gap tracking for this run's window
++                benchinputgapcount = 0;
+                 return;
+             }
+             double waitedms = double(now - benchpendingticks) * 1000.0 / double(freq);
+@@ -3077,12 +3103,15 @@
+         {
+             bencharmed = false;
+             benchmeasuring = false;
+-            if(benchcount) benchreport();
++            benchcapactive = false;         // SwiftGibs paced benchmark mode (patch 24): resume normal limitfps semantics
++            benchinputgatearmed = false;    // SwiftGibs paced benchmark mode (patch 24): close the input-gap measured window
++            if(benchcount) { if(benchpaced) benchreportpaced(); else benchreport(); }
+             else { conoutf("BENCH ERROR: no frames captured"); quit(); }
+             return;
+         }
+ 
+         double sincestart = double(now - benchstartticks) * 1000.0 / double(freq);
++        if(benchpaced) benchinputgatearmed = sincestart >= 2000.0;   // SwiftGibs paced benchmark mode (patch 24): same 2s settle discard as the frame-capture window just below
+         if(sincestart >= 2000.0 && benchlastticks)
+         {
+             if(minimized)
+@@ -3185,6 +3214,8 @@
+         benchtruncated = false;
+         benchlastticks = 0;
+         benchmeasuring = false;
++        benchpaced = false;      // SwiftGibs paced benchmark mode (patch 24): classic sgbench is never the paced/capped mode
++        benchcapactive = false;
+         copystring(benchdemofile, file);
+         benchpendingticks = SDL_GetPerformanceCounter();
+         bencharmed = true;
+@@ -3208,6 +3239,240 @@
+     });
+     // ---- end SwiftGibs benchmark mode ----
+ 
++    // ---- SwiftGibs paced benchmark mode (patch 24): sgbenchpaced + pacing metrics + input-gap ----
++    //
++    // sgbenchpaced <demofile> <fps> is sgbench's capped sibling: it reuses the ENTIRE
++    // patch-22 state machine above (bencharmed/PENDING/MEASURING, the 10s start timeout, the
++    // minimized-window poison, the preallocated benchframes_ms capture array, quit-on-done) -
++    // nothing about IDLE -> PENDING -> MEASURING -> report/error is duplicated here. The only
++    // new arm-time state is benchpaced/benchcapfps (declared with the rest of the shared state
++    // above) plus the input-gap array below. What genuinely differs from sgbench:
++    // - limitfps (engine/main.cpp) must NOT be bypassed: benchmeasuring alone always bypassed
++    //   it (that is the entire point of uncapped sgbench). A paced run instead sets
++    //   benchcapactive (true global scope, like benchmeasuring itself) so limitfps's guard
++    //   becomes `benchmeasuring && !benchcapactive` - false for a paced run, so the cap keeps
++    //   governing the loop exactly as it would in normal play.
++    // - the cap itself is the real `maxfps` VARP, forced in memory for this run via
++    //   `setvar("maxfps", fps)` at arm time (same idiom already used elsewhere in this codebase
++    //   for programmatic var changes, e.g. engine/server.cpp's setvar("serveruprate", ...)) -
++    //   not a parallel, hand-rolled cap. It is never explicitly restored: sgbenchpaced always
++    //   quit()s the engine when it finishes (same as sgbench), and quit() writes maxfps's new
++    //   value into writecfg()'s target - but that target is the disposable bench-home directory
++    //   the runner recreates from scratch on every invocation (tools/bench/run-benchmark-paced.sh),
++    //   never the player's real config, so "not persisted" is true in every sense that matters.
++    // - a SEPARATE CSV, benchpacing.csv, with its own EXACT header (below) - the v1
++    //   benchresults.csv header contract that benchreport() writes above is untouched.
++    // - four new pacing metrics with no patch-22 equivalent: p999, jitter_stddev, late15/20
++    //   counts (see benchcomputepacedstats() below), and maxgap_input (see the input-gap
++    //   instrumentation further below).
++    //
++    // Pacing metrics (computed over the SAME measured-window frame array benchframe() already
++    // fills in above - this comment block is the spec, not just a description):
++    // - p50/p99/p999: reuse benchpercentile() (patch 22, above) UNCHANGED - the exact same
++    //   sorted[min(n-1,(size_t)(k/100.0*n))] convention, just at three k values. There is only
++    //   ever one percentile formula in this file.
++    // - jitter_stddev: POPULATION standard deviation of the frame times (divide by n, not
++    //   n-1) - see the hand-computed selftest comment below for the worked example.
++    // - late15_count / late20_count: target period = 1000.0/capfps ms; count frames STRICTLY
++    //   GREATER than 1.5x / 2.0x that period - same strict-inequality convention as patch 22's
++    //   "stutters" (> 2.0*median).
++    // - maxgap_input_ms: the largest checkinput()-entry-to-entry gap observed during the
++    //   measured window (see the input-gap instrumentation below); the CSV carries only the
++    //   max per the exact header contract, but the p99 gap is also computed (and printed to
++    //   the console, not the CSV) since Task 2/3 of this plan use it as their decouple-vs-
++    //   coupled latency proxy.
++    //
++    // Failure contract: IDENTICAL to sgbench above, reusing the exact same "BENCH ERROR: ..."
++    // messages from the shared state machine (timeout, no frames captured, minimized poison) -
++    // a paced run never gets its own distinct error-message vocabulary, and never writes a
++    // benchpacing.csv row on failure, matching "runners detect success by CSV row growth, not
++    // exit code" from the patch-22 measurement rules above.
++    //
++    // CSV header (written when the file is created, exact):
++    // utc,version,platform,demo,capfps,frames,seconds,avgfps,p50ms,p99ms,p999ms,jitter_stddev_ms,late15_count,late20_count,maxgap_input_ms
++    //
++    // ---- Input-gap instrumentation ----
++    // checkinput() (engine/main.cpp) times its own entry with SDL_GetPerformanceCounter(),
++    // gated by `if(benchinputgatearmed) game::benchinputtick();` - a single bool check on every
++    // call where no paced run's measured window is open (zero cost otherwise, per the design
++    // spec). benchinputgatearmed itself is maintained here, not in main.cpp: benchframe() sets
++    // it every MEASURING iteration to `sincestart >= 2000.0` - the identical 2s settle-discard
++    // condition the frame array uses - and clears it the moment the run ends. Because
++    // benchframe() runs BEFORE checkinput() in the main loop (engine/main.cpp: benchframe() is
++    // called right after getclockmillis(), checkinput() only after limitfps() and the
++    // time-advance block further down), the flag checkinput() reads this iteration was decided
++    // by THIS SAME iteration's benchframe() call, not a stale one-iteration-old value.
++    // benchinputtick() itself just records the perf-counter delta since the previous entry into
++    // a preallocated array, benchinputgaps_ms, sized BENCHCAP (1,000,000) - same capacity
++    // reasoning as benchframes_ms above, and same "stop recording rather than reallocate or
++    // crash if somehow exhausted" contract, just without a separate truncation flag (a
++    // multi-minute bench run at even a very high uncapped tick rate stays several orders of
++    // magnitude below 1,000,000 samples).
++    void benchinputtick()
++    {
++        Uint64 now = SDL_GetPerformanceCounter();
++        static const Uint64 freq = SDL_GetPerformanceFrequency();
++        if(benchlastinputticks)
++        {
++            double gapms = double(now - benchlastinputticks) * 1000.0 / double(freq);
++            if(benchinputgapcount < BENCHCAP) benchinputgaps_ms[benchinputgapcount++] = float(gapms);
++        }
++        benchlastinputticks = now;
++    }
++
++    // Pacing-specific stats over a captured (or fixture) frame-time array - see the "Pacing
++    // metrics" comment above for the formulas this implements.
++    struct benchpacedstats { float p50, p99, p999, jitterstddev; int late15count, late20count; };
++
++    static void benchcomputepacedstats(const float *src, int n, int capfps, benchpacedstats &out)
++    {
++        float *sorted = new float[n];
++        memcpy(sorted, src, n*sizeof(float));
++        quicksort(sorted, n);
++
++        out.p50  = benchpercentile(sorted, n, 50.0);
++        out.p99  = benchpercentile(sorted, n, 99.0);
++        out.p999 = benchpercentile(sorted, n, 99.9);
++        delete[] sorted;
++
++        double sum = 0;
++        for(int i = 0; i < n; i++) sum += src[i];
++        double mean = sum / n;
++        double sqsum = 0;
++        for(int i = 0; i < n; i++) { double d = src[i] - mean; sqsum += d*d; }
++        out.jitterstddev = sqrtf(float(sqsum / n));
++
++        double period = 1000.0 / double(capfps);
++        int late15 = 0, late20 = 0;
++        for(int i = 0; i < n; i++)
++        {
++            if(src[i] > float(1.5*period)) late15++;
++            if(src[i] > float(2.0*period)) late20++;
++        }
++        out.late15count = late15;
++        out.late20count = late20;
++    }
++
++    // Input-gap array stats: max + p99 of the checkinput()-entry gaps (see the input-gap
++    // instrumentation comment above). Reuses the same quicksort + benchpercentile as every
++    // other stat in this file. n<=0 (no real measured window - e.g. sgbenchpacedselftest's
++    // fixture-only run below never opens one) reports 0.00 for both.
++    static void benchcomputeinputgapstats(const float *src, int n, float &maxgap, float &p99gap)
++    {
++        if(n <= 0) { maxgap = 0.0f; p99gap = 0.0f; return; }
++        float *sorted = new float[n];
++        memcpy(sorted, src, n*sizeof(float));
++        quicksort(sorted, n);
++        maxgap = sorted[n-1];
++        p99gap = benchpercentile(sorted, n, 99.0);
++        delete[] sorted;
++    }
++
++    // Only ever called with benchcount > 0 and benchpaced true (see benchframe() above) - the
++    // zero-frames case is handled entirely by the caller, so this never has to.
++    static void benchreportpaced()
++    {
++        benchpacedstats st;
++        benchcomputepacedstats(benchframes_ms, benchcount, benchcapfps, st);
++
++        float maxgapinput = 0.0f, p99gapinput = 0.0f;
++        benchcomputeinputgapstats(benchinputgaps_ms, benchinputgapcount, maxgapinput, p99gapinput);
++
++        double totalms = 0;
++        for(int i = 0; i < benchcount; i++) totalms += benchframes_ms[i];
++        double seconds = totalms/1000.0;
++        double avgfps = seconds > 0 ? benchcount/seconds : 0.0;
++
++        conoutf("BENCHPACED: demo=%s capfps=%d frames=%d seconds=%.2f avgfps=%.2f%s", benchdemofile, benchcapfps, benchcount, seconds, avgfps, benchtruncated ? " TRUNCATED" : "");
++        conoutf("BENCHPACED: p50=%.2fms p99=%.2fms p999=%.2fms jitter_stddev=%.2fms", st.p50, st.p99, st.p999, st.jitterstddev);
++        conoutf("BENCHPACED: late15_count=%d late20_count=%d", st.late15count, st.late20count);
++        conoutf("BENCHPACED: maxgap_input=%.2fms p99gap_input=%.2fms%s", maxgapinput, p99gapinput, benchinputgapcount ? "" : " (no input samples)");
++
++        const char *fname = "benchpacing.csv";
++        bool existed = fileexists(findfile(fname, "r"), "r");   // same idiom as fpsstatswritelog() (fpsgame/fps.cpp) / benchreport() above
++        stream *o = openfile(fname, "a");
++        if(!o) { conoutf("BENCH ERROR: could not open %s for writing", fname); quit(); return; }
++        if(!existed) o->printf("utc,version,platform,demo,capfps,frames,seconds,avgfps,p50ms,p99ms,p999ms,jitter_stddev_ms,late15_count,late20_count,maxgap_input_ms\n");
++
++        time_t nowt = time(NULL);
++        string utcbuf;
++        strftime(utcbuf, sizeof(utcbuf), "%Y-%m-%dT%H:%M:%SZ", gmtime(&nowt));
++        const char *ver = getalias("swiftgibsversion");
++#ifdef WIN32
++        const char *plat = "windows";
++#elif defined(__APPLE__)
++        const char *plat = "mac";
++#else
++        const char *plat = "linux";
++#endif
++        o->printf("%s,%s,%s,%s,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%.2f\n",
++                   utcbuf, ver, plat, benchdemofile, benchcapfps, benchcount, seconds, avgfps,
++                   st.p50, st.p99, st.p999, st.jitterstddev, st.late15count, st.late20count, maxgapinput);
++        delete o;
++
++        conoutf("BENCHPACED: done");
++        quit();
++    }
++
++    // Filename + fps supplied to sgbenchpaced, stashed at arm time. Order matters here exactly
++    // as it does for sgbench above: benchpaced/benchcapfps/benchcapactive and the forced
++    // setvar("maxfps", ...) are all set, and any leftover demo is stopped, BEFORE execute(cmd)
++    // starts loading the new one - same race-proofing reasoning as sgbench's own ordering
++    // comment above.
++    ICOMMAND(sgbenchpaced, "si", (char *file, int *fps),
++    {
++        if(bencharmed) { conoutf("BENCH ERROR: already benchmarking"); return; }
++        if(*fps <= 0) { conoutf("BENCH ERROR: sgbenchpaced requires fps > 0"); quit(); return; }
++        if(!fileexists(findfile(file, "r"), "r")) { conoutf("BENCH ERROR: demo file not found: %s", file); quit(); return; }
++        if(!benchframes_ms) benchframes_ms = new float[BENCHCAP];
++        if(!benchinputgaps_ms) benchinputgaps_ms = new float[BENCHCAP];
++        benchcount = 0;
++        benchtruncated = false;
++        benchlastticks = 0;
++        benchmeasuring = false;
++        benchpaced = true;
++        benchcapfps = *fps;
++        benchcapactive = true;         // limitfps (patch 24): do not bypass while this paced run is armed
++        benchinputgapcount = 0;
++        benchlastinputticks = 0;
++        benchinputgatearmed = false;   // becomes true once the measured window opens - see benchframe() above
++        copystring(benchdemofile, file);
++        setvar("maxfps", benchcapfps); // forced in memory for this run - see the module comment above for why this is never persisted in any sense that matters
++        benchpendingticks = SDL_GetPerformanceCounter();
++        bencharmed = true;
++        defformatstring(cmd, "stopdemo; mode -1; map \"%s\"", file);
++        execute(cmd);
++    });
++
++    // sgbenchpacedselftest hand-computed arithmetic (fixture REUSED from patch 22 above -
++    // benchselftestfixture = {10,10,10,10,10,10,10,10,30,10}, n=10: nine 10ms samples plus one
++    // 30ms sample; cap=100fps -> target period = 1000/100 = 10.00ms; sorted ascending:
++    // [10,10,10,10,10,10,10,10,10,30], 0-indexed):
++    //   p50  = sorted[min(9,(size_t)(50.0/100.0*10))]  = sorted[min(9,5)] = sorted[5] = 10.00
++    //   p99  = sorted[min(9,(size_t)(99.0/100.0*10))]  = sorted[min(9,9)] = sorted[9] = 30.00
++    //   p999 = sorted[min(9,(size_t)(99.9/100.0*10))]  = sorted[min(9,9)] = sorted[9] = 30.00
++    //     (99.9/100.0*10 = 9.99, truncated to size_t 9 - same truncating-not-rounding
++    //     convention as p50/p99 above)
++    //   late15_count: threshold = 1.5*10.00 = 15ms; only the 30ms sample exceeds it -> 1
++    //   late20_count: threshold = 2.0*10.00 = 20ms; only the 30ms sample exceeds it -> 1
++    //   jitter_stddev (population, divide by n not n-1):
++    //     mean = (9*10 + 30)/10 = 120/10 = 12.0
++    //     variance = (9*(10-12)^2 + (30-12)^2)/10 = (9*4 + 324)/10 = (36+324)/10 = 36.0
++    //     stddev = sqrt(36.0) = 6.00
++    //   maxgap_input: the selftest never opens a real measured window (a pure-fixture command
++    //   generates no checkinput() traffic of its own) - hardcoded 0.00, matching
++    //   benchcomputeinputgapstats()'s own n<=0 fallback above.
++    // Expected line:
++    // "BENCHPACED SELFTEST: n=10 capfps=100 p50=10.00 p99=30.00 p999=30.00 jitter_stddev=6.00 late15_count=1 late20_count=1 maxgap_input=0.00"
++    ICOMMAND(sgbenchpacedselftest, "", (),
++    {
++        benchpacedstats st;
++        benchcomputepacedstats(benchselftestfixture, 10, 100, st);
++        conoutf("BENCHPACED SELFTEST: n=10 capfps=100 p50=%.2f p99=%.2f p999=%.2f jitter_stddev=%.2f late15_count=%d late20_count=%d maxgap_input=0.00",
++                st.p50, st.p99, st.p999, st.jitterstddev, st.late15count, st.late20count);
++    });
++    // ---- end SwiftGibs paced benchmark mode ----
++
+     // === SwiftGibs clip POV scan (QoL batch: export from another player's POV) ==============
+     //
+     // Bounded, read-only scan of a clip/recording's opening keyframe (writeclipwelcome(),
+--- a/shared/iengine.h	2026-08-19 13:46:46.132259665 +0100
++++ b/shared/iengine.h	2026-08-19 13:57:51.761387833 +0100
+@@ -582,6 +582,8 @@
+ extern int bilinear;
+ extern int clips;                                               // SwiftGibs instant replay on/off
+ extern bool benchmeasuring;                                     // SwiftGibs benchmark mode (patch 22): limitfps() no-ops while this is set
++extern bool benchcapactive;                                     // SwiftGibs paced benchmark mode (patch 24): when set alongside benchmeasuring, limitfps() stays active (the cap governs the run)
++extern bool benchinputgatearmed;                                // SwiftGibs paced benchmark mode (patch 24): checkinput() timestamps its own entry while this is set
+ 
+ // SwiftGibs preload pass (patch 23, slate C): sgpreloadstats (0/1, VAR) counts what got
+ // warmed at map start (sgpreload_*) vs what still loaded lazily during play (sglazy_*),
+--- a/shared/igame.h	2026-08-19 13:46:46.132398964 +0100
++++ b/shared/igame.h	2026-08-19 13:57:51.761897732 +0100
+@@ -52,6 +52,7 @@
+     extern void updateworld();
+     extern void fpsstatsframe(int elapsed);  // SwiftGibs per-match fps stats: called once per frame with the frame time the engine already computed
+     extern void benchframe();          // SwiftGibs benchmark mode (patch 22): per-frame perf-counter capture, no-op unless a run is armed
++    extern void benchinputtick();      // SwiftGibs paced benchmark mode (patch 24): perf-counter timestamp for a checkinput() entry, called only while benchinputgatearmed
+     extern void initclient();
+     extern void physicstrigger(physent *d, bool local, int floorlevel, int waterlevel, int material = 0);
+     extern void bounced(physent *d, const vec &surface);
