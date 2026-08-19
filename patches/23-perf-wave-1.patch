@@ -31,6 +31,30 @@
      vec mo = vec(o).sub(e.o), mray(ray);
      float v = mo.dot(mray), inside = m->bih->entradius - mo.squaredlen();
      if((inside < 0 && v > 0) || inside + v*v < 0) return false;
+--- a/engine/main.cpp
++++ b/engine/main.cpp
+@@ -14,6 +14,11 @@
+ 
+ void cleanup()
+ {
++    // SwiftGibs clip writer thread (Task 2, perf-wave-1 slate B): join before recorder::stop() -
++    // both are "wait for a background writer thread to finish its pending work," same precedent;
++    // order between the two doesn't matter (independent threads, independent files). No-op if
++    // the writer thread was never started this session (clips/recording never used).
++    game::clipworkerjoin();
+     recorder::stop();
+     cleanupserver();
+     SDL_ShowCursor(SDL_TRUE);
+@@ -1390,6 +1395,9 @@
+         static int frames = 0;
+         int millis = getclockmillis();
+         game::benchframe();          // sgbench: per-frame perf-counter capture (no-op unless armed, patch 22)
++        game::drainclipresults();    // SwiftGibs clip writer thread (Task 2): drains completion/failure
++                                      // messages from the background clip/recording writer once per
++                                      // frame (no-op unless the writer thread has ever been started)
+         // SwiftGibs deterministic export capture: while (and only while) a clip export is
+         // capturing, this paces the loop to the export's own frame rate and returns the exact
+         // game-time step this frame must advance by, so every captured frame lands on an exact
 --- a/engine/rendermodel.cpp
 +++ b/engine/rendermodel.cpp
 @@ -365,8 +365,15 @@
@@ -266,6 +290,875 @@
  
      game::preload();
      flushpreloadedmodels();
+--- a/fpsgame/client.cpp
++++ b/fpsgame/client.cpp
+@@ -1,6 +1,17 @@
+ #include "game.h"
+ #include "processpipe.h" // SwiftGibs clip export (Task 3): found via -Iengine on the include path (Makefile); a plain, self-contained header (no engine.h needed for the processpipe TYPE itself - see shared/iengine.h for the recorder:: functions this file also calls)
+ 
++// SwiftGibs clip writer thread (Task 2, perf-wave-1 slate B): the worker's own directory-prune
++// scan (sgclipprunescan(), below) must never call the engine's listfiles()/findfile() - those are
++// forbidden to the worker thread (see the threading-contract comment ahead of the writer module
++// itself) - so it uses the same raw platform directory APIs shared/stream.cpp's listdir() does,
++// included directly here since that file's own includes aren't reachable from fpsgame code.
++#ifdef WIN32
++#include <windows.h>
++#else
++#include <dirent.h>
++#endif
++
+ // SwiftGibs benchmark mode (patch 22): two pieces of state that must live at TRUE global
+ // scope, not inside namespace game (which this whole file lives inside from here down).
+ // - quit() is engine/main.cpp's plain global-scope exit function; forward-declared here so
+@@ -2030,6 +2041,12 @@
+     VARP(clipautostreak, 0, 0, 1);        // auto-save a clip on reaching a kill streak; OFF by default
+     VARP(clipautostreakcount, 2, 5, 50);  // streak length that triggers the auto-clip
+ 
++    // SwiftGibs clip writer thread (Task 2, perf-wave-1 slate B) measurement harness: when on,
++    // saveclip() prints a perf-counter timing of its own frame-thread portion (snapshot ring,
++    // format the flat write buffer, enqueue the job) - the tools/bench/measure-saveclip.sh A/B
++    // harness parses this line. OFF by default: zero cost (one int compare) in normal play.
++    VARP(sgclipstalldebug, 0, 0, 1);
++
+     // Exposed via shared/igame.h so the raw packet tap in engine/client.cpp's
+     // localservertoclient() can suppress capture while playing back a .dmo (Task 3, addressing
+     // the Task 1 review note): playback is driven by the local embedded server replaying the
+@@ -2223,6 +2240,370 @@
+         result(base);
+     });
+ 
++    // === SwiftGibs clip writer thread (Task 2, perf-wave-1 slate B) =========================
++    // THREADING CONTRACT (verbatim from docs/superpowers/specs/2026-08-19-perf-wave-1-design.md,
++    // "Slate B", reproduced here so this module's own rules never drift from the design doc that
++    // authorises it):
++    //
++    //   A single background writer thread (SDL_CreateThread; SDL is already the platform layer)
++    //   owned by the clip module, started lazily on first use, joined at quit.
++    //     - saveclip: frame thread snapshots the ring (memcpy into a heap buffer, milliseconds at
++    //       worst) and enqueues a job {buffer, path, level}; the worker compresses and writes.
++    //       Completion/failure messages are queued back and printed by the frame thread next
++    //       frame (conoutf is NOT thread-safe; the worker never calls engine functions).
++    //     - match recording: frame thread appends packets to the active segment buffer (this is
++    //       clipsinkappend()'s existing job, engine/client.cpp - unchanged by this module); at
++    //       the 1s cadence it swaps buffers (clipsinkindex()+clipsinkreset(), also unchanged) and
++    //       enqueues the full one; the worker owns the gzFile entirely (open/write/close all on
++    //       worker). Stop-recording enqueues a close job plus the prune scan.
++    //     - compression level: worker uses level 6 for clips/recordings (the zlib sweet spot -
++    //       queue depth still matters, and the size delta vs 9 on demo data is a few percent).
++    //       The opengzfile() DEFAULT (shared/tools.h, Z_BEST_COMPRESSION) is left untouched -
++    //       this module never calls opengzfile() at all, on either thread.
++    //     - bounded queue (4 real jobs); if full, the frame thread drops the job with a visible
++    //       console message rather than blocking (never block the frame thread, never silently
++    //       lose a requested save without saying so). RECCLOSE and the QUIT sentinel bypass the
++    //       cap (see sgclipenqueue() below) - dropping either would leak a gzFile the worker can
++    //       never close, corrupting or orphaning a file forever, strictly worse than a
++    //       transiently deeper queue; both are rare, terminal, cheap-to-process events.
++    //     - the frame thread drains the result queue (mutex-guarded, swap-under-lock via
++    //       vector::move()) once per frame (game::drainclipresults(), called unconditionally from
++    //       the main loop next to game::benchframe() - engine/main.cpp) and conoutf's every
++    //       completion/failure message there. Idle cost is one pointer check (thread never
++    //       started) or one non-blocking SDL_TryLockMutex (thread started, nothing queued) - never
++    //       a stall, never per-frame IO.
++    //     - quit: engine/main.cpp's cleanup() enqueues a QUIT sentinel then SDL_WaitThread joins
++    //       (clipworkerjoin() below). Pending jobs FINISH before the thread exits - the sentinel
++    //       is appended to the SAME FIFO queue, so every job already queued when quit fires is
++    //       processed first. Chosen over abandoning them: a save/recording in flight at quit is
++    //       never a truncated or corrupt file; the process exits a little later instead.
++    //
++    //   WHAT THE WORKER MAY TOUCH: the buffers/paths/ints handed to it inside each sgclipjob (all
++    //   resolved on the FRAME thread before the job crosses the mutex - path(), findfile(),
++    //   homedir, clipdir etc. are engine helpers and only the frame thread may call them), zlib's
++    //   gzFile API on files it opens itself (gzopen/gzwrite/gzclose - never the engine's own
++    //   stream/opengzfile classes), plain stdio/dirent (or Win32 FindFirstFile) for its own prune
++    //   scan, and the job/result queues under sgclipmutex. It NEVER calls conoutf, NEVER calls
++    //   openfile()/opengzfile()/listfiles()/findfile()/path() or any other engine helper, NEVER
++    //   touches game state (fpsent/players/vars), NEVER touches GL. Every string/int the worker
++    //   needs is resolved and copied into the job by the frame thread; the worker's own code
++    //   (sgclipworkerthread(), sgclipprocessjob(), sgclipscandir(), sgclipprunescan() below) is
++    //   the audit boundary - nothing outside that quartet ever runs on the worker thread.
++    #define SGCLIP_QUEUE_CAP 4
++
++    enum
++    {
++        SGCLIPJOB_SAVECLIP,    // one-shot: gzopen(path,level) + gzwrite(buf,len) + gzclose
++        SGCLIPJOB_RECOPEN,     // gzopen(path,level) for sgcliprecfiles[slot], then gzwrite(buf,len) (the header)
++        SGCLIPJOB_RECAPPEND,   // gzwrite(buf,len) to the already-open sgcliprecfiles[slot]
++        SGCLIPJOB_RECCLOSE,    // gzclose(sgcliprecfiles[slot]); optional prune scan (job.prune)
++        SGCLIPJOB_QUIT         // sentinel: the worker exits its loop after processing this batch
++    };
++    enum { SGCLIPRESULT_SAVECLIP, SGCLIPRESULT_RECOPEN, SGCLIPRESULT_RECCLOSE };
++
++    struct sgclipjob
++    {
++        int kind;
++        int slot;                          // CLIPSINK_MANUAL/CLIPSINK_AUTO - RECOPEN/RECAPPEND/RECCLOSE only
++        uchar *buf;                        // heap (new[]); the worker deletes[] it once processed, or the
++        int len;                           // enqueue caller deletes[] it if the job never entered the queue
++        string path;                       // resolved absolute path (SAVECLIP, RECOPEN) - findfile() output,
++        int level;                         // copied on the frame thread; SAVECLIP/RECOPEN only
++        bool prune;                        // RECCLOSE: run the prune scan after closing
++        string prunedir1, prunedir2;       // RECCLOSE: up to 2 absolute clipdir locations to scan (mirrors
++                                            // listfiles()'s CWD-relative + homedir-relative search, minus the
++                                            // packagedirs/zip legs - clips are only ever WRITTEN to one of
++                                            // these two by findfile()'s own write-mode rule, so nothing this
++                                            // feature ever wrote can live anywhere else); prunedir2[0]=='\0'
++                                            // means "homedir unset, only prunedir1 applies"
++        int prunekeep;                     // RECCLOSE: cliprecordkeep, captured at enqueue time
++        string relpath;                    // display path for the eventual console message
++        string label;                      // RECOPEN/RECCLOSE: "manual"/"auto"
++        string reason;                     // RECCLOSE: "stopped"/"map change"/"intermission"/"disconnect"
++        int basems, lastms;                // duration reporting
++    };
++
++    struct sgclipresult
++    {
++        int kind;
++        int slot;
++        bool ok;
++        string relpath, label, reason;
++        int basems, lastms;
++    };
++
++    static SDL_Thread *sgclipthread = NULL;
++    static SDL_mutex *sgclipmutex = NULL;
++    static SDL_cond *sgclipcond = NULL;
++    static vector<sgclipjob> sgclipqueue;      // frame -> worker, guarded by sgclipmutex
++    static vector<sgclipresult> sgclipresults; // worker -> frame, guarded by sgclipmutex
++
++    // WORKER-THREAD-OWNED ONLY: never read or written from the frame thread (the frame thread
++    // only ever sees "is this slot recording" via cliprecorder::active, set/cleared by the frame
++    // thread itself). No lock needed: exactly one thread (the worker) ever touches this array.
++    static gzFile sgcliprecfiles[CLIPSINKCOUNT] = { NULL, NULL };
++
++    static void cliprecordmarkopenfailed(int slot);   // fwd decl - defined near cliprecorder below;
++                                                        // called only from sgclipreport() (this module)
++
++    // The worker's own directory-prune scan - see the threading contract above for why this
++    // reimplements a small slice of shared/stream.cpp's listdir()/pruneclipdir() rather than
++    // calling them: both are engine helpers (listfiles() reads the packagedirs vector and calls
++    // path(), findfile() touches homedir) the worker may never call. Operates on up to two
++    // ALREADY-ABSOLUTE directory strings the frame thread resolved before enqueueing (see
++    // finishcliprecorder() below) using nothing but opendir/readdir/remove (or FindFirstFile on
++    // Windows) - no engine call anywhere in this function or sgclipprunescan() below.
++    struct sgclipprunefile { string name, dir; };
++    static void sgclipscandir(const char *dir, vector<sgclipprunefile> &entries)
++    {
++        if(!dir || !dir[0]) return;
++#ifdef WIN32
++        string pattern;
++        formatstring(pattern, "%s\\*.dmo", dir);
++        WIN32_FIND_DATAA fd;
++        HANDLE h = FindFirstFileA(pattern, &fd);
++        if(h == INVALID_HANDLE_VALUE) return;
++        do
++        {
++            size_t n = strlen(fd.cFileName);
++            if(n <= 4 || strcmp(fd.cFileName+n-4, ".dmo")) continue;
++            sgclipprunefile &e = entries.add();
++            copystring(e.name, fd.cFileName, min((size_t)sizeof(e.name), n-3));
++            copystring(e.dir, dir);
++        } while(FindNextFileA(h, &fd));
++        FindClose(h);
++#else
++        DIR *d = opendir(dir);
++        if(!d) return;
++        struct dirent *de;
++        while((de = readdir(d)) != NULL)
++        {
++            size_t n = strlen(de->d_name);
++            if(n <= 4 || strcmp(de->d_name+n-4, ".dmo")) continue;
++            sgclipprunefile &e = entries.add();
++            copystring(e.name, de->d_name, min((size_t)sizeof(e.name), n-3));
++            copystring(e.dir, dir);
++        }
++        closedir(d);
++#endif
++    }
++
++    // Mirrors pruneclipdir()'s exact semantics (the function this replaces - see finishcliprecorder()
++    // below for what used to call it, before this task): collect every "<name>.dmo" ending in suf1
++    // or suf2 from dir1 and (if set) dir2, sort ascending (filenames are timestamp-prefixed, so
++    // lexicographic order is chronological order), dedupe adjacent identical names (the two scan
++    // directories can be the SAME physical directory - the Windows homedir==installdir case the
++    // original dedupclipfiles() handled), then remove all but the newest `keep`.
++    static bool cliprecordmatch(const char *name);   // fwd decl - defined later in this file
++                                                        // (near pruneclipdir's old home); a pure
++                                                        // string function (no engine state), safe
++                                                        // to reuse here on the worker thread
++    static void sgclipprunescan(const char *dir1, const char *dir2, int keep)
++    {
++        if(keep <= 0) return;
++        vector<sgclipprunefile> entries;
++        sgclipscandir(dir1, entries);
++        sgclipscandir(dir2, entries);
++        if(entries.empty()) return;
++
++        entries.sort(sortnameless());   // compares by the struct's own .name member
++        for(int i = entries.length()-1; i > 0; i--)
++            if(!strcmp(entries[i].name, entries[i-1].name)) entries.remove(i);
++
++        vector<sgclipprunefile *> matches;
++        loopv(entries) if(cliprecordmatch(entries[i].name)) matches.add(&entries[i]);
++        int todelete = matches.length() - keep;
++        for(int i = 0; i < todelete; i++)
++        {
++            string full;
++            formatstring(full, "%s/%s.dmo", matches[i]->dir, matches[i]->name);
++            remove(full);
++        }
++    }
++
++    // Processes one job, appending a completion result when the kind needs one (SAVECLIP/RECOPEN
++    // always report; RECAPPEND never did even in the old synchronous code, so it stays silent on
++    // success here too; RECCLOSE always reports - it's the "recording saved" message). All zlib
++    // calls use the level captured in the job (6, from the two call sites below) - never the
++    // opengzfile() default.
++    static void sgclipprocessjob(sgclipjob &job, vector<sgclipresult> &results)
++    {
++        switch(job.kind)
++        {
++            case SGCLIPJOB_SAVECLIP:
++            {
++                string mode; formatstring(mode, "wb%d", job.level);
++                gzFile gz = gzopen(job.path, mode);
++                bool ok = gz != NULL;
++                if(ok && job.len) ok = gzwrite(gz, job.buf, (unsigned)job.len) == job.len;
++                if(gz) { if(gzclose(gz) != Z_OK) ok = false; }
++                delete[] job.buf;
++                sgclipresult &r = results.add();
++                r.kind = SGCLIPRESULT_SAVECLIP; r.ok = ok;
++                copystring(r.relpath, job.relpath);
++                r.basems = job.basems; r.lastms = job.lastms;
++                break;
++            }
++            case SGCLIPJOB_RECOPEN:
++            {
++                string mode; formatstring(mode, "wb%d", job.level);
++                gzFile gz = gzopen(job.path, mode);
++                bool ok = gz != NULL;
++                if(ok && job.len) ok = gzwrite(gz, job.buf, (unsigned)job.len) == job.len;
++                if(ok) sgcliprecfiles[job.slot] = gz;
++                else if(gz) gzclose(gz);
++                delete[] job.buf;
++                sgclipresult &r = results.add();
++                r.kind = SGCLIPRESULT_RECOPEN; r.slot = job.slot; r.ok = ok;
++                copystring(r.relpath, job.relpath); copystring(r.label, job.label);
++                break;
++            }
++            case SGCLIPJOB_RECAPPEND:
++            {
++                gzFile gz = sgcliprecfiles[job.slot];
++                if(gz && job.len) gzwrite(gz, job.buf, (unsigned)job.len);
++                delete[] job.buf;
++                break;
++            }
++            case SGCLIPJOB_RECCLOSE:
++            {
++                gzFile gz = sgcliprecfiles[job.slot];
++                if(gz) { gzclose(gz); sgcliprecfiles[job.slot] = NULL; }
++                if(job.prune) sgclipprunescan(job.prunedir1, job.prunedir2, job.prunekeep);
++                sgclipresult &r = results.add();
++                r.kind = SGCLIPRESULT_RECCLOSE; r.slot = job.slot; r.ok = true;
++                copystring(r.relpath, job.relpath); copystring(r.label, job.label); copystring(r.reason, job.reason);
++                r.basems = job.basems; r.lastms = job.lastms;
++                break;
++            }
++        }
++    }
++
++    // The worker's whole loop: wait for at least one job, take EVERY job currently queued in one
++    // swap (vector::move() - O(1), same trick the frame-thread drain uses below), process them in
++    // FIFO order, push back whatever results that batch produced in one more swap, repeat. Only
++    // exits after seeing SGCLIPJOB_QUIT - and even then, only after processing every real job
++    // batched alongside it (a QUIT sentinel is only ever enqueued once, last, by clipworkerjoin()
++    // below, so nothing legitimate can ever follow it in the queue).
++    static int sgclipworkerthread(void *)
++    {
++        for(;;)
++        {
++            vector<sgclipjob> jobs;
++            SDL_LockMutex(sgclipmutex);
++            while(sgclipqueue.empty()) SDL_CondWait(sgclipcond, sgclipmutex);
++            jobs.move(sgclipqueue);
++            SDL_UnlockMutex(sgclipmutex);
++
++            vector<sgclipresult> results;
++            bool quitting = false;
++            loopv(jobs)
++            {
++                if(jobs[i].kind == SGCLIPJOB_QUIT) { quitting = true; continue; }
++                sgclipprocessjob(jobs[i], results);
++            }
++            jobs.setsize(0);
++
++            if(!results.empty())
++            {
++                SDL_LockMutex(sgclipmutex);
++                sgclipresults.move(results);
++                SDL_UnlockMutex(sgclipmutex);
++            }
++            if(quitting) break;
++        }
++        return 0;
++    }
++
++    static void sgclipensurethread()
++    {
++        if(sgclipthread) return;
++        sgclipmutex = SDL_CreateMutex();
++        sgclipcond = SDL_CreateCond();
++        sgclipthread = SDL_CreateThread(sgclipworkerthread, "clip writer", NULL);
++    }
++
++    // Enqueues one job. Returns false if the job was DROPPED (queue already at SGCLIP_QUEUE_CAP
++    // and this kind isn't exempt) - the caller then still owns job.buf and must delete[] it plus
++    // print its own drop message; see the threading contract above for why RECCLOSE/QUIT are
++    // exempt from the cap.
++    static bool sgclipenqueue(const sgclipjob &job)
++    {
++        sgclipensurethread();
++        bool bypass = job.kind == SGCLIPJOB_RECCLOSE || job.kind == SGCLIPJOB_QUIT;
++        SDL_LockMutex(sgclipmutex);
++        bool full = !bypass && sgclipqueue.length() >= SGCLIP_QUEUE_CAP;
++        if(!full) sgclipqueue.add(job);
++        SDL_CondSignal(sgclipcond);
++        SDL_UnlockMutex(sgclipmutex);
++        return !full;
++    }
++
++    // Turns one drained result into exactly the console message the old synchronous code used to
++    // print inline, now deferred until the worker has actually finished. A RECOPEN failure also
++    // rolls the optimistic cliprecorder::active back off (cliprecordmarkopenfailed() above).
++    static void sgclipreport(const sgclipresult &r)
++    {
++        switch(r.kind)
++        {
++            case SGCLIPRESULT_SAVECLIP:
++                if(r.ok) conoutf("saved clip: %s (%.1fs)", r.relpath, (r.lastms-r.basems)/1000.0f);
++                else conoutf("saveclip: could not write %s", r.relpath);
++                break;
++            case SGCLIPRESULT_RECOPEN:
++                if(r.ok) conoutf("recording started (%s): %s", r.label, r.relpath);
++                else
++                {
++                    conoutf("record: could not write %s", r.relpath);
++                    cliprecordmarkopenfailed(r.slot);
++                }
++                break;
++            case SGCLIPRESULT_RECCLOSE:
++                conoutf("recording saved (%s, %s): %s (%.1fs)", r.label, r.reason, r.relpath,
++                        r.basems >= 0 ? (r.lastms-r.basems)/1000.0f : 0.0f);
++                break;
++        }
++    }
++
++    // Frame-thread result drain - see the threading contract above. Called unconditionally once
++    // per real frame (engine/main.cpp's main loop, next to game::benchframe()); idle cost is a
++    // single pointer check (thread never started) or one non-blocking SDL_TryLockMutex (thread
++    // started, nothing queued yet) - never a stall, matching every other per-frame housekeeping
++    // call in this file.
++    void drainclipresults()
++    {
++        if(!sgclipthread) return;
++        if(SDL_TryLockMutex(sgclipmutex) != 0) return;   // worker is mid-push/pop right now - skip
++                                                            // this frame rather than wait; it'll
++                                                            // still be here next frame
++        static vector<sgclipresult> drained;
++        bool any = !sgclipresults.empty();
++        if(any) drained.move(sgclipresults);
++        SDL_UnlockMutex(sgclipmutex);
++        if(!any) return;
++        loopv(drained) sgclipreport(drained[i]);
++        drained.setsize(0);
++    }
++
++    // Joined at quit only (engine/main.cpp cleanup(), right where recorder::stop() joins the
++    // video-export encoder thread - the same "stop a background writer thread cleanly"
++    // precedent). No-op if the writer was never started this session (clips/recording never
++    // used). See the threading contract above for why pending jobs are drained, not abandoned.
++    void clipworkerjoin()
++    {
++        if(!sgclipthread) return;
++        sgclipjob job = {};
++        job.kind = SGCLIPJOB_QUIT;
++        sgclipenqueue(job);       // always succeeds - QUIT bypasses the cap
++        SDL_WaitThread(sgclipthread, NULL);
++        sgclipthread = NULL;
++        SDL_DestroyCond(sgclipcond); sgclipcond = NULL;
++        SDL_DestroyMutex(sgclipmutex); sgclipmutex = NULL;
++    }
++    // === end SwiftGibs clip writer thread ====================================================
++
++    // saveclip: writes <clipdir>/<timestamp>_<map>_<mode>.dmo, gzipped in the stock demo
++    // format (24-byte demoheader, then lilswapped {ms,chan,len} stamps + raw payload,
+     // saveclip: writes <clipdir>/<timestamp>_<map>_<mode>.dmo, gzipped in the stock demo
+     // format (24-byte demoheader, then lilswapped {ms,chan,len} stamps + raw payload,
+     // mirroring writedemo()/setupdemorecord() in fpsgame/server.cpp field-for-field), reading
+@@ -2250,6 +2631,11 @@
+         // explicitly instead, same idiom as togglerecord()'s own demoplayback check below.
+         if(demoplayback) { conoutf("saveclip: can't save while playing back a demo"); return; }
+ 
++        // SwiftGibs clip writer thread (Task 2) measurement harness - see sgclipstalldebug's own
++        // comment above. Times exactly "the frame-thread portion": ring snapshot, format into the
++        // flat write buffer, enqueue - everything below down to the closing brace.
++        Uint64 sgclipstallstart = sgclipstalldebug ? SDL_GetPerformanceCounter() : 0;
++
+         vector<clipentry> idx;
+         if(!clipindex(idx)) { conoutf("saveclip: nothing recorded yet"); return; }
+ 
+@@ -2279,18 +2665,37 @@
+ 
+         defformatstring(relpath, "%s%s%s_%s_%s.dmo", clipdir, clipdir[0] ? "/" : "", sstime, mapname, mode);
+ 
+-        stream *f = opengzfile(path(relpath, true), "wb");
+-        if(!f) { conoutf("saveclip: could not write %s", relpath); return; }
++        // SwiftGibs clip writer thread (Task 2, perf-wave-1 slate B): format the whole would-be
++        // file - header + every record this clip covers - into ONE flat heap buffer here, on the
++        // frame thread. Pure memcpy/formatting (milliseconds at worst for a full ring, per the
++        // design doc) - the same work the old inline loop below used to do, minus the actual gzip
++        // deflate + file IO, which the worker thread now owns. Two passes over idx (size, then
++        // fill) avoid append-growth reallocation; the byte CONTENT this produces is exactly what
++        // the old synchronous loop fed into opengzfile()'s stream one record at a time - gzip's
++        // Z_NO_FLUSH streaming semantics don't care how input is chunked across write() calls,
++        // only the total ordered bytes matter, so one big write instead of many small ones
++        // changes nothing about the compressed output (proven empirically too - see the
++        // gzip-determinism harness in the Task 2 report).
++        int basems = idx[starti].ms;
++        int lastms = basems;
++        int stampsize = (int)sizeof(int)*3;
++        int totalbytes = (int)sizeof(demoheader);
++        for(int i = starti; i < idx.length(); i++)
++        {
++            if(idx[i].chan == CLIPCHAN_KEYFRAME && i != starti) continue;   // see the fill pass below for why
++            totalbytes += stampsize + idx[i].len;
++        }
++
++        uchar *filebuf = new uchar[totalbytes];
++        int pos = 0;
+ 
+         demoheader hdr;
+         memcpy(hdr.magic, DEMO_MAGIC, sizeof(hdr.magic));
+         hdr.version = DEMO_VERSION;
+         hdr.protocol = PROTOCOL_VERSION;
+         lilswap(&hdr.version, 2);
+-        f->write(&hdr, sizeof(demoheader));
++        memcpy(&filebuf[pos], &hdr, sizeof(demoheader)); pos += (int)sizeof(demoheader);
+ 
+-        int basems = idx[starti].ms;
+-        int lastms = basems;
+         for(int i = starti; i < idx.length(); i++)
+         {
+             // Only the STARTING keyframe carries the full synthesised welcome bundle - a
+@@ -2305,15 +2710,124 @@
+             stamp[1] = idx[i].chan == CLIPCHAN_KEYFRAME ? 1 : idx[i].chan;
+             stamp[2] = idx[i].len;
+             lilswap(stamp, 3);
+-            f->write(stamp, sizeof(stamp));
+-            if(idx[i].len) f->write(&data[idx[i].offset], idx[i].len);
++            memcpy(&filebuf[pos], stamp, sizeof(stamp)); pos += (int)sizeof(stamp);
++            if(idx[i].len) { memcpy(&filebuf[pos], &data[idx[i].offset], idx[i].len); pos += idx[i].len; }
+             lastms = idx[i].ms;
+         }
+-        delete f;
+ 
+-        conoutf("saved clip: %s (%.1fs)", relpath, (lastms-basems)/1000.0f);
++        sgclipjob job = {};
++        job.kind = SGCLIPJOB_SAVECLIP;
++        job.buf = filebuf;
++        job.len = totalbytes;
++        // The only engine call this job needs - resolved here, on the frame thread, mirroring
++        // opengzfile()'s own openfile()->findfile() resolution the old code relied on. findfile()
++        // returns a pointer into its own static scratch buffer - copied out immediately (the
++        // established precedent in this file - see the clip-export pass1target comment below).
++        copystring(job.path, findfile(path(relpath, true), "wb"));
++        job.level = 6;
++        copystring(job.relpath, relpath);
++        job.basems = basems;
++        job.lastms = lastms;
++        if(!sgclipenqueue(job))
++        {
++            delete[] filebuf;
++            conoutf("saveclip: writer busy, dropped save of %s", relpath);
++        }
++        // Success/failure message deferred to the completion result, drained + printed by
++        // drainclipresults() next frame (see sgclipreport(), above) - conoutf is not thread-safe,
++        // and the write hasn't actually happened yet at this point.
++
++        if(sgclipstalldebug)
++        {
++            double sgclipstallms = (SDL_GetPerformanceCounter() - sgclipstallstart) * 1000.0 / SDL_GetPerformanceFrequency();
++            conoutf("sgclipstalldebug: saveclip frame-thread portion = %.3fms", sgclipstallms);
++        }
+     }
+     COMMAND(saveclip, "");
++
++    // SwiftGibs clip writer thread (Task 2, perf-wave-1 slate B) correctness gate: proves the
++    // worker's gzopen()/gzwrite()/gzclose() path (SGCLIPJOB_SAVECLIP in sgclipprocessjob(),
++    // above) produces BYTE-IDENTICAL output to the pre-Task-2 synchronous write loop, given the
++    // exact same input bytes at the exact same compression level. Snapshots whatever is
++    // currently in the ring (no keyframe/cutoff selection - unlike saveclip() above, this tool
++    // only cares about proving the two COMPRESSION paths agree, not about producing a playable
++    // clip), formats it once into a flat buffer, then writes that SAME buffer through both paths
++    // at level 6 and byte-compares the two resulting files. Debug/test tool only - never called
++    // from normal gameplay, not wired into any bind or menu.
++    ICOMMAND(sgclipdeterminism, "", (),
++    {
++        if(!clipactive()) { conoutf("sgclipdeterminism: replay clips are off (clips 1 to enable)"); return; }
++        vector<clipentry> idx;
++        if(!clipindex(idx)) { conoutf("sgclipdeterminism: nothing recorded yet"); return; }
++        const uchar *data = clipdata();
++        if(!data) { conoutf("sgclipdeterminism: replay clips are off (clips 1 to enable)"); return; }
++
++        int stampsize = (int)sizeof(int)*3;
++        int totalbytes = (int)sizeof(demoheader);
++        loopv(idx) totalbytes += stampsize + idx[i].len;
++
++        uchar *filebuf = new uchar[totalbytes];
++        int pos = 0;
++        demoheader hdr;
++        memcpy(hdr.magic, DEMO_MAGIC, sizeof(hdr.magic));
++        hdr.version = DEMO_VERSION;
++        hdr.protocol = PROTOCOL_VERSION;
++        lilswap(&hdr.version, 2);
++        memcpy(&filebuf[pos], &hdr, sizeof(demoheader)); pos += (int)sizeof(demoheader);
++        loopv(idx)
++        {
++            int stamp[3];
++            stamp[0] = idx[i].ms;
++            stamp[1] = idx[i].chan == CLIPCHAN_KEYFRAME ? 1 : idx[i].chan;
++            stamp[2] = idx[i].len;
++            lilswap(stamp, 3);
++            memcpy(&filebuf[pos], stamp, sizeof(stamp)); pos += (int)sizeof(stamp);
++            if(idx[i].len) { memcpy(&filebuf[pos], &data[idx[i].offset], idx[i].len); pos += idx[i].len; }
++        }
++
++        defformatstring(relpatha, "%s%ssgclipdeterminism_old.dmo", clipdir, clipdir[0] ? "/" : "");
++        defformatstring(relpathb, "%s%ssgclipdeterminism_new.dmo", clipdir, clipdir[0] ? "/" : "");
++
++        // OLD PATH: the engine's own gzstream (opengzfile), explicit level 6 - isolating the
++        // threading/buffering change under test from the separate, already-approved level-9->6
++        // change (both paths use level 6 here, matching the spec's "old sync path at level 6 vs
++        // worker path at level 6" gate).
++        stream *f = opengzfile(path(relpatha, true), "wb", NULL, 6);
++        bool oldok = f != NULL;
++        if(f) { oldok = f->write(filebuf, totalbytes) == (size_t)totalbytes; delete f; }
++
++        // NEW PATH: exactly what SGCLIPJOB_SAVECLIP does in sgclipprocessjob() above (raw zlib
++        // gzFile), called synchronously here since this is a same-thread proof, not a real job.
++        gzFile gz = gzopen(findfile(path(relpathb, true), "wb"), "wb6");
++        bool newok = gz != NULL;
++        if(gz) { newok = gzwrite(gz, filebuf, (unsigned)totalbytes) == totalbytes; newok = gzclose(gz) == Z_OK && newok; }
++
++        delete[] filebuf;
++
++        if(!oldok || !newok) { conoutf("sgclipdeterminism: write failed (old=%d new=%d)", (int)oldok, (int)newok); return; }
++
++        // Byte-compare via plain stdio (both files are on-disk gzip streams - compare the raw
++        // compressed bytes directly, not their decompressed content, since determinism means
++        // "the two code paths emit the identical compressed byte stream").
++        FILE *fa = fopen(findfile(path(relpatha, true), "rb"), "rb");
++        FILE *fb = fopen(findfile(path(relpathb, true), "rb"), "rb");
++        if(!fa || !fb) { conoutf("sgclipdeterminism: could not reopen output files for comparison"); if(fa) fclose(fa); if(fb) fclose(fb); return; }
++        fseek(fa, 0, SEEK_END); long sizea = ftell(fa); fseek(fa, 0, SEEK_SET);
++        fseek(fb, 0, SEEK_END); long sizeb = ftell(fb); fseek(fb, 0, SEEK_SET);
++        bool match = sizea == sizeb && sizea >= 0;
++        if(match)
++        {
++            uchar *bufa = new uchar[(size_t)sizea];
++            uchar *bufb = new uchar[(size_t)sizeb];
++            match = fread(bufa, 1, (size_t)sizea, fa) == (size_t)sizea && fread(bufb, 1, (size_t)sizeb, fb) == (size_t)sizeb
++                    && memcmp(bufa, bufb, (size_t)sizea) == 0;
++            delete[] bufa; delete[] bufb;
++        }
++        fclose(fa); fclose(fb);
++
++        if(match) conoutf("sgclipdeterminism: MATCH (%ld bytes)", sizea);
++        else conoutf("sgclipdeterminism: MISMATCH (oldsize=%ld newsize=%ld)", sizea, sizeb);
++    });
+     // === end SwiftGibs instant replay: keyframes + clip writing =============================
+ 
+     // ---- SwiftGibs benchmark mode (patch 22) ----
+@@ -2802,14 +3316,21 @@
+ 
+     struct cliprecorder
+     {
+-        stream *f;           // open gzip file handle while recording; NULL otherwise
++        // SwiftGibs clip writer thread (Task 2): this used to be `stream *f` - the frame thread's
++        // own open gzip handle. The worker now owns the real gzFile entirely (see the threading
++        // contract above the writer module, and sgcliprecfiles[] inside it); this flag is purely
++        // "does the frame thread consider this slot to be recording" - set the moment a RECOPEN
++        // job is successfully QUEUED (optimistic; rolled back by cliprecordmarkopenfailed() below
++        // if the worker's gzopen() then actually fails) and cleared the moment a stop is
++        // requested, independent of whether the worker has finished closing the file yet.
++        bool active;
+         string relpath;       // for console messages
+         int basems;           // ms of the first record ever written (rebase origin); -1 = not yet set
+         int lastms;           // ms of the most recently written record (for duration reporting)
+         bool wrotekeyframe;   // true once this stream's one allowed opening keyframe has been written
+     };
+-    static cliprecorder manualrec = { NULL, "", -1, 0, false };
+-    static cliprecorder autorec   = { NULL, "", -1, 0, false };
++    static cliprecorder manualrec = { false, "", -1, 0, false };
++    static cliprecorder autorec   = { false, "", -1, 0, false };
+     static bool cliprecordarmed = false;   // set by cliprecordarmmatchstart() (fpsgame/fps.cpp startgame()
+                                             // hook); consumed on the very next c2sinfo() tick, once the
+                                             // whole welcome bundle for a fresh match (incl. the item list,
+@@ -2830,10 +3351,22 @@
+     // cliprecordwasactivematch() below - never on the per-frame path.
+     static bool cliprecordseenthismatch = false;
+ 
+-    bool cliprecordmanualactive() { return manualrec.f != NULL; }
+-    bool cliprecordautoactive() { return autorec.f != NULL; }
++    bool cliprecordmanualactive() { return manualrec.active; }
++    bool cliprecordautoactive() { return autorec.active; }
+     bool cliprecordwasactivematch() { return cliprecordseenthismatch; }   // SwiftGibs fps stats accessor
+ 
++    // SwiftGibs clip writer thread (Task 2): rolls back the optimistic `r.active = true` a
++    // startcliprecorder() caller sets before it can know whether the worker's RECOPEN actually
++    // succeeded - called only from sgclipreport() (defined earlier in this file, ahead of
++    // cliprecorder's own definition, hence this forward-declared name) on a RECOPEN failure
++    // result, once the worker's gzopen() has actually failed.
++    static void cliprecordmarkopenfailed(int slot)
++    {
++        cliprecorder &r = slot == CLIPSINK_MANUAL ? manualrec : autorec;
++        r.active = false;
++        clipsinkstop(slot);
++    }
++
+     // Opens <clipdir>/<timestamp>_<map>_<mode>_rec-<label>.dmo (same gzipped stock demo format
+     // saveclip() writes: 24-byte header, then {ms,chan,len} stamps + payload), starts the
+     // engine-side sink buffer for `slot`, and seeds it with ONE synthesised opening keyframe
+@@ -2844,7 +3377,7 @@
+     // ordinary capture path (cliprecord()'s fan-out), same as the ring.
+     static void startcliprecorder(cliprecorder &r, int slot, const char *label)
+     {
+-        if(r.f) return;   // already running - callers check first anyway, stays idempotent
++        if(r.active) return;   // already running - callers check first anyway, stays idempotent
+ 
+         string mapname, mode, sstime;
+         clipsanitize(mapname, sizeof(mapname), clientmap, "map");
+@@ -2854,17 +3387,35 @@
+         sstime[min(tlen, sizeof(sstime)-1)] = '\0';
+         defformatstring(relpath, "%s%s%s_%s_%s_rec-%s.dmo", clipdir, clipdir[0] ? "/" : "", sstime, mapname, mode, label);
+ 
+-        stream *f = opengzfile(path(relpath, true), "wb");
+-        if(!f) { conoutf("record: could not write %s", relpath); return; }
+-
++        // SwiftGibs clip writer thread (Task 2): the gzFile itself is now opened ON THE WORKER
++        // (see the threading contract above) - RECOPEN carries the header bytes as its buffer, so
++        // "open" and "write the header" happen as one worker-side job, same as they used to be
++        // one synchronous call here.
+         demoheader hdr;
+         memcpy(hdr.magic, DEMO_MAGIC, sizeof(hdr.magic));
+         hdr.version = DEMO_VERSION;
+         hdr.protocol = PROTOCOL_VERSION;
+         lilswap(&hdr.version, 2);
+-        f->write(&hdr, sizeof(demoheader));
++        uchar *hdrbuf = new uchar[sizeof(demoheader)];
++        memcpy(hdrbuf, &hdr, sizeof(demoheader));
+ 
+-        r.f = f;
++        sgclipjob job = {};
++        job.kind = SGCLIPJOB_RECOPEN;
++        job.slot = slot;
++        job.buf = hdrbuf;
++        job.len = (int)sizeof(demoheader);
++        copystring(job.path, findfile(path(relpath, true), "wb"));
++        job.level = 6;
++        copystring(job.relpath, relpath);
++        copystring(job.label, label);
++        if(!sgclipenqueue(job))
++        {
++            delete[] hdrbuf;
++            conoutf("record: writer busy, could not start (%s)", label);
++            return;
++        }
++
++        r.active = true;
+         copystring(r.relpath, relpath);
+         r.basems = -1;
+         r.lastms = 0;
+@@ -2876,7 +3427,8 @@
+         writeclipwelcome(p);
+         clipsinkput(slot, CLIPCHAN_KEYFRAME, p.buf, p.len);
+ 
+-        conoutf("recording started (%s): %s", label, relpath);
++        // "recording started (...)"/"could not write" is now printed from the RECOPEN completion
++        // result (sgclipreport(), above) - we don't actually know the open succeeded yet.
+     }
+ 
+     // A map-change finalise (cliprecordfinalizeall("map change"), called from the TOP of
+@@ -2910,7 +3462,7 @@
+     // that caused this finalise in the first place, never legitimate history.
+     static void flushcliprecorder(cliprecorder &r, int slot, bool trimtrailingmapchange = false)
+     {
+-        if(!r.f) return;
++        if(!r.active) return;
+         vector<clipentry> idx;
+         if(!clipsinkindex(slot, idx)) return;   // nothing buffered since the last flush - normal, no IO
+         const uchar *data = clipsinkdata(slot);
+@@ -2920,23 +3472,64 @@
+             clipentry &last = idx[count-1];
+             if(last.chan == 1 && isleadingmapchange(&data[last.offset], last.len)) count--;
+         }
++
++        // SwiftGibs clip writer thread (Task 2): format this batch into a flat heap buffer here
++        // (pure memcpy - the sink is capped at CLIPSINKBUFCAP=96KB, sub-millisecond even in the
++        // worst case) and hand it to the worker as a RECAPPEND job instead of writing it inline -
++        // this IS the spec's "swap-buffer 1Hz recording drain": clipsinkindex()/clipsinkreset()
++        // above already do the actual swap (index-then-reset), this loop just formats what was
++        // indexed. wrotekeyframe/basems/lastms bookkeeping is unchanged - still pure computation,
++        // still on the frame thread, still needed before we can even know how many bytes this
++        // batch will end up being. The size pass below simulates the SAME skip decision the fill
++        // pass makes (both are pure functions of the same idx + the same starting wrotekeyframe
++        // value) without touching r itself, so the two passes can never disagree.
++        int stampsize = (int)sizeof(int)*3;
++        int totalbytes = 0;
++        bool localwrote = r.wrotekeyframe;
+         for(int i = 0; i < count; i++)
+         {
+             if(idx[i].chan == CLIPCHAN_KEYFRAME)
+             {
+-                if(r.wrotekeyframe) continue;
+-                r.wrotekeyframe = true;
++                if(localwrote) continue;
++                localwrote = true;
+             }
+-            if(r.basems < 0) r.basems = idx[i].ms;
+-            int stamp[3];
+-            stamp[0] = idx[i].ms - r.basems;
+-            stamp[1] = idx[i].chan == CLIPCHAN_KEYFRAME ? 1 : idx[i].chan;
+-            stamp[2] = idx[i].len;
+-            lilswap(stamp, 3);
+-            r.f->write(stamp, sizeof(stamp));
+-            if(idx[i].len) r.f->write(&data[idx[i].offset], idx[i].len);
+-            r.lastms = idx[i].ms;
++            totalbytes += stampsize + idx[i].len;
+         }
++
++        if(totalbytes > 0)
++        {
++            uchar *buf = new uchar[totalbytes];
++            int pos = 0;
++            for(int i = 0; i < count; i++)
++            {
++                if(idx[i].chan == CLIPCHAN_KEYFRAME)
++                {
++                    if(r.wrotekeyframe) continue;
++                    r.wrotekeyframe = true;
++                }
++                if(r.basems < 0) r.basems = idx[i].ms;
++                int stamp[3];
++                stamp[0] = idx[i].ms - r.basems;
++                stamp[1] = idx[i].chan == CLIPCHAN_KEYFRAME ? 1 : idx[i].chan;
++                stamp[2] = idx[i].len;
++                lilswap(stamp, 3);
++                memcpy(&buf[pos], stamp, sizeof(stamp)); pos += (int)sizeof(stamp);
++                if(idx[i].len) { memcpy(&buf[pos], &data[idx[i].offset], idx[i].len); pos += idx[i].len; }
++                r.lastms = idx[i].ms;
++            }
++
++            sgclipjob job = {};
++            job.kind = SGCLIPJOB_RECAPPEND;
++            job.slot = slot;
++            job.buf = buf;
++            job.len = totalbytes;
++            if(!sgclipenqueue(job))
++            {
++                delete[] buf;
++                conoutf("record: writer busy, dropped a buffered segment (%s)", r.relpath);
++            }
++        }
++
+         clipsinkreset(slot);   // the trimmed trailing record (if any) is simply discarded, never
+                                 // written anywhere - correct: it belongs to the NEXT match, which
+                                 // gets its own proper (synthesised-keyframe) opening instead, and
+@@ -2983,25 +3576,12 @@
+         }
+     }
+ 
+-    static void pruneclipdir()
+-    {
+-        if(cliprecordkeep <= 0) return;
+-        vector<char *> files;
+-        listfiles(clipdir, "dmo", files);
+-        dedupclipfiles(files);   // collapses the double registration (see above) before counting
+-        vector<char *> matches;
+-        loopv(files) { if(cliprecordmatch(files[i])) matches.add(files[i]); }
+-        // files is already sorted by dedupclipfiles() above, so matches (a filtered
+-        // subsequence of it) is already in chronological order too - no separate sort needed.
+-        int todelete = matches.length() - cliprecordkeep;
+-        for(int i = 0; i < todelete; i++)
+-        {
+-            defformatstring(relpath, "%s/%s.dmo", clipdir, matches[i]);
+-            const char *real = findfile(path(relpath, true), "rb");
+-            if(real) remove(real);
+-        }
+-        files.deletearrays();
+-    }
++    // pruneclipdir() (the old frame-thread directory scan + sort + remove loop) was removed in
++    // Task 2 (perf-wave-1 slate B): its exact semantics now run on the worker thread instead, as
++    // sgclipprunescan() (see the clip-writer-thread module, above, which forward-declares
++    // cliprecordmatch() to call it directly - a pure string function, safe on the worker) -
++    // enqueued by finishcliprecorder() below as part of the RECCLOSE job rather than called
++    // synchronously here. dedupclipfiles() (above) is still used by clipfilecount() below.
+ 
+     // === SwiftGibs instant replay: clip folder listing (playback discoverability fix) =======
+     // April's playtest-1 bug: clips land in clipdir, but neither the stock `demo` command nor
+@@ -3111,13 +3691,39 @@
+     // through here rather than leaving a file open, unflushed, or lost.
+     static void finishcliprecorder(cliprecorder &r, int slot, const char *label, const char *reason)
+     {
+-        if(!r.f) return;
++        if(!r.active) return;
+         flushcliprecorder(r, slot, true);
+-        delete r.f;
+-        r.f = NULL;
++        r.active = false;
+         clipsinkstop(slot);
+-        conoutf("recording saved (%s, %s): %s (%.1fs)", label, reason, r.relpath, r.basems >= 0 ? (r.lastms - r.basems)/1000.0f : 0.0f);
+-        pruneclipdir();
++
++        // SwiftGibs clip writer thread (Task 2): close + prune both move to the worker (see the
++        // threading contract above) - one RECCLOSE job carries everything the worker needs for
++        // both, pre-resolved here on the frame thread (the only place allowed to call path()/
++        // read homedir). "recording saved (...)" is now printed from the completion result
++        // (sgclipreport(), above), not here.
++        sgclipjob job = {};
++        job.kind = SGCLIPJOB_RECCLOSE;
++        job.slot = slot;
++        copystring(job.relpath, r.relpath);
++        copystring(job.label, label);
++        copystring(job.reason, reason);
++        job.basems = r.basems;
++        job.lastms = r.lastms;
++        job.prune = true;
++        job.prunekeep = cliprecordkeep;
++        // Mirrors listfiles()'s own two real candidate locations for a writable clipdir (CWD-
++        // relative and homedir-relative - see sgclipprunescan()'s own comment for why the
++        // packagedirs/zip legs are out of scope): both resolved here, since only the frame thread
++        // may call path()/read homedir.
++        string normdir;
++        copystring(normdir, clipdir);
++        path(normdir);
++        size_t dirlen = strlen(normdir);
++        while(dirlen > 1 && normdir[dirlen-1] == PATHDIV) normdir[--dirlen] = '\0';
++        copystring(job.prunedir1, normdir);
++        job.prunedir2[0] = '\0';
++        if(homedir[0]) formatstring(job.prunedir2, "%s%s", homedir, normdir);
++        sgclipenqueue(job);   // RECCLOSE bypasses the cap - never dropped
+     }
+ 
+     // Finalises WHATEVER is currently running (manual and/or auto - each no-ops independently
+@@ -3133,7 +3739,7 @@
+     // Manual start/stop (a named, bindable action - F9 by default, see overlay/autoexec.cfg).
+     void togglerecord()
+     {
+-        if(manualrec.f) { finishcliprecorder(manualrec, CLIPSINK_MANUAL, "manual", "stopped"); return; }
++        if(manualrec.active) { finishcliprecorder(manualrec, CLIPSINK_MANUAL, "manual", "stopped"); return; }
+         if(!connected) { conoutf("record: not connected"); return; }
+         if(demoplayback) { conoutf("record: can't record during demo playback"); return; }
+         if(editmode) { conoutf("record: can't record in edit mode"); return; }
 --- a/fpsgame/ctf.h
 +++ b/fpsgame/ctf.h
 @@ -513,6 +513,24 @@
@@ -436,3 +1329,14 @@
  // crypto
  extern void genprivkey(const char *seed, vector<char> &privstr, vector<char> &pubstr);
  extern bool calcpubkey(const char *privstr, vector<char> &pubstr);
+--- a/shared/igame.h
++++ b/shared/igame.h
+@@ -105,6 +105,8 @@
+     extern bool needminimap();
+     extern bool demoplaying();   // SwiftGibs instant replay (Task 3): true while playing back a .dmo
+     extern bool clipexportcapturing();   // SwiftGibs video export (fix round 2): true only while a clip export capture is actively running - fpsgame/client.cpp; lets engine-side code (engine/movie.cpp's stock recorder HUD) gate itself off during export the same way fpsgame/fps.cpp's SPECTATOR label already does
++    extern void drainclipresults();   // SwiftGibs clip writer thread (Task 2, perf-wave-1 slate B): drains the background writer's completion/failure messages once per frame - engine/main.cpp's main loop
++    extern void clipworkerjoin();     // SwiftGibs clip writer thread (Task 2): joins the writer thread at quit - engine/main.cpp cleanup()
+ }
+  
+ namespace server
