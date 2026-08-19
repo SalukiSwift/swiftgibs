@@ -1,0 +1,38 @@
+--- a/fpsgame/render.cpp
++++ b/fpsgame/render.cpp
+@@ -339,20 +339,23 @@
+             if(teamskins || m_teammode) team = isteam(teamviewplayer()->team, d->team) ? 1 : 2;
+             renderplayer(d, getplayermodelinfo(d), team, 1, mainpass);
+ 
+-            vec dir = vec(d->o).sub(camera1->o);
+-            float dist = dir.magnitude();
+-            dir.div(dist);
+-            if(d->state!=CS_EDITING && raycube(camera1->o, dir, dist, 0) < dist)
++            if(mainpass)
+             {
+-                d->info[0] = '\0';
+-                continue;
+-            }
++                vec dir = vec(d->o).sub(camera1->o);
++                float dist = dir.magnitude();
++                dir.div(dist);
++                if(d->state!=CS_EDITING && raycube(camera1->o, dir, dist, 0) < dist)
++                {
++                    d->info[0] = '\0';
++                    continue;
++                }
+ 
+-            copystring(d->info, colorname(d));
+-            if(d->state!=CS_DEAD)
+-            {
+-                float offset = renderstatusbars(d, team);
+-                renderstatusicons(d, team, offset);
++                copystring(d->info, colorname(d));
++                if(d->state!=CS_DEAD)
++                {
++                    float offset = renderstatusbars(d, team);
++                    renderstatusicons(d, team, offset);
++                }
+             }
+         }
+         loopv(ragdolls)
