@@ -20,6 +20,14 @@ cp -a "$ROOT/overlay/." "$OUT/"; rm -f "$OUT/autoexec.source.cfg"
 "$ROOT/build/integrate-menus.sh" "$OUT"
 rm -f "$OUT/config.cfg" "$OUT/init.cfg"
 
+# Benchmark mode (sgbench, patch 22): canonical workload + runner + pinned profile, shipped at
+# the bundle root so run-benchmark.sh can find bin/swiftgibs and data/bench/ next to itself.
+mkdir -p "$OUT/data/bench"
+cp "$ROOT/tools/bench/workload-v1.dmo" "$OUT/data/bench/workload-v1.dmo"
+cp "$ROOT/tools/bench/run-benchmark.sh" "$OUT/run-benchmark.sh"
+chmod +x "$OUT/run-benchmark.sh"
+cp -a "$ROOT/tools/bench/bench-home" "$OUT/bench-home"
+
 # Bundled ffmpeg (video export, clip-export feature): its own directory, sibling of bin/data/
 # packages, matching the engine's default clipexportffmpeg lookup path (ffmpeg/ffmpeg, resolved
 # relative to cwd - guaranteed to be $OUT since swiftgibs.sh below `cd`s here first). GPL-licensed,

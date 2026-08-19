@@ -40,6 +40,14 @@ rm -f "$OUT/autoexec.source.cfg"   # internal reference file, don't ship
 "$ROOT/build/integrate-menus.sh" "$OUT"
 rm -f "$OUT/config.cfg" "$OUT/init.cfg"   # fresh VARP defaults + native-resolution auto-detect
 
+# 4c-bench) benchmark mode (sgbench, patch 22): canonical workload + runner + pinned profile,
+# shipped at the bundle root so run-benchmark.bat can find bin64\sauerbraten.exe and
+# data\bench\ next to itself.
+mkdir -p "$OUT/data/bench"
+cp "$ROOT/tools/bench/workload-v1.dmo" "$OUT/data/bench/workload-v1.dmo"
+cp "$ROOT/tools/bench/run-benchmark.bat" "$OUT/run-benchmark.bat"
+cp -a "$ROOT/tools/bench/bench-home" "$OUT/bench-home"
+
 # 4c) bundled ffmpeg (video export, clip-export feature): its own directory, sibling of bin64/
 # data/packages, matching the engine's default clipexportffmpeg lookup path (ffmpeg/ffmpeg.exe,
 # resolved relative to cwd - CreateProcess never searches PATH for a relative path that contains

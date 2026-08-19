@@ -74,6 +74,17 @@ mkdir -p "$RES/ffmpeg"
 cp "$FFMPEG_DIR/ffmpeg" "$FFMPEG_DIR/LICENSE.txt" "$FFMPEG_DIR/NOTICE.txt" "$RES/ffmpeg/"
 chmod +x "$RES/ffmpeg/ffmpeg"
 
+# 4d) benchmark mode (sgbench, patch 22): canonical workload + runner + pinned profile, staged
+# in Contents/Resources - the mac binary's data root (patches/13-mac-datadir.patch chdir's the
+# engine here at startup) - alongside data/packages, same as the win/linux bundlers' bundle
+# root. MUST happen before the re-sign step below, same reasoning as the ffmpeg block above:
+# codesign/rcodesign seals whatever is in the bundle at the moment it runs.
+mkdir -p "$RES/data/bench"
+cp "$ROOT/tools/bench/workload-v1.dmo" "$RES/data/bench/workload-v1.dmo"
+cp "$ROOT/tools/bench/run-benchmark.sh" "$RES/run-benchmark.sh"
+chmod +x "$RES/run-benchmark.sh"
+cp -a "$ROOT/tools/bench/bench-home" "$RES/bench-home"
+
 # 5) RE-SIGN the whole bundle now that data is inside Contents/Resources. The code-only seal only
 #    covered the binary + frameworks; adding data invalidates the CodeResources seal, and the arm64
 #    binary + frameworks must stay validly signed (mandatory for Apple Silicon to run them).
