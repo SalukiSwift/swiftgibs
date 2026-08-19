@@ -1,6 +1,6 @@
 diff -ruN /tmp/sg-bench-209564-pristine/engine/main.cpp /tmp/sg-bench-209564-work/engine/main.cpp
 --- a/engine/main.cpp	2026-08-18 23:49:14.954060048 +0100
-+++ b/engine/main.cpp	2026-08-19 00:07:53.819215996 +0100
++++ b/engine/main.cpp	2026-08-19 04:30:20.090414159 +0100
 @@ -1058,6 +1058,7 @@
  
  void limitfps(int &millis, int curmillis)
@@ -19,7 +19,7 @@ diff -ruN /tmp/sg-bench-209564-pristine/engine/main.cpp /tmp/sg-bench-209564-wor
          // game-time step this frame must advance by, so every captured frame lands on an exact
 diff -ruN /tmp/sg-bench-209564-pristine/fpsgame/client.cpp /tmp/sg-bench-209564-work/fpsgame/client.cpp
 --- a/fpsgame/client.cpp	2026-08-18 23:49:14.959890692 +0100
-+++ b/fpsgame/client.cpp	2026-08-19 00:07:53.820774498 +0100
++++ b/fpsgame/client.cpp	2026-08-19 04:30:20.091660466 +0100
 @@ -1,6 +1,17 @@
  #include "game.h"
  #include "processpipe.h" // SwiftGibs clip export (Task 3): found via -Iengine on the include path (Makefile); a plain, self-contained header (no engine.h needed for the processpipe TYPE itself - see shared/iengine.h for the recorder:: functions this file also calls)
@@ -38,7 +38,7 @@ diff -ruN /tmp/sg-bench-209564-pristine/fpsgame/client.cpp /tmp/sg-bench-209564-
  namespace game
  {
      VARP(minradarscale, 0, 384, 10000);
-@@ -2299,6 +2310,222 @@
+@@ -2299,6 +2310,272 @@
      COMMAND(saveclip, "");
      // === end SwiftGibs instant replay: keyframes + clip writing =============================
  
@@ -50,6 +50,30 @@ diff -ruN /tmp/sg-bench-209564-pristine/fpsgame/client.cpp /tmp/sg-bench-209564-
 +    // own delay logic during normal play; it is never the right tool for "how long did this frame
 +    // actually take". Reuses the stock demo player entirely (mode -1 + map <file>, same as the
 +    // `demo` alias in data/game_fps.cfg) - no new playback code here, only measurement.
++    //
++    // State machine: IDLE (!bencharmed) -> PENDING (bencharmed, !benchmeasuring: armed, waiting
++    // for THIS run's playback to actually start) -> MEASURING (bencharmed, benchmeasuring) ->
++    // back to IDLE once a report or BENCH ERROR fires (which always also quit()s). Driven
++    // entirely by polling the `demoplayback` flag once per frame in benchframe() below, NOT by a
++    // N_DEMOPLAYBACK packet hook - review found two real termination paths that never send that
++    // packet: gamedisconnect() (fpsgame/client.cpp) sets demoplayback=false directly on any
++    // disconnect, reachable via the localdisconnect/disconnect console commands at any time
++    // during local playback; and setupdemoplayback()'s validation-failure branch
++    // (fpsgame/server.cpp - bad magic/version/protocol) prints a message and returns WITHOUT
++    // ever sending N_DEMOPLAYBACK on or off, so demoplayback just never becomes true. Polling
++    // the flag directly catches every one of these the same way it catches the ordinary case, at
++    // most one frame later - ARMED and MEASURING never depend on which code path changed the
++    // flag. PENDING's timeout (BENCHSTARTTIMEOUTMS) is what turns that silent
++    // setupdemoplayback() failure into a reported BENCH ERROR instead of an armed-forever hang.
++    //
++    // This same design also closes a race the packet-hook version had: if a demo is ALREADY
++    // playing when sgbench is invoked, its own "stopdemo; mode -1; map ..." synchronously stops
++    // the OLD demo first (server::stopdemo() -> enddemoplayback() -> sendf() -> local packet
++    // delivery is synchronous, fpsgame/server.cpp/fpsgame/client.cpp) - entirely within the
++    // sgbench ICOMMAND body below, before benchframe() is ever called again. So by the time
++    // PENDING's poll first runs, demoplayback is already false and stays that way (map still
++    // loading) or has already flipped true for the NEW file - either way there's nothing left
++    // to mistake for "the new run already ended".
 +    //
 +    // Measurement rules (this comment block is the spec, not just a description):
 +    // - Timing: SDL_GetPerformanceCounter() delta between consecutive main-loop iterations,
@@ -67,20 +91,22 @@ diff -ruN /tmp/sg-bench-209564-pristine/fpsgame/client.cpp /tmp/sg-bench-209564-
 +    // - stutters: frames strictly greater than 2.0 * median (median = the p50 above).
 +    // - On demoend: compute, print BENCH: summary lines, append a benchresults.csv row, write
 +    //   benchframes-<row>.csv (one ms value per line) if benchdumpframes is 1, then quit().
-+    // - On failure (missing file, disconnect before demoend, zero frames captured): print
-+    //   "BENCH ERROR: <reason>" and quit() anyway - runners detect success by CSV row growth,
-+    //   not by exit code.
++    // - On failure (missing file, playback never starts, disconnect before demoend, zero frames
++    //   captured): print "BENCH ERROR: <reason>" and quit() anyway - runners detect success by
++    //   CSV row growth, not by exit code.
 +    //
 +    // benchmeasuring itself is defined at TRUE FILE SCOPE, above namespace game's opening brace -
 +    // see the comment up there for why.
 +    static bool bencharmed = false;
-+    static Uint64 benchstartticks = 0;
++    static Uint64 benchpendingticks = 0;      // SDL_GetPerformanceCounter() at arm time - PENDING's start-timeout clock
++    static Uint64 benchstartticks = 0;        // SDL_GetPerformanceCounter() when demoplayback actually went true
 +    static const int BENCHCAP = 1000000;
 +    static float *benchframes_ms = NULL;      // allocated once on arm
 +    static int benchcount = 0;
 +    static bool benchtruncated = false;
 +    static Uint64 benchlastticks = 0;
 +    static string benchdemofile;              // stashed at arm time - BENCH: lines / CSV "demo" column
++    static const double BENCHSTARTTIMEOUTMS = 10000.0;   // give up waiting for playback to start after this long
 +    VAR(benchdumpframes, 0, 1, 1);             // write benchframes-<row>.csv alongside the CSV row (not persisted)
 +
 +    struct benchstats { float p50, p95, p99, onepctlow, worst; int stutters; };
@@ -120,14 +146,52 @@ diff -ruN /tmp/sg-bench-209564-pristine/fpsgame/client.cpp /tmp/sg-bench-209564-
 +        delete[] sorted;
 +    }
 +
++    static void benchreport();   // forward decl - defined below; benchframe() below is the only caller
++
 +    // Called unconditionally from the main loop (engine/main.cpp, right after
-+    // getclockmillis()) - must stay a no-op before sgbench arms a run and forever after that
-+    // run reports, hence the benchmeasuring gate first.
++    // getclockmillis()) - a no-op before sgbench arms a run and forever after that run reports.
++    // See the state-machine comment above the state block: this single function drives the
++    // whole PENDING -> MEASURING -> report/error lifecycle by polling demoplayback directly.
 +    void benchframe()
 +    {
-+        if(!benchmeasuring) return;
++        if(!bencharmed) return;
 +        Uint64 now = SDL_GetPerformanceCounter();
 +        static const Uint64 freq = SDL_GetPerformanceFrequency();
++
++        if(!benchmeasuring)
++        {
++            // PENDING: a transition to true is unambiguously THIS run's own playback starting
++            // (see the race note above the state block for why a stale/leftover false reading
++            // can never be mistaken for anything here) - anything else just means keep waiting,
++            // up to the timeout.
++            if(demoplayback)
++            {
++                benchmeasuring = true;
++                benchstartticks = now;
++                benchlastticks = 0;
++                return;
++            }
++            double waitedms = double(now - benchpendingticks) * 1000.0 / double(freq);
++            if(waitedms >= BENCHSTARTTIMEOUTMS)
++            {
++                bencharmed = false;
++                conoutf("BENCH ERROR: demo playback never started (missing/corrupt/incompatible file?)");
++                quit();
++            }
++            return;
++        }
++
++        // MEASURING: demoplayback going false here - by ANY means, packet-driven or not - is
++        // this run ending.
++        if(!demoplayback)
++        {
++            bencharmed = false;
++            benchmeasuring = false;
++            if(benchcount) benchreport();
++            else { conoutf("BENCH ERROR: no frames captured"); quit(); }
++            return;
++        }
++
 +        double sincestart = double(now - benchstartticks) * 1000.0 / double(freq);
 +        if(sincestart >= 2000.0 && benchlastticks)
 +        {
@@ -138,8 +202,8 @@ diff -ruN /tmp/sg-bench-209564-pristine/fpsgame/client.cpp /tmp/sg-bench-209564-
 +        benchlastticks = now;
 +    }
 +
-+    // Only ever called with benchcount > 0 (see benchplaybackstate() below) - the zero-frames
-+    // case is handled entirely by the caller, so this never has to.
++    // Only ever called with benchcount > 0 (see benchframe() above) - the zero-frames case is
++    // handled entirely by the caller, so this never has to.
 +    static void benchreport()
 +    {
 +        benchstats st;
@@ -204,30 +268,14 @@ diff -ruN /tmp/sg-bench-209564-pristine/fpsgame/client.cpp /tmp/sg-bench-209564-
 +        quit();
 +    }
 +
-+    // Called from the N_DEMOPLAYBACK handler below, on every playback start/stop - real demos
-+    // AND SwiftGibs clip playback both raise it. `bencharmed` (only ever true after the sgbench
-+    // command below arms a run) keeps this a no-op for ordinary clip watching.
-+    void benchplaybackstate(bool on)
-+    {
-+        if(!bencharmed) return;
-+        if(on)
-+        {
-+            benchstartticks = SDL_GetPerformanceCounter();
-+            benchmeasuring = true;
-+        }
-+        else
-+        {
-+            benchmeasuring = false;
-+            if(benchcount) benchreport();
-+            else { conoutf("BENCH ERROR: no frames captured"); quit(); }
-+        }
-+    }
-+
 +    // Filename supplied to sgbench, stashed at arm time and echoed into the BENCH: lines / CSV
 +    // "demo" column; the findfile()/fileexists() check below is the same existence-check idiom
 +    // fpsstatswritelog() uses (fpsgame/fps.cpp), not a full replication of setupdemoplayback()'s
 +    // own demodir/extension-fallback resolution (fpsgame/server.cpp) - stock playback still does
 +    // that part; this is just an early, friendly failure for a typo'd or missing filename.
++    // Order matters here: bencharmed/benchpendingticks are set, and any leftover demo is
++    // stopped, BEFORE execute(cmd) starts loading the new one - see the race note in the
++    // state-machine comment above for why that ordering is what makes PENDING race-proof.
 +    ICOMMAND(sgbench, "s", (char *file),
 +    {
 +        if(bencharmed) { conoutf("BENCH ERROR: already benchmarking"); return; }
@@ -236,7 +284,9 @@ diff -ruN /tmp/sg-bench-209564-pristine/fpsgame/client.cpp /tmp/sg-bench-209564-
 +        benchcount = 0;
 +        benchtruncated = false;
 +        benchlastticks = 0;
++        benchmeasuring = false;
 +        copystring(benchdemofile, file);
++        benchpendingticks = SDL_GetPerformanceCounter();
 +        bencharmed = true;
 +        defformatstring(cmd, "stopdemo; mode -1; map \"%s\"", file);
 +        execute(cmd);
@@ -261,17 +311,9 @@ diff -ruN /tmp/sg-bench-209564-pristine/fpsgame/client.cpp /tmp/sg-bench-209564-
      // === SwiftGibs clip POV scan (QoL batch: export from another player's POV) ==============
      //
      // Bounded, read-only scan of a clip/recording's opening keyframe (writeclipwelcome(),
-@@ -4908,6 +5135,7 @@
-                 }
-                 else clearclients();
-                 demoplayback = on!=0;
-+                benchplaybackstate(on!=0);   // SwiftGibs benchmark mode (patch 22): arms/reports around a sgbench run
-                 player1->clientnum = getint(p);
-                 gamepaused = false;
-                 execident(on ? "demostart" : "demoend");
 diff -ruN /tmp/sg-bench-209564-pristine/shared/iengine.h /tmp/sg-bench-209564-work/shared/iengine.h
 --- a/shared/iengine.h	2026-08-18 23:49:14.959470896 +0100
-+++ b/shared/iengine.h	2026-08-19 00:07:53.818897596 +0100
++++ b/shared/iengine.h	2026-08-19 04:30:20.090113913 +0100
 @@ -581,6 +581,7 @@
  extern int vsync;
  extern int bilinear;
@@ -282,13 +324,12 @@ diff -ruN /tmp/sg-bench-209564-pristine/shared/iengine.h /tmp/sg-bench-209564-wo
  extern void genprivkey(const char *seed, vector<char> &privstr, vector<char> &pubstr);
 diff -ruN /tmp/sg-bench-209564-pristine/shared/igame.h /tmp/sg-bench-209564-work/shared/igame.h
 --- a/shared/igame.h	2026-08-18 23:49:14.959367797 +0100
-+++ b/shared/igame.h	2026-08-19 00:07:53.819003496 +0100
-@@ -51,6 +51,8 @@
++++ b/shared/igame.h	2026-08-19 04:30:20.090216663 +0100
+@@ -51,6 +51,7 @@
  
      extern void updateworld();
      extern void fpsstatsframe(int elapsed);  // SwiftGibs per-match fps stats: called once per frame with the frame time the engine already computed
 +    extern void benchframe();          // SwiftGibs benchmark mode (patch 22): per-frame perf-counter capture, no-op unless a run is armed
-+    extern void benchplaybackstate(bool on);  // SwiftGibs benchmark mode (patch 22): demo playback start/stop hook (see N_DEMOPLAYBACK, fpsgame/client.cpp)
      extern void initclient();
      extern void physicstrigger(physent *d, bool local, int floorlevel, int waterlevel, int material = 0);
      extern void bounced(physent *d, const vec &surface);
