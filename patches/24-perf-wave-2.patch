@@ -1,5 +1,14 @@
 --- a/engine/main.cpp
 +++ b/engine/main.cpp
+@@ -81,7 +81,7 @@
+     exit(EXIT_FAILURE);
+ }
+ 
+-int curtime = 0, lastmillis = 1, elapsedtime = 0, totalmillis = 1;
++int curtime = 0, lastmillis = 1, elapsedtime = 0, totalmillis = 1, curframetime = 0;   // curframetime (patch 24 wave 2, decoupled frame drawing): scaled duration since the last actual RENDER, not the last tick - see the sgdecouplefps module comment near limitfps() below
+ // SwiftGibs AFK-aware auto-respawn: wall-clock (totalmillis-based) timestamp of the last
+ // REAL SDL input event that reached the client - keyboard (processkey(), engine/console.cpp)
+ // or mouse movement (the SDL_MOUSEMOTION case in checkinput() below); mouse buttons/wheel
 @@ -936,6 +936,7 @@
  
  void checkinput()
@@ -8,10 +17,14 @@
      if(interceptkeysym) clearinterceptkey();
      //int lasttype = 0, lastbut = 0;
      bool mousemoved = false;
-@@ -1061,11 +1062,71 @@
+@@ -1061,11 +1062,161 @@
  VAR(menufps, 0, 60, 1000);
  VARP(maxfps, 0, 200, 1000);
  
+-void limitfps(int &millis, int curmillis)
+-{
+-    if(benchmeasuring) return;   // sgbench: uncapped while measuring (patch 22)
+-    int limit = (mainmenu || minimized) && menufps ? (maxfps ? min(maxfps, menufps) : menufps) : maxfps;
 +// SwiftGibs sub-millisecond precise frame limiter (patch 24, perf wave 2 component 2). DEFAULT
 +// OFF - sgprecisefps 0 takes the untouched stock branch at the bottom of limitfps() below,
 +// byte-for-byte the same code that has always run there; `sgprecisefps && !menugoverned` is the
@@ -47,14 +60,102 @@
 +// machinery scoped to the live-gameplay case it was built to fix.
 +VARP(sgprecisefps, 0, 0, 1);
 +
- void limitfps(int &millis, int curmillis)
- {
--    if(benchmeasuring) return;   // sgbench: uncapped while measuring (patch 22)
--    int limit = (mainmenu || minimized) && menufps ? (maxfps ? min(maxfps, menufps) : menufps) : maxfps;
++// SwiftGibs decoupled frame drawing (patch 24, perf wave 2 component 3). DEFAULT OFF -
++// sgdecouplefps 0 never enters the branch added below; limitfps()'s caller (engine/main.cpp's
++// main loop) always sees shouldrender left at its own default of true, so every tick renders,
++// exactly as before this existed.
++//
++// Why: even with sgprecisefps's sub-millisecond pacing (above), a capped frame still means
++// SDL events, net servicing and game-time advance ALL wait behind the same sleep/spin as the
++// render itself (crawl finding 38) - the whole loop iterates once per rendered frame. At
++// maxfps 60 that is a real ~16.7ms ceiling on input and network responsiveness, not just on
++// what gets drawn.
++//
++// sgdecouplefps turns the cap from "sleep until the next frame" into "render or don't render
++// THIS iteration" - the loop keeps iterating at whatever rate it can manage, pumping input,
++// servicing the network, and advancing game time every single time (engine/main.cpp's loop
++// body - checkinput/menuprocess/tryedit/game::updateworld/checksleep/serverslice/
++// recomputecamera/updateparticles/updatesounds all stay OUTSIDE any render gate, unchanged from
++// today); only the actual draw - fps history, gl_drawframe/gl_drawmainmenu, swapbuffers, and the
++// renderedframe bookkeeping - is skipped on an iteration that isn't due to render yet, the same
++// way the engine already skips that exact block today whenever `minimized` is true. A
++// non-render iteration parks itself briefly rather than spinning a core at 100%: SDL_Delay(1)
++// while more than about a millisecond from the render deadline, spinning only inside that final
++// millisecond (reusing sgprecisefps's own deadline/spin machinery above) so the eventual render
++// still lands precisely when sgprecisefps is also on.
++//
++// The 2x2 interaction matrix (this is the actual spec for how the two vars combine - not just a
++// description):
++//
++//   sgdecouplefps=0, sgprecisefps=0 (both off) - vendor behavior, byte-for-byte: the stock
++//     whole-ms sleep-the-whole-loop branch at the bottom of limitfps() runs, every tick renders.
++//   sgdecouplefps=0, sgprecisefps=1 - commit A alone: the precise coarse-delay+spin branch
++//     above runs every call, still sleeping/spinning the WHOLE loop each frame - no decoupling,
++//     just a tighter wait. Every tick still renders.
++//   sgdecouplefps=1, sgprecisefps=0 - the cap becomes a render/no-render decision; non-render
++//     iterations use a plain SDL_Delay(1) with no spin at all (acceptable per the design spec -
++//     input/net still get serviced roughly every millisecond, and the eventual render is only
++//     as precise as a millisecond-granularity SDL_Delay(1) makes it, same coarseness class as
++//     the stock branch's own single-wait precision).
++//   sgdecouplefps=1, sgprecisefps=1 - both: non-render iterations still use the cheap
++//     SDL_Delay(1) while far from the deadline, but the FINAL sub-millisecond approach to each
++//     render's deadline spins exactly like commit A instead of overshooting by a whole
++//     SDL_Delay(1) - decoupled input/net AND a precisely-timed render. This is the cell the
++//     round's own soak test exercises (maxfps 60, both vars 1).
++//
++// Menu/minimized frames (menufps-governed) and an active clip export capture
++// (game::clipexportcapturing()) both fall through to the non-decoupled branches above instead:
++// menus/minimized because there is no live match to keep input/net responsive for, and export
++// capture because engine/movie.cpp's deterministicframestep() has ALREADY paced this exact
++// iteration to land on one of ITS OWN output-frame boundaries (with its own SDL_Delay, before
++// limitfps() ever runs) - decouple skipping that render would silently drop an export frame the
++// export pacer already committed to. Both exclusions mean sgdecouplefps behaves exactly like
++// sgdecouplefps 0 in those two situations, never a third, undocumented behavior.
++VARP(sgdecouplefps, 0, 0, 1);
++
++void limitfps(int &millis, int curmillis, bool &shouldrender)
++{
 +    if(benchmeasuring && !benchcapactive) return;   // sgbench: uncapped while measuring (patch 22); a PACED run (patch 24) sets benchcapactive so the cap stays active instead of being bypassed
 +    bool menugoverned = (mainmenu || minimized) && menufps;   // SwiftGibs precise limiter (patch 24): named so both the cap computation below and the sgprecisefps gate agree on the same condition
 +    int limit = menugoverned ? (maxfps ? min(maxfps, menufps) : menufps) : maxfps;
      if(!limit) return;
++
++    if(sgdecouplefps && !menugoverned && !game::clipexportcapturing())
++    {
++        // SwiftGibs decoupled frame drawing (patch 24): see the module comment above for the
++        // full design, including the 2x2 matrix. Separate deadline state from the
++        // sgprecisefps-only branch below - the two are mutually exclusive per call (this branch
++        // always returns), so there is no double-bookkeeping, only two independent schedules
++        // that pick up whichever one applies as the vars are (rarely) toggled at runtime.
++        static Uint64 deadline = 0;
++        static const Uint64 freq = SDL_GetPerformanceFrequency();
++        Uint64 periodticks = (Uint64)(freq / (double)limit);
++        Uint64 now = SDL_GetPerformanceCounter();
++        if(!deadline || now > deadline + periodticks) deadline = now;   // never armed, or stalled a full period behind: resync, don't burst-catch-up
++
++        if(now < deadline)
++        {
++            double remainingms = double(deadline - now) * 1000.0 / double(freq);
++            if(!(sgprecisefps && remainingms <= 1.0))
++            {
++                // far from the deadline, or sgprecisefps is off: a short, cheap tick - matrix
++                // cells (1,0) and the "far" part of (1,1) above. Input/net get serviced again
++                // almost immediately rather than waiting out the whole render period.
++                SDL_Delay(1);
++                shouldrender = false;
++                millis = getclockmillis();
++                return;
++            }
++            // final sub-millisecond stretch with sgprecisefps on - matrix cell (1,1): spin it
++            // out precisely instead of parking one more non-render iteration for a remainder
++            // smaller than SDL_Delay(1) can usefully wait out.
++            do { now = SDL_GetPerformanceCounter(); } while(now < deadline);
++        }
++        shouldrender = true;
++        deadline += periodticks;   // advance from the deadline's OWN previous value - see the sgprecisefps module comment above for why
++        millis = getclockmillis();
++        return;
++    }
 +
 +    if(sgprecisefps && !menugoverned)
 +    {
@@ -82,6 +183,118 @@
      static int fpserror = 0;
      int delay = 1000/limit - (millis-curmillis);
      if(delay < 0) fpserror = 0;
+@@ -1393,8 +1544,9 @@
+     for(;;)
+     {
+         static int frames = 0;
++        static int lastdrawmillis = 0;   // SwiftGibs decoupled frame drawing (patch 24): millis (getclockmillis() domain) at the last actual render - see the sgdecouplefps module comment near limitfps() above
+         int millis = getclockmillis();
+-        game::benchframe();          // sgbench: per-frame perf-counter capture (no-op unless armed, patch 22)
++        game::benchframe();          // sgbench: per-frame perf-counter capture (no-op unless armed, patch 22); as of patch 24 commit B this is the PENDING/MEASURING state machine only - the frame-time SAMPLE is taken by game::benchcaptureframe() below, inside the render-gated block, so sgbenchpaced measures render pacing rather than tick pacing once sgdecouplefps starts skipping renders (see that function's comment, fpsgame/client.cpp)
+         game::drainclipresults();    // SwiftGibs clip writer thread (Task 2): drains completion/failure
+                                       // messages from the background clip/recording writer once per
+                                       // frame (no-op unless the writer thread has ever been started)
+@@ -1405,9 +1557,14 @@
+         // happened to be. Returns 0, and does nothing at all, in every other situation. limitfps
+         // still runs afterwards and is a no-op at any maxfps at or above the export's frame rate
+         // (the delay it computes is already used up); a maxfps BELOW it still wins, and costs the
+-        // export duplicated frames exactly as it did before this existed.
++        // export duplicated frames exactly as it did before this existed. sgdecouplefps's own
++        // render/no-render decision (below) never fights this: limitfps() itself falls through to
++        // the non-decoupled branches whenever game::clipexportcapturing() is true, so an export
++        // in progress always renders every iteration exactly as it always has (see the
++        // sgdecouplefps module comment near limitfps() above).
+         int exportframestep = recorder::deterministicframestep(millis);
+-        limitfps(millis, totalmillis);
++        bool shouldrender = true;   // SwiftGibs decoupled frame drawing (patch 24): limitfps() only ever sets this false, and only when sgdecouplefps decides this iteration should not render - every other case (var off, menu/minimized, export capturing, no cap) leaves it at this default
++        limitfps(millis, totalmillis, shouldrender);
+         elapsedtime = millis - totalmillis;
+         static int timeerr = 0;
+         int scaledtime = game::scaletime(elapsedtime) + timeerr;
+@@ -1419,7 +1576,13 @@
+ 		lastmillis += curtime;
+         totalmillis = millis;
+         updatetime();
+- 
++
++        // SwiftGibs decoupled frame drawing (patch 24): everything from here down to the render
++        // gate below runs EVERY iteration regardless of shouldrender - input pump, menu/edit
++        // input, world simulation (including c2sinfo()'s own send and gets2c()'s receive, both
++        // inside game::updateworld() - fpsgame/fps.cpp), sleep-command timers and the
++        // server/network slice. None of this is presentation, so decoupling the render cap from
++        // it is the entire point (crawl finding 38) - unchanged from the vendor loop either way.
+         checkinput();
+         menuprocess();
+         tryedit();
+@@ -1430,22 +1593,46 @@
+ 
+         serverslice(false, 0);
+ 
+-        if(frames) updatefpshistory(elapsedtime);
+-        if(frames) game::fpsstatsframe(elapsedtime);   // SwiftGibs per-match fps stats: same frame time, no second clock
+-        frames++;
+-
+-        // miscellaneous general game effects
++        // miscellaneous general game effects: also state advance, not presentation (particle
++        // simulation and the sound mixer's own channel sync both want to run every tick for
++        // smoothness regardless of render rate; recomputecamera() just refreshes camera state
++        // that rendering below will read if and when it happens) - all three stay outside the
++        // render gate, unchanged from the vendor loop.
+         recomputecamera();
+         updateparticles();
+         updatesounds();
+ 
+         if(minimized) continue;
+ 
++        if(!shouldrender) continue;   // SwiftGibs decoupled frame drawing (patch 24): non-render iteration - everything above already ran; only the presentation block below is skipped
++
++        // SwiftGibs decoupled frame drawing (patch 24): frametime/curframetime measure time
++        // since the last RENDER (getclockmillis() domain), not since the last tick - elapsedtime/
++        // curtime above stay tick-based for game simulation, which is correct even when a render
++        // and a tick are no longer the same event. Equals elapsedtime/curtime whenever every tick
++        // renders (sgdecouplefps 0, or no cap active). See the extern's comment (shared/iengine.h)
++        // for the one existing consumer this fixes (engine/rendergl.cpp's damage compass fade).
++        int frametime = millis - lastdrawmillis;
++        static int frametimeerr = 0;
++        int scaledframetime = game::scaletime(frametime) + frametimeerr;
++        curframetime = scaledframetime/100;
++        frametimeerr = scaledframetime%100;
++
++        // updatefpshistory/fpsstatsframe are presentation metrics (the HUD fps counter and the
++        // per-match fps-stats feature respectively) - both belong on render cadence, using
++        // frametime, not tick cadence using elapsedtime, or they would report the tick rate
++        // instead of the render rate whenever sgdecouplefps is skipping renders. frames/
++        // lastdrawmillis are therefore also render counters now, not tick counters.
++        if(frames) { updatefpshistory(frametime); game::fpsstatsframe(frametime); }   // SwiftGibs per-match fps stats: same frame time, no second clock
++        frames++;
++        lastdrawmillis = millis;
++
+         inbetweenframes = false;
+         if(mainmenu) gl_drawmainmenu();
+         else gl_drawframe();
+         swapbuffers();
+         renderedframe = inbetweenframes = true;
++        game::benchcaptureframe();   // SwiftGibs paced benchmark mode (patch 24 commit B): this render's frame-time sample for sgbenchpaced - see that function's comment (fpsgame/client.cpp) for why it lives here and not in benchframe() above
+     }
+     
+     ASSERT(0);   
+--- a/engine/rendergl.cpp
++++ b/engine/rendergl.cpp
+@@ -2025,7 +2025,13 @@
+         gle::attrib(m.transform(vec2(0, 0)));
+ 
+         // fade in log space so short blips don't disappear too quickly
+-        scale -= float(curtime)/damagecompassfade;
++        // SwiftGibs decoupled frame drawing (patch 24 wave 2): curframetime, not curtime - this
++        // function only runs once per actual RENDER (gl_drawhud, below the render gate in
++        // engine/main.cpp's loop), so the fade must use time-since-last-render, not
++        // time-since-last-tick, or it would fade almost not at all whenever a render lands
++        // right after a short non-render tick (sgdecouplefps on). Identical to curtime whenever
++        // every tick renders.
++        scale -= float(curframetime)/damagecompassfade;
+         damagedirs[i] = scale > 0 ? (pow(logscale, scale) - 1) / (logscale - 1) : 0;
+     }
+     if(dirs) gle::end();
 --- a/fpsgame/client.cpp
 +++ b/fpsgame/client.cpp
 @@ -12,14 +12,23 @@
@@ -139,7 +352,7 @@
      struct benchstats { float p50, p95, p99, onepctlow, worst; int stutters; };
  
      // p(k) on an already-sorted array: nearest-rank, truncating (not rounding) the index - the
-@@ -3036,7 +3060,8 @@
+@@ -3036,12 +3060,21 @@
          delete[] sorted;
      }
  
@@ -149,7 +362,20 @@
  
      // Called unconditionally from the main loop (engine/main.cpp, right after
      // getclockmillis()) - a no-op before sgbench arms a run and forever after that run reports.
-@@ -3059,6 +3084,8 @@
+     // See the state-machine comment above the state block: this single function drives the
+     // whole PENDING -> MEASURING -> report/error lifecycle by polling demoplayback directly.
++    //
++    // SwiftGibs decoupled frame drawing (patch 24 commit B): this function is the state machine
++    // ONLY as of this patch - it must still run every iteration regardless of sgdecouplefps
++    // (including the minimized-during-measurement poison check below, which has to fire even on
++    // an iteration that will never reach a render at all: main.cpp's own `if(minimized) continue;`
++    // skips straight past rendering, decouple or not). The actual per-frame TIME SAMPLE
++    // (benchframes_ms/benchlastticks) moved out to benchcaptureframe() below, called only from
++    // main.cpp's render-gated block - see that function's comment for why.
+     void benchframe()
+     {
+         if(!bencharmed) return;
+@@ -3059,6 +3092,8 @@
                  benchmeasuring = true;
                  benchstartticks = now;
                  benchlastticks = 0;
@@ -158,7 +384,7 @@
                  return;
              }
              double waitedms = double(now - benchpendingticks) * 1000.0 / double(freq);
-@@ -3077,12 +3104,15 @@
+@@ -3077,24 +3112,55 @@
          {
              bencharmed = false;
              benchmeasuring = false;
@@ -172,10 +398,60 @@
  
          double sincestart = double(now - benchstartticks) * 1000.0 / double(freq);
 +        if(benchpaced) benchinputgatearmed = sincestart >= 2000.0;   // SwiftGibs paced benchmark mode (patch 24): same 2s settle discard as the frame-capture window just below
++        // SwiftGibs decoupled frame drawing (patch 24 commit B): the frame-time SAMPLE that used
++        // to be taken right here now lives in benchcaptureframe() below (called only on a render,
++        // from main.cpp) - this check stays here, unconditional every tick, purely so the
++        // minimized-during-measurement poison still fires on an iteration that will never reach a
++        // render at all (see the module comment above benchframe()).
++        if(sincestart >= 2000.0 && benchlastticks && minimized)
++        {
++            // Poison the whole pass rather than silently recording a render-free,
++            // spun-free frame delta - see the "Minimized window" measurement rule above.
++            bencharmed = false;
++            benchmeasuring = false;
++            conoutf("BENCH ERROR: window minimized during measurement");
++            quit();
++            return;
++        }
++    }
++
++    // SwiftGibs decoupled frame drawing (patch 24 commit B): called from engine/main.cpp's
++    // render-gated block - only on an iteration that actually renders - NOT from benchframe()
++    // above, which runs every iteration whether or not it renders. This split is what makes
++    // sgbenchpaced measure RENDER pacing instead of TICK pacing once sgdecouplefps starts
++    // skipping renders: when decouple is off (or no cap is active) every tick renders, so this
++    // fires every tick and benchframes_ms is identical to the pre-patch-24-commit-B behavior;
++    // when decouple is on and skipping some renders, this only fires on the ticks that actually
++    // rendered, so benchframes_ms - and therefore the CSV's p50/p99/p999/late15/late20 - reflects
++    // true render cadence, which is the exact thing the design spec's decouple soak checks (a
++    // capfps 60 paced run should show p50ms ~= 16.7, not ~1, once sgdecouplefps is on). Guarded
++    // on benchmeasuring alone (not bencharmed): PENDING/timeout/error handling all stay in
++    // benchframe() above, this only ever needs to add a sample or start the running gap.
++    // checkinput()'s SEPARATE benchinputtick() (engine/main.cpp) is what still shows the full
++    // TICK rate via maxgap_input_ms - the two metrics are deliberately fed from different call
++    // sites for exactly this reason.
++    void benchcaptureframe()
++    {
++        if(!benchmeasuring) return;
++        Uint64 now = SDL_GetPerformanceCounter();
++        static const Uint64 freq = SDL_GetPerformanceFrequency();
++        double sincestart = double(now - benchstartticks) * 1000.0 / double(freq);
          if(sincestart >= 2000.0 && benchlastticks)
          {
-             if(minimized)
-@@ -3185,6 +3215,8 @@
+-            if(minimized)
+-            {
+-                // Poison the whole pass rather than silently recording a render-free,
+-                // spun-free frame delta - see the "Minimized window" measurement rule above.
+-                bencharmed = false;
+-                benchmeasuring = false;
+-                conoutf("BENCH ERROR: window minimized during measurement");
+-                quit();
+-                return;
+-            }
+             double deltams = double(now - benchlastticks) * 1000.0 / double(freq);
+             if(benchcount < BENCHCAP) benchframes_ms[benchcount++] = float(deltams);
+             else benchtruncated = true;
+@@ -3185,6 +3251,8 @@
          benchtruncated = false;
          benchlastticks = 0;
          benchmeasuring = false;
@@ -184,7 +460,7 @@
          copystring(benchdemofile, file);
          benchpendingticks = SDL_GetPerformanceCounter();
          bencharmed = true;
-@@ -3208,6 +3240,246 @@
+@@ -3208,6 +3276,246 @@
      });
      // ---- end SwiftGibs benchmark mode ----
  
@@ -433,7 +709,15 @@
      // Bounded, read-only scan of a clip/recording's opening keyframe (writeclipwelcome(),
 --- a/shared/iengine.h
 +++ b/shared/iengine.h
-@@ -582,6 +582,8 @@
+@@ -4,6 +4,7 @@
+ extern int lastmillis;                  // last time
+ extern int elapsedtime;                 // elapsed frame time
+ extern int totalmillis;                 // total elapsed time
++extern int curframetime;                // SwiftGibs decoupled frame drawing (patch 24 wave 2): scaled duration since the last actual RENDER (vs curtime's "since the last tick") - engine/rendergl.cpp uses this for per-render animation math that must not warp when a tick and a render stop being the same event; equals curtime whenever every tick renders (sgdecouplefps 0, or no cap active)
+ extern int lastinputmillis;             // SwiftGibs AFK-aware auto-respawn: wall-clock (totalmillis-based) timestamp of the last real keyboard/mouse event (engine/main.cpp, engine/console.cpp) - declared here, not engine/engine.h, so unqualified lookup from inside namespace game (fpsgame/fps.cpp) finds this global, not a namespaced copy
+ extern uint totalsecs;
+ extern int gamespeed, paused;
+@@ -582,6 +583,8 @@
  extern int bilinear;
  extern int clips;                                               // SwiftGibs instant replay on/off
  extern bool benchmeasuring;                                     // SwiftGibs benchmark mode (patch 22): limitfps() no-ops while this is set
@@ -444,11 +728,12 @@
  // warmed at map start (sgpreload_*) vs what still loaded lazily during play (sglazy_*),
 --- a/shared/igame.h
 +++ b/shared/igame.h
-@@ -52,6 +52,7 @@
+@@ -52,6 +52,8 @@
      extern void updateworld();
      extern void fpsstatsframe(int elapsed);  // SwiftGibs per-match fps stats: called once per frame with the frame time the engine already computed
      extern void benchframe();          // SwiftGibs benchmark mode (patch 22): per-frame perf-counter capture, no-op unless a run is armed
 +    extern void benchinputtick();      // SwiftGibs paced benchmark mode (patch 24): perf-counter timestamp for a checkinput() entry, called only while benchinputgatearmed
++    extern void benchcaptureframe();   // SwiftGibs decoupled frame drawing (patch 24 commit B): the frame-time sample benchframe() used to take unconditionally - called only from engine/main.cpp's render-gated block now, so sgbenchpaced measures render pacing rather than tick pacing under sgdecouplefps
      extern void initclient();
      extern void physicstrigger(physent *d, bool local, int floorlevel, int waterlevel, int material = 0);
      extern void bounced(physent *d, const vec &surface);
