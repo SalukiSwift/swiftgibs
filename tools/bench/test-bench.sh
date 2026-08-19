@@ -27,15 +27,30 @@
 # Runtime: dominated by the client compile (~1-3min) and the workload's own ~120s x2 real-time
 # playback (warmup + 1 measured pass) - expect ~5min for one run, ~10min+ for two back-to-back.
 # That is expected, not a hang.
+#
+# NOTE: a run dirties dist/SwiftGibs-linux-x86_64 itself (bench-home-run/, benchresults.csv,
+# benchframes-*.csv archive dir, and Step 4's boot config.cfg/init.cfg) - that bundle directory
+# must be regenerated (re-run build/make-bundle-linux.sh) before it ships to a player.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 WORK="/tmp/sg-bench4-$$-work"
 rm -rf "$WORK"; mkdir -p "$WORK"
-cleanup() { rm -rf "$WORK"; }
+
+# On failure, the WORK scratch tree (logs, homedirs, CSVs) is exactly what a human needs to
+# diagnose the FAIL: line below - so cleanup() only removes it on a clean pass. FAILED is set by
+# fail() itself, right before it exits; the EXIT trap checks it and preserves the tree instead.
+FAILED=0
+cleanup() {
+  if [ "$FAILED" -eq 1 ]; then
+    echo "scratch tree preserved for inspection (not cleaned up): $WORK" >&2
+  else
+    rm -rf "$WORK"
+  fi
+}
 trap cleanup EXIT
 
-fail() { echo "FAIL: $1" >&2; exit 1; }
+fail() { FAILED=1; echo "FAIL: $1" >&2; echo "FAIL: scratch tree preserved at $WORK - see the logs inside it" >&2; exit 1; }
 ok()   { echo "OK: $1"; }
 
 export SDL_AUDIODRIVER=dummy

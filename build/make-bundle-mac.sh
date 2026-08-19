@@ -74,16 +74,14 @@ mkdir -p "$RES/ffmpeg"
 cp "$FFMPEG_DIR/ffmpeg" "$FFMPEG_DIR/LICENSE.txt" "$FFMPEG_DIR/NOTICE.txt" "$RES/ffmpeg/"
 chmod +x "$RES/ffmpeg/ffmpeg"
 
-# 4d) benchmark mode (sgbench, patch 22): canonical workload + runner + pinned profile, staged
-# in Contents/Resources - the mac binary's data root (patches/13-mac-datadir.patch chdir's the
-# engine here at startup) - alongside data/packages, same as the win/linux bundlers' bundle
-# root. MUST happen before the re-sign step below, same reasoning as the ffmpeg block above:
-# codesign/rcodesign seals whatever is in the bundle at the moment it runs.
-mkdir -p "$RES/data/bench"
-cp "$ROOT/tools/bench/workload-v1.dmo" "$RES/data/bench/workload-v1.dmo"
-cp "$ROOT/tools/bench/run-benchmark.sh" "$RES/run-benchmark.sh"
-chmod +x "$RES/run-benchmark.sh"
-cp -a "$ROOT/tools/bench/bench-home" "$RES/bench-home"
+# NOTE: benchmark mode (sgbench, patch 22) deliberately does NOT ship in this bundle. The
+# Windows/Linux runners write bench-home-run/benchresults.csv/benchframes-*.csv INSIDE their own
+# bundle root, which is fine there - but the mac bundle root is the signed .app's own
+# Contents/Resources, and a runner writing there at play time would mutate a directory the
+# CodeResources seal already covers, invalidating it (macOS/Gatekeeper can then refuse to launch
+# the app at all - a normal-play regression, not just a bench-feature gap). Mac bench support
+# returns once it stages+writes somewhere outside the signed bundle; until then this platform is
+# a side platform for benchmarking (Windows + the Ubuntu box are the real campaign targets).
 
 # 5) RE-SIGN the whole bundle now that data is inside Contents/Resources. The code-only seal only
 #    covered the binary + frameworks; adding data invalidates the CodeResources seal, and the arm64

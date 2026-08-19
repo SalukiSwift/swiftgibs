@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Runs the SwiftGibs benchmark: 1 warmup pass + N measured passes (default 3).
-# Usage: run-benchmark.sh [passes]. Results: benchresults.csv next to this script.
+# Usage: run-benchmark.sh [passes]. Results: benchresults.csv next to this script (latest run),
+# plus a timestamped benchresults-<yyyymmdd-hhmmss>.csv archive and any benchframes-<row>.csv
+# per-frame dumps copied out under the same timestamp prefix - both also land next to this
+# script. bench-home-run/ itself (where the engine actually writes those files first) is wiped
+# and recreated at the start of every invocation, so nothing left only in there survives.
 #
 # Shared between the Linux and Mac bundles (both platform bundlers copy this same file to
 # their bundle root / Contents/Resources - see build/make-bundle-{linux,mac}.sh). The two
@@ -54,12 +58,47 @@ BH="$HERE/bench-home-run"; rm -rf "$BH"; mkdir -p "$BH"
 } > "$BH/autoexec.cfg"
 printf 'sgbench "data/bench/workload-v1.dmo"\n' > "$BH/bench.cfg"
 run_pass() { "$CLIENT" -q"$BH" '-xexec bench.cfg' >/dev/null 2>&1 || true; }   # fullscreen comes from the profile, no -t flag
+
+# Data-row count only (excludes the header line): benchreport() (patch 22) always writes the
+# header and that row's data together in one openfile("a") call, so the CSV is either absent
+# (0 data rows) or has a header plus >=1 data row - never a bare header. Counting wc -l directly
+# double-counts the header as if it were a row of growth: on this invocation's very first
+# success (BEFORE captured right after the warmup pass, when the file has just been created for
+# the first time), that one extra line let PASSES-1 real measured successes still satisfy
+# `AFTER >= BEFORE + PASSES` - a silently-too-lenient gate. Subtracting the header fixes it.
+datarows() {
+  if [ -f "$1" ]; then
+    local lines; lines=$(wc -l < "$1")
+    echo $((lines - 1))
+  else
+    echo 0
+  fi
+}
+
 echo "warmup pass..."; run_pass
-BEFORE=$(wc -l < "$BH/benchresults.csv" 2>/dev/null || echo 0)
+BEFORE=$(datarows "$BH/benchresults.csv")
 for i in $(seq 1 "$PASSES"); do echo "measured pass $i/$PASSES..."; run_pass; done
-AFTER=$(wc -l < "$BH/benchresults.csv" 2>/dev/null || echo 0)
+AFTER=$(datarows "$BH/benchresults.csv")
 [ "$AFTER" -ge $((BEFORE + PASSES)) ] || { echo "BENCH FAILED: expected $PASSES new rows, got $((AFTER-BEFORE))"; exit 1; }
+
+TS="$(date -u +%Y%m%d-%H%M%S)"
 cp "$BH/benchresults.csv" "$HERE/benchresults.csv"
+# Keep the latest results at the stable benchresults.csv name (above) for tools/scripts that
+# always read that path, but ALSO archive this invocation's full CSV under a timestamped name so
+# an earlier run's rows are never silently clobbered by a later one.
+cp "$BH/benchresults.csv" "$HERE/benchresults-$TS.csv"
+
+# benchframes-<row>.csv (per-pass raw frame-time dumps, one ms value per line - see
+# benchdumpframes in patch 22, on by default) live inside bench-home-run, which the very next
+# invocation's `rm -rf "$BH"` above wipes unconditionally. Copy every dump out next to
+# benchresults.csv, under this invocation's timestamp, before it's lost.
+shopt -s nullglob
+for f in "$BH"/benchframes-*.csv; do
+  base="$(basename "$f")"                       # benchframes-<row>.csv
+  cp "$f" "$HERE/benchframes-$TS-${base#benchframes-}"
+done
+shopt -u nullglob
+
 # The warmup pass row is intentionally left in the CSV file - the summary below prints only
 # the last N (measured) rows. Simpler than filtering, and the utc column disambiguates.
 echo "== results (last $PASSES passes) =="
