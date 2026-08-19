@@ -20,7 +20,20 @@
  // SwiftGibs AFK-aware auto-respawn: wall-clock (totalmillis-based) timestamp of the last
  // REAL SDL input event that reached the client - keyboard (processkey(), engine/console.cpp)
  // or mouse movement (the SDL_MOUSEMOTION case in checkinput() below); mouse buttons/wheel
-@@ -936,6 +936,7 @@
+@@ -658,6 +658,12 @@
+     {
+         SDL_GL_DeleteContext(glcontext);
+         glcontext = NULL;
++        // patch 24 component 4 (review fix): the pending GPU fence, if any, belonged to the
++        // context just destroyed above - see resetswapfence()'s own comment (beside
++        // swapbuffers(), engine/main.cpp) for why it must be cleared here, at this exact
++        // point, rather than left for the next swapbuffers() call to discover.
++        extern void resetswapfence();
++        resetswapfence();
+     }
+     if(screen)
+     {
+@@ -936,6 +942,7 @@
  
  void checkinput()
  {
@@ -28,7 +41,7 @@
      if(interceptkeysym) clearinterceptkey();
      //int lasttype = 0, lastbut = 0;
      bool mousemoved = false;
-@@ -1051,21 +1052,275 @@
+@@ -1051,21 +1058,308 @@
      if(mousemoved) resetmousemotion();
  }
  
@@ -82,36 +95,48 @@
 +// per-tick flow entirely, during synchronous map/asset loading) - every call is a real
 +// presented frame, never a tick that skipped rendering, so gating this logic inside
 +// swapbuffers() itself is sufficient on its own; no separate decouple-awareness was needed.
++//
++// GL context lifecycle (review fix): the pending fence is a GL object owned by whichever
++// context created it, and does not survive that context's destruction. setupscreen()
++// (below) calls resetswapfence() (defined beside swapbuffers(), below) at the exact point
++// it destroys the OLD context via SDL_GL_DeleteContext, before creating a new one - this
++// covers resetgl()'s mid-session context recreation (reachable from ordinary CHANGE_GFX
++// settings: scr_w/h, depthbits, fsaa, fullscreen), where
++// renderbackground("resetting OpenGL") can otherwise leave a stale fence handle from the
++// about-to-be-destroyed context sitting in the static below, which the very next
++// swapbuffers() call (on the NEW context, a few lines later in resetgl() via
++// renderbackground("initializing...")) would otherwise misuse.
 +VARP(sggpumaxqueue, 0, 0, 1);
++
++static GLsync pendingswapfence = NULL;   // patch 24 component 4: previous frame's pending fence, if any - file-scope (not a swapbuffers()-local static) so resetswapfence() below can clear it independently of swapbuffers() itself; see that function's own comment for why.
 +
  void swapbuffers(bool overlay)
  {
      recorder::capture(overlay);
      gle::disable();
 +
-+    static GLsync pendingfence = NULL;   // patch 24 component 4: previous frame's fence, if any
 +    if(sggpumaxqueue && hasSync)
 +    {
-+        if(pendingfence)
++        if(pendingswapfence)
 +        {
 +            // bounded wait on the PREVIOUS frame's fence - see the module comment above for
 +            // why this is one frame behind, not the frame just about to be submitted.
-+            GLenum waitresult = glClientWaitSync_(pendingfence, GL_SYNC_FLUSH_COMMANDS_BIT, 100000000ull);
++            GLenum waitresult = glClientWaitSync_(pendingswapfence, GL_SYNC_FLUSH_COMMANDS_BIT, 100000000ull);
 +            if(waitresult == GL_TIMEOUT_EXPIRED || waitresult == GL_WAIT_FAILED)
 +            {
 +                static bool warnedtimeout = false;
 +                if(!warnedtimeout) { warnedtimeout = true; conoutf(CON_WARN, "sggpumaxqueue: GPU fence wait timed out or failed, continuing without full back-pressure"); }
 +            }
-+            glDeleteSync_(pendingfence);
-+            pendingfence = NULL;
++            glDeleteSync_(pendingswapfence);
++            pendingswapfence = NULL;
 +        }
 +    }
-+    else if(pendingfence)
++    else if(pendingswapfence)
 +    {
 +        // var turned off (or sync unavailable) with a fence still outstanding: delete it
 +        // rather than leak the GL object - see the module comment above.
-+        glDeleteSync_(pendingfence);
-+        pendingfence = NULL;
++        glDeleteSync_(pendingswapfence);
++        pendingswapfence = NULL;
 +    }
 +
 +    if(sggpumaxqueue && !hasSync)
@@ -122,7 +147,28 @@
 +
      SDL_GL_SwapWindow(screen);
 +
-+    if(sggpumaxqueue && hasSync) pendingfence = glFenceSync_(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);   // marks everything submitted up to and including this swap
++    if(sggpumaxqueue && hasSync) pendingswapfence = glFenceSync_(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);   // marks everything submitted up to and including this swap
++}
++
++// Resets the pending-fence handle WITHOUT waiting on it or deleting it - GL context
++// destruction (setupscreen() above, on its SDL_GL_DeleteContext path) already reclaims
++// every GL object that belonged to that context, including any pending fence sync object,
++// so calling glClientWaitSync_/glDeleteSync_ on a handle from an already-destroyed context
++// would be at best a benign GL error and at worst undefined behavior (GLsync is commonly a
++// raw pointer under most driver implementations, and nothing about the GL spec promises a
++// fence handle stays meaningful once its owning context is gone). Called from setupscreen()
++// at the exact point the OLD context is destroyed, before a new one is created - covers
++// both of that function's callers: the initial boot path (glcontext is still NULL there, so
++// this is a harmless no-op) and, the actual review-fix bug, resetgl()'s mid-session context
++// recreation (reachable from ordinary CHANGE_GFX settings - scr_w/h, depthbits, fsaa,
++// fullscreen): resetgl() calls renderbackground("resetting OpenGL") BEFORE setupscreen(),
++// which can create a fence on the OLD context if sggpumaxqueue is on; without this reset,
++// the NEXT swapbuffers() call (renderbackground("initializing...") a few lines later in
++// resetgl(), now on the freshly created context) would pass that dangling old-context
++// handle straight to glClientWaitSync_/glDeleteSync_.
++void resetswapfence()
++{
++    pendingswapfence = NULL;
  }
   
  VAR(menufps, 0, 60, 1000);
@@ -308,7 +354,7 @@
      static int fpserror = 0;
      int delay = 1000/limit - (millis-curmillis);
      if(delay < 0) fpserror = 0;
-@@ -1393,8 +1648,9 @@
+@@ -1393,8 +1687,9 @@
      for(;;)
      {
          static int frames = 0;
@@ -319,7 +365,7 @@
          game::drainclipresults();    // SwiftGibs clip writer thread (Task 2): drains completion/failure
                                        // messages from the background clip/recording writer once per
                                        // frame (no-op unless the writer thread has ever been started)
-@@ -1405,9 +1661,14 @@
+@@ -1405,9 +1700,14 @@
          // happened to be. Returns 0, and does nothing at all, in every other situation. limitfps
          // still runs afterwards and is a no-op at any maxfps at or above the export's frame rate
          // (the delay it computes is already used up); a maxfps BELOW it still wins, and costs the
@@ -336,7 +382,7 @@
          elapsedtime = millis - totalmillis;
          static int timeerr = 0;
          int scaledtime = game::scaletime(elapsedtime) + timeerr;
-@@ -1419,7 +1680,13 @@
+@@ -1419,7 +1719,13 @@
  		lastmillis += curtime;
          totalmillis = millis;
          updatetime();
@@ -351,7 +397,7 @@
          checkinput();
          menuprocess();
          tryedit();
-@@ -1430,22 +1697,82 @@
+@@ -1430,22 +1736,82 @@
  
          serverslice(false, 0);
  
@@ -945,15 +991,40 @@
      // Bounded, read-only scan of a clip/recording's opening keyframe (writeclipwelcome(),
 --- a/shared/glexts.h
 +++ b/shared/glexts.h
-@@ -459,6 +459,15 @@
+@@ -459,6 +459,40 @@
  extern PFNGLBINDBUFFERBASEPROC       glBindBufferBase_;
  extern PFNGLBINDBUFFERRANGEPROC      glBindBufferRange_;
  
-+// GL_ARB_sync (patch 24, perf wave 2 component 4: GPU back-pressure at swap). The GLsync
-+// type and PFNGLFENCESYNCPROC/PFNGLCLIENTWAITSYNCPROC/PFNGLDELETESYNCPROC typedefs already
-+// come from <SDL_opengl.h>'s own GL_VERSION_3_2 block (included by shared/cube.h before
-+// this header) - only the loaded-function-pointer externs are new here, following the exact
-+// pattern of the GL 3.0 pair immediately above.
++// GL_ARB_sync (patch 24, perf wave 2 component 4: GPU back-pressure at swap). On
++// Windows/Linux the GLsync type and PFNGLFENCESYNCPROC/PFNGLCLIENTWAITSYNCPROC/
++// PFNGLDELETESYNCPROC typedefs already come from <SDL_opengl.h>'s own GL_VERSION_3_2 block
++// (included by shared/cube.h before this header) - but shared/cube.h's __APPLE__ branch
++// includes <OpenGL/gl.h> instead of <SDL_opengl.h> (no SDL GL-extension header reaches that
++// platform at all), and Apple's own <OpenGL/gl.h> only exposes legacy GL 1.x, so
++// GL_VERSION_3_2 is never defined there either (review fix - the original comment here was
++// wrong: no such block exists in a form Apple ever reaches). Same fallback shape as the
++// GL_VERSION_3_0 block immediately above already uses for this exact situation - a scoped
++// subset, not a full spec mirror, matching that block's own precedent of only backfilling
++// what this codebase actually uses: the four enum values engine/main.cpp's swapbuffers()
++// references, GLsync, GLuint64 (needed only for PFNGLCLIENTWAITSYNCPROC's timeout parameter
++// - nothing in this patch needs GLint64), and the three function-pointer typedefs. GLuint64
++// is defined here as this codebase's own portable 64-bit type (`ullong`, shared/tools.h,
++// already included by shared/cube.h before this header on every platform) rather than
++// `uint64_t`/<stdint.h> the way the real SDL header does it, to avoid adding a new implicit
++// header dependency for a type this codebase already has a guaranteed-available name for.
++#ifndef GL_VERSION_3_2
++#define GL_VERSION_3_2 1
++#define GL_SYNC_GPU_COMMANDS_COMPLETE     0x9117
++#define GL_TIMEOUT_EXPIRED                0x911B
++#define GL_WAIT_FAILED                    0x911D
++#define GL_SYNC_FLUSH_COMMANDS_BIT        0x00000001
++typedef ullong GLuint64;
++typedef struct __GLsync *GLsync;
++typedef GLsync (APIENTRYP PFNGLFENCESYNCPROC) (GLenum condition, GLbitfield flags);
++typedef GLenum (APIENTRYP PFNGLCLIENTWAITSYNCPROC) (GLsync sync, GLbitfield flags, GLuint64 timeout);
++typedef void (APIENTRYP PFNGLDELETESYNCPROC) (GLsync sync);
++#endif
++
 +extern PFNGLFENCESYNCPROC      glFenceSync_;
 +extern PFNGLCLIENTWAITSYNCPROC glClientWaitSync_;
 +extern PFNGLDELETESYNCPROC     glDeleteSync_;
