@@ -34,7 +34,24 @@ if [ "$(uname -s)" != "Darwin" ] && [ "${SWIFTGIBS_SYSTEM_SDL:-0}" != "1" ] && [
 fi
 
 BH="$HERE/bench-home-run"; rm -rf "$BH"; mkdir -p "$BH"
-cp "$HERE/bench-home/autoexec.cfg" "$BH/"
+# The benchmark must measure the SHIPPED SwiftGibs config, not an isolated blank slate: build
+# bench-home-run/autoexec.cfg by execing the bundle's real staged autoexec.cfg FIRST (this is
+# what sets the shipped first-run defaults - shaderdetail, blood, ragdoll, hidedead,
+# forceplayermodels, swiftgibsversion, etc.), THEN appending this repo's pinned bench
+# overrides on top, exactly as bench-home/autoexec.cfg's own top comment documents.
+#
+# The exec target must be an ABSOLUTE path, not the bare filename "autoexec.cfg": the engine's
+# findfile() (shared/stream.cpp) always checks the -q homedir FIRST for any bare filename, and
+# this generated file IS bench-home-run/autoexec.cfg - a bare `exec "autoexec.cfg"` from
+# inside it would just find and re-exec itself (infinite recursion). An absolute path dodges
+# this: findfile()'s homedir-prefix check concatenates homedir+filename, which garbles an
+# absolute path into a nonexistent string, so that check fails and falls through to its own
+# final fallback of returning the filename exactly as given - fopen() then resolves that
+# absolute path correctly, regardless of cwd or homedir.
+{
+  printf 'exec "%s/autoexec.cfg"\n' "$HERE"
+  cat "$HERE/bench-home/autoexec.cfg"
+} > "$BH/autoexec.cfg"
 printf 'sgbench "data/bench/workload-v1.dmo"\n' > "$BH/bench.cfg"
 run_pass() { "$CLIENT" -q"$BH" '-xexec bench.cfg' >/dev/null 2>&1 || true; }   # fullscreen comes from the profile, no -t flag
 echo "warmup pass..."; run_pass
