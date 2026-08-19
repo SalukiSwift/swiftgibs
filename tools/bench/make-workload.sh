@@ -84,26 +84,24 @@ sleep 128000 [quit]
 EOF
 sed -i "s/PORTPLACEHOLDER/$PORT/" "$S/homeB/b.cfg"
 
-(cd "$S/servertree" && ./sauer_server -q"$S/serverhome" > "$S/server.log" 2>&1) &
+# Each subshell's last command is `exec`-replaced so $! is the real game binary's own PID,
+# not a wrapper shell sitting above it (a plain "(cd X && cmd) &" forks a subshell that then
+# forks cmd as ITS OWN child - killing $! only kills the subshell, leaving cmd running). This
+# way plain `kill "$PID"` reaps the actual process - no pattern-matching kill of any kind
+# (pkill -f is banned project-wide: a pattern match once killed the session running it).
+(cd "$S/servertree" && exec ./sauer_server -q"$S/serverhome") > "$S/server.log" 2>&1 &
 SERVERPID=$!
 sleep 2
 
-(cd "$S/bundle" && SDL_AUDIODRIVER=dummy ./sauer_client -q"$S/homeA" -w640 -h480 -t0 '-xexec a.cfg' > "$S/a.log" 2>&1) &
+(cd "$S/bundle" && SDL_AUDIODRIVER=dummy exec ./sauer_client -q"$S/homeA" -w640 -h480 -t0 '-xexec a.cfg') > "$S/a.log" 2>&1 &
 APID=$!
 sleep 15   # let A connect, claim master, mapvote, and spawn+settle all 8 bots
 
-(cd "$S/bundle" && SDL_AUDIODRIVER=dummy ./sauer_client -q"$S/homeB" -w640 -h480 -t0 '-xexec b.cfg' > "$S/b.log" 2>&1) &
+(cd "$S/bundle" && SDL_AUDIODRIVER=dummy exec ./sauer_client -q"$S/homeB" -w640 -h480 -t0 '-xexec b.cfg') > "$S/b.log" 2>&1 &
 BPID=$!
 wait "$BPID" || true
 
-# kill: $APID/$SERVERPID are the "(cd ... && cmd) &" subshells, not the actual
-# sauer_client/sauer_server children they exec'd (bash forks a real child process
-# for the compound command rather than exec-replacing it) - killing just the
-# subshell PID leaves the game binary running. Match on this run's unique $S path
-# instead, which is scoped to exactly the two processes this invocation started.
 kill "$APID" "$SERVERPID" 2>/dev/null || true
-pkill -f "sauer_client -q$S/homeA" 2>/dev/null || true
-pkill -f "sauer_server -q$S/serverhome" 2>/dev/null || true
 
 REC=$(ls -t "$S/homeB/clips/"*rec*.dmo 2>/dev/null | head -1)
 [ -n "$REC" ] || { echo "no recording produced" >&2; exit 1; }
