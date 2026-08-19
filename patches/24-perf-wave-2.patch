@@ -8,15 +8,80 @@
      if(interceptkeysym) clearinterceptkey();
      //int lasttype = 0, lastbut = 0;
      bool mousemoved = false;
-@@ -1063,7 +1064,7 @@
+@@ -1061,11 +1062,71 @@
+ VAR(menufps, 0, 60, 1000);
+ VARP(maxfps, 0, 200, 1000);
  
++// SwiftGibs sub-millisecond precise frame limiter (patch 24, perf wave 2 component 2). DEFAULT
++// OFF - sgprecisefps 0 takes the untouched stock branch at the bottom of limitfps() below,
++// byte-for-byte the same code that has always run there; `sgprecisefps && !menugoverned` is the
++// only new decision point on that path.
++//
++// Why: the stock branch quantizes its wait to whole milliseconds. At a high cap (maxfps 999 -
++// a 1.001ms target period) the `1000%limit` error accumulator's job is to nudge the INTEGER
++// delay up by 1ms every so often so the AVERAGE period tracks the true fractional one, but any
++// SINGLE frame still either sleeps 0ms or 1ms - a guaranteed pacing beat baked into the wait
++// itself (crawl finding 37), not a rounding error that washes out.
++//
++// The precise path instead times the wait on SDL_GetPerformanceCounter() (sub-millisecond
++// resolution): SDL_Delay(max(0, floor(remaining_ms) - 1)) sleeps everything except roughly the
++// last millisecond (cheap - yields the CPU, no different from the stock branch's own SDL_Delay
++// call), then a tight SDL_GetPerformanceCounter() poll loop spins out the sub-millisecond
++// remainder exactly. The spin is bounded to that leftover fraction (worst case a touch over 1ms
++// if SDL_Delay overshoots its own OS-timer granularity) - one core briefly hot right at each
++// frame boundary, not a sustained busy-wait for the whole frame.
++//
++// Pacing target: an ABSOLUTE next-frame deadline (perf-counter ticks), not "now + period" -
++// every call advances it by exactly one period from ITS OWN previous value, so a frame that
++// lands a little late does not push the schedule later; the following wait is simply shorter by
++// that same amount, and error cannot accumulate frame over frame (this replaces the stock
++// fpserror accumulator entirely on this path - the perf counter itself now plays that role, at
++// far finer resolution than 1000%limit ever gave). The one exception: if a call ever finds itself
++// more than a full period past the deadline (a real stall - alt-tab, a hitch, a paused
++// debugger), the deadline resyncs to "now" instead of trying to catch up, so a stall costs
++// exactly one slow frame and never a burst of unpaced frames right after it.
++//
++// Menu/minimized frames (the `menugoverned` branch just below - menufps governs the cap, not
++// maxfps) ALWAYS take the stock whole-ms path regardless of sgprecisefps: nobody needs
++// sub-millisecond pacing looking at a paused menu or a minimized window, and it keeps the new
++// machinery scoped to the live-gameplay case it was built to fix.
++VARP(sgprecisefps, 0, 0, 1);
++
  void limitfps(int &millis, int curmillis)
  {
 -    if(benchmeasuring) return;   // sgbench: uncapped while measuring (patch 22)
+-    int limit = (mainmenu || minimized) && menufps ? (maxfps ? min(maxfps, menufps) : menufps) : maxfps;
 +    if(benchmeasuring && !benchcapactive) return;   // sgbench: uncapped while measuring (patch 22); a PACED run (patch 24) sets benchcapactive so the cap stays active instead of being bypassed
-     int limit = (mainmenu || minimized) && menufps ? (maxfps ? min(maxfps, menufps) : menufps) : maxfps;
++    bool menugoverned = (mainmenu || minimized) && menufps;   // SwiftGibs precise limiter (patch 24): named so both the cap computation below and the sgprecisefps gate agree on the same condition
++    int limit = menugoverned ? (maxfps ? min(maxfps, menufps) : menufps) : maxfps;
      if(!limit) return;
++
++    if(sgprecisefps && !menugoverned)
++    {
++        // SwiftGibs precise limiter (patch 24): see the module comment above for the full
++        // design. static state persists across calls (and across sgprecisefps being toggled
++        // off and back on - the resync-on-stall check above self-heals a stale deadline the
++        // first time this path runs again).
++        static Uint64 precisedeadline = 0;   // absolute perf-counter tick this frame is due
++        static const Uint64 freq = SDL_GetPerformanceFrequency();
++        Uint64 periodticks = (Uint64)(freq / (double)limit);
++        Uint64 now = SDL_GetPerformanceCounter();
++        if(!precisedeadline || now > precisedeadline + periodticks) precisedeadline = now;   // never armed, or stalled a full period behind: resync, don't burst-catch-up
++        if(now < precisedeadline)
++        {
++            double remainingms = double(precisedeadline - now) * 1000.0 / double(freq);
++            int coarse = (int)remainingms - 1;   // floor(remaining_ms) - 1: leave the last ~1ms (plus fraction) to the spin below
++            if(coarse > 0) SDL_Delay((Uint32)coarse);
++            do { now = SDL_GetPerformanceCounter(); } while(now < precisedeadline);
++        }
++        precisedeadline += periodticks;   // advance from the deadline's OWN previous value, never from "now" - see the module comment above
++        millis = getclockmillis();        // refresh to the actual post-wait instant; unlike the stock branch's SDL_Delay(delay); millis += delay, the coarse-delay-plus-spin time isn't known in advance
++        return;
++    }
++
      static int fpserror = 0;
+     int delay = 1000/limit - (millis-curmillis);
+     if(delay < 0) fpserror = 0;
 --- a/fpsgame/client.cpp
 +++ b/fpsgame/client.cpp
 @@ -12,14 +12,23 @@
