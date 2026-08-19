@@ -1,6 +1,387 @@
+Binary files /tmp/sg-pw1-pristine/engine/3dgui.o and /tmp/sg-pw1-work/engine/3dgui.o differ
+--- a/engine/bih.cpp
++++ b/engine/bih.cpp
+@@ -26,8 +26,13 @@
+         if(f > 0 || f < maxdist*det) return false;
+     }
+     float invdet = 1/det;
+-    if(m.flags&MESH_ALPHA && (mode&RAY_ALPHAPOLY)==RAY_ALPHAPOLY && (m.tex->alphamask || (lightmapping <= 1 && loadalphamask(m.tex))))
++    if(m.flags&MESH_ALPHA && (mode&RAY_ALPHAPOLY)==RAY_ALPHAPOLY)
+     {
++        // SwiftGibs preload pass (patch 23, slate C): a null alphamask here means the
++        // map-load preload (preloadusedmapmodels(true, true), engine/worldio.cpp) missed
++        // this mesh and we're about to decode it from disk inline in a shot raycast.
++        if(sgpreloadstats && !m.tex->alphamask) sglazy_alphamask++;
++        if(!(m.tex->alphamask || (lightmapping <= 1 && loadalphamask(m.tex)))) return false;
+         vec2 at = m.gettc(t.vert[0]), bt = m.gettc(t.vert[1]).sub(at).mul(v*invdet), ct = m.gettc(t.vert[2]).sub(at).mul(w*invdet);
+         at.add(bt).add(ct);
+         int si = clamp(int(m.tex->xs * at.x), 0, m.tex->xs-1),
+@@ -314,7 +319,14 @@
+         if(!m->shadow || e.flags&EF_NOSHADOW) return false;
+     }
+     else if((mode&RAY_ENTS)!=RAY_ENTS && (!m->collide || e.flags&EF_NOCOLLIDE)) return false;
+-    if(!m->bih && (lightmapping > 1 || !m->setBIH())) return false;
++    // SwiftGibs preload pass (patch 23, slate C): a null bih here means the map-load
++    // preload (preloadusedmapmodels(true, true), engine/worldio.cpp) missed this
++    // mapmodel and we're about to build its BIH inline in a shot raycast.
++    if(!m->bih)
++    {
++        if(sgpreloadstats) sglazy_mapmodelbih++;
++        if(lightmapping > 1 || !m->setBIH()) return false;
++    }
+     vec mo = vec(o).sub(e.o), mray(ray);
+     float v = mo.dot(mray), inside = m->bih->entradius - mo.squaredlen();
+     if((inside < 0 && v > 0) || inside + v*v < 0) return false;
+Binary files /tmp/sg-pw1-pristine/engine/bih.o and /tmp/sg-pw1-work/engine/bih.o differ
+Binary files /tmp/sg-pw1-pristine/engine/blend.o and /tmp/sg-pw1-work/engine/blend.o differ
+Binary files /tmp/sg-pw1-pristine/engine/blob.o and /tmp/sg-pw1-work/engine/blob.o differ
+Binary files /tmp/sg-pw1-pristine/engine/client.o and /tmp/sg-pw1-work/engine/client.o differ
+Binary files /tmp/sg-pw1-pristine/engine/command-standalone.o and /tmp/sg-pw1-work/engine/command-standalone.o differ
+Binary files /tmp/sg-pw1-pristine/engine/command.o and /tmp/sg-pw1-work/engine/command.o differ
+Binary files /tmp/sg-pw1-pristine/engine/console.o and /tmp/sg-pw1-work/engine/console.o differ
+Binary files /tmp/sg-pw1-pristine/engine/cubeloader.o and /tmp/sg-pw1-work/engine/cubeloader.o differ
+Binary files /tmp/sg-pw1-pristine/engine/decal.o and /tmp/sg-pw1-work/engine/decal.o differ
+Binary files /tmp/sg-pw1-pristine/engine/dynlight.o and /tmp/sg-pw1-work/engine/dynlight.o differ
+Binary files /tmp/sg-pw1-pristine/engine/engine.h.gch and /tmp/sg-pw1-work/engine/engine.h.gch differ
+Binary files /tmp/sg-pw1-pristine/engine/glare.o and /tmp/sg-pw1-work/engine/glare.o differ
+Binary files /tmp/sg-pw1-pristine/engine/grass.o and /tmp/sg-pw1-work/engine/grass.o differ
+Binary files /tmp/sg-pw1-pristine/engine/lightmap.o and /tmp/sg-pw1-work/engine/lightmap.o differ
+Binary files /tmp/sg-pw1-pristine/engine/main.o and /tmp/sg-pw1-work/engine/main.o differ
+Binary files /tmp/sg-pw1-pristine/engine/material.o and /tmp/sg-pw1-work/engine/material.o differ
+Binary files /tmp/sg-pw1-pristine/engine/menus.o and /tmp/sg-pw1-work/engine/menus.o differ
+Binary files /tmp/sg-pw1-pristine/engine/movie.o and /tmp/sg-pw1-work/engine/movie.o differ
+Binary files /tmp/sg-pw1-pristine/engine/normal.o and /tmp/sg-pw1-work/engine/normal.o differ
+Binary files /tmp/sg-pw1-pristine/engine/octa.o and /tmp/sg-pw1-work/engine/octa.o differ
+Binary files /tmp/sg-pw1-pristine/engine/octaedit.o and /tmp/sg-pw1-work/engine/octaedit.o differ
+Binary files /tmp/sg-pw1-pristine/engine/octarender.o and /tmp/sg-pw1-work/engine/octarender.o differ
+Binary files /tmp/sg-pw1-pristine/engine/physics.o and /tmp/sg-pw1-work/engine/physics.o differ
+Binary files /tmp/sg-pw1-pristine/engine/processpipe.o and /tmp/sg-pw1-work/engine/processpipe.o differ
+Binary files /tmp/sg-pw1-pristine/engine/pvs.o and /tmp/sg-pw1-work/engine/pvs.o differ
+Binary files /tmp/sg-pw1-pristine/engine/rendergl.o and /tmp/sg-pw1-work/engine/rendergl.o differ
+--- a/engine/rendermodel.cpp
++++ b/engine/rendermodel.cpp
+@@ -365,8 +365,15 @@
+     preloadmodels.add(newstring(name));
+ }
+ 
++// SwiftGibs preload pass (patch 23, slate C): loadmodel()'s cache-miss branch is the
++// SAME code whether it's called from here (the load screen) or from a real render call
++// mid-match - this flag lets that branch's lazy-hit counters tell the two apart, so a
++// preload's own necessary one-time load is never miscounted as a lazy hit.
++bool sgpreloadsweep = false;
++
+ void flushpreloadedmodels(bool msg)
+ {
++    sgpreloadsweep = true;
+     loopv(preloadmodels)
+     {
+         loadprogress = float(i+1)/preloadmodels.length();
+@@ -377,6 +384,7 @@
+             m->preloadmeshes();
+         }
+     }
++    sgpreloadsweep = false;
+     preloadmodels.deletearrays();
+     loadprogress = 0;
+ }
+@@ -400,7 +408,10 @@
+         else if(mmi->name[0] && !loadmodel(NULL, mmindex, msg)) { if(msg) conoutf(CON_WARN, "could not load model: %s", mmi->name); }
+         else if(mmi->m)
+         {
+-            if(bih) mmi->m->preloadBIH();
++            // SwiftGibs preload pass (patch 23, slate C): counts BIH+alphamask builds
++            // done here at load time instead of lazily on the first shot ray that
++            // reaches this mapmodel mid-combat (engine/bih.cpp mmintersect/triintersect).
++            if(bih) { mmi->m->preloadBIH(); if(sgpreloadstats) sgpreload_mapmodelbih++; }
+             mmi->m->preloadmeshes();
+         }
+     }
+@@ -426,6 +437,11 @@
+     if(mm) m = *mm;
+     else
+     { 
++        // SwiftGibs preload pass (patch 23, slate C): a flat player-skin variant
++        // (fpsgame/render.cpp's per-player "%s/flatred" etc, always superseding the
++        // stock skin) missing this cache means preloadplayermodel() didn't warm it -
++        // count the miss so a scripted match can prove the preload eliminated it.
++        if(sgpreloadstats && !sgpreloadsweep && (strstr(name, "/flatblue") || strstr(name, "/flatcyan") || strstr(name, "/flatred") || strstr(name, "/flatorange"))) sglazy_flatmodel++;
+         if(!name[0] || loadingmodel || lightmapping > 1) return NULL;
+         if(msg)
+         {
+Binary files /tmp/sg-pw1-pristine/engine/rendermodel.o and /tmp/sg-pw1-work/engine/rendermodel.o differ
+--- a/engine/renderparticles.cpp
++++ b/engine/renderparticles.cpp
+@@ -354,7 +354,10 @@
+         startrender();
+         if(texname)
+         {
+-            if(!tex) tex = textureload(texname, texclamp);
++            // SwiftGibs preload pass (patch 23, slate C): a null tex here means
++            // initparticles()'s eager warm missed this renderer's texture and it's
++            // loading from disk on the frame thread at first render.
++            if(!tex) { if(sgpreloadstats) sglazy_particle++; tex = textureload(texname, texclamp); }
+             glBindTexture(GL_TEXTURE_2D, tex->id);
+         }
+         
+@@ -836,7 +839,8 @@
+  
+     void render()
+     {   
+-        if(!tex) tex = textureload(texname, texclamp);
++        // SwiftGibs preload pass (patch 23, slate C): see the listrenderer sibling above.
++        if(!tex) { if(sgpreloadstats) sglazy_particle++; tex = textureload(texname, texclamp); }
+         glBindTexture(GL_TEXTURE_2D, tex->id);
+ 
+         gle::bindvbo(vbo);
+@@ -966,6 +970,17 @@
+     if(!particleshader) particleshader = lookupshaderbyname("particle");
+     if(!particlenotextureshader) particlenotextureshader = lookupshaderbyname("particlenotexture");
+     loopi(sizeof(parts)/sizeof(parts[0])) parts[i]->init(parts[i]->type&PT_FEW ? min(fewparticles, maxparticles) : maxparticles);
++    // SwiftGibs preload pass (patch 23, slate C): warm every renderer's texture here
++    // (called once at startup, main.cpp) instead of on first render() during the first
++    // blood splash/spark/smoke/muzzle flash of the session.
++    loopi(sizeof(parts)/sizeof(parts[0]))
++    {
++        if(parts[i]->texname && !parts[i]->tex)
++        {
++            parts[i]->tex = textureload(parts[i]->texname, parts[i]->texclamp);
++            if(sgpreloadstats) sgpreload_particles++;
++        }
++    }
+ }
+ 
+ void clearparticles()
+Binary files /tmp/sg-pw1-pristine/engine/renderparticles.o and /tmp/sg-pw1-work/engine/renderparticles.o differ
+Binary files /tmp/sg-pw1-pristine/engine/rendersky.o and /tmp/sg-pw1-work/engine/rendersky.o differ
+Binary files /tmp/sg-pw1-pristine/engine/rendertext.o and /tmp/sg-pw1-work/engine/rendertext.o differ
+Binary files /tmp/sg-pw1-pristine/engine/renderva.o and /tmp/sg-pw1-work/engine/renderva.o differ
+Binary files /tmp/sg-pw1-pristine/engine/server-standalone.o and /tmp/sg-pw1-work/engine/server-standalone.o differ
+Binary files /tmp/sg-pw1-pristine/engine/server.o and /tmp/sg-pw1-work/engine/server.o differ
+Binary files /tmp/sg-pw1-pristine/engine/serverbrowser.o and /tmp/sg-pw1-work/engine/serverbrowser.o differ
+Binary files /tmp/sg-pw1-pristine/engine/shader.o and /tmp/sg-pw1-work/engine/shader.o differ
+Binary files /tmp/sg-pw1-pristine/engine/shadowmap.o and /tmp/sg-pw1-work/engine/shadowmap.o differ
+--- a/engine/sound.cpp
++++ b/engine/sound.cpp
+@@ -712,6 +712,19 @@
+     gamesounds.preloadsound(n);
+ }
+ 
++// SwiftGibs preload pass (patch 23, slate C): the playsoundname() register-and-load path
++// without the play, so the first REAL playsoundname() call for a named sound (streak,
++// respawn pips, reload ticks) is a cache hit instead of a synchronous zip probe + full
++// decode on the frame thread the moment it's actually needed mid-match.
++void preloadsoundname(const char *name, int vol)
++{
++    if(nosound || !name || !name[0]) return;
++    if(!vol) vol = 100;
++    int id = gamesounds.findsound(name, vol);
++    if(id < 0) id = gamesounds.addsound(name, vol);
++    gamesounds.preloadsound(id);
++}
++
+ void preloadmapsound(int n)
+ {
+     mapsounds.preloadsound(n);
+@@ -779,7 +792,14 @@
+     if(fade < 0) return -1;
+ 
+     soundslot &slot = sounds.slots[config.chooseslot(flags)];
+-    if(!slot.sample->chunk && !slot.sample->load()) return -1;
++    if(!slot.sample->chunk)
++    {
++        // SwiftGibs preload pass (patch 23, slate C): a swiftgibs/* named sound missing
++        // its chunk here means preloadswiftgibssounds() (fpsgame/render.cpp) didn't warm
++        // it - count the miss so a scripted match can prove the preload eliminated it.
++        if(sgpreloadstats && slot.sample->name && !strncmp(slot.sample->name, "swiftgibs/", 10)) sglazy_sound++;
++        if(!slot.sample->load()) return -1;
++    }
+ 
+     if(dbgsound) conoutf(CON_DEBUG, "sound: %s", slot.sample->name);
+  
+@@ -872,6 +892,10 @@
+     soundsample *ps = samples.access(pname);
+     if(!ps || !ps->chunk)   // also rebuilds after a sound reset frees the chunk
+     {
++        // SwiftGibs preload pass (patch 23, slate C): preloadpitched() below should
++        // have warmed this (name, pitch) cache entry at map load / on VARP change - a
++        // miss here means the load+resample is happening on the frame thread instead.
++        if(sgpreloadstats) sglazy_pitched++;
+         soundsample *base = samples.access(s);
+         if(!base)
+         {
+@@ -898,6 +922,39 @@
+ }
+ ICOMMAND(playpitched, "sii", (char *s, int *vol, int *pitch), intret(playsoundpitched(s, *vol, *pitch, NULL)));
+ 
++// SwiftGibs preload pass (patch 23, slate C): playsoundpitched()'s cache-warm logic
++// (load the base sample + resample it) without ever playing anything - lets map load /
++// a pitch-slider VARP change pay the decode+resample cost instead of the first hit/fire/
++// reload of a session paying it on the frame thread. Mirrors playsoundpitched() exactly;
++// pitch==100 is a deliberate no-op there too (playsoundname() never touches this cache).
++void preloadpitched(const char *s, int pitch)
++{
++    if(nosound || !s || !s[0]) return;
++    pitch = clamp(pitch, 50, 200);
++    if(pitch == 100) return;
++    defformatstring(pname, "%s#p%d", s, pitch);
++    soundsample *ps = samples.access(pname);
++    if(ps && ps->chunk) return;   // already warm
++    soundsample *base = samples.access(s);
++    if(!base)
++    {
++        char *n = newstring(s);
++        base = &samples[n];
++        base->name = n;
++        base->chunk = NULL;
++    }
++    if(!base->chunk && !base->load()) return;
++    Mix_Chunk *rc = resamplechunk(base->chunk, pitch);
++    if(!rc) return;
++    if(!ps)
++    {
++        char *pn = newstring(pname);
++        ps = &samples[pn];
++        ps->name = pn;
++    }
++    ps->chunk = rc;
++}
++
+ void resetsound()
+ {
+     clearchanges(CHANGE_SOUND);
+Binary files /tmp/sg-pw1-pristine/engine/sound.o and /tmp/sg-pw1-work/engine/sound.o differ
+--- a/engine/texture.cpp
++++ b/engine/texture.cpp
+@@ -3,6 +3,24 @@
+ #include "engine.h"
+ #include "SDL_image.h"
+ 
++
++// SwiftGibs preload pass (patch 23, slate C): see shared/iengine.h for the field-by-field
++// meaning. Off (0) by default: a handful of extra untaken branches per relevant call.
++VAR(sgpreloadstats, 0, 0, 1);
++int sgpreload_flatmodels = 0, sgpreload_mapmodelbih = 0, sgpreload_particles = 0,
++    sgpreload_sounds = 0, sgpreload_pitched = 0, sgpreload_ctf = 0;
++int sglazy_flatmodel = 0, sglazy_mapmodelbih = 0, sglazy_alphamask = 0, sglazy_particle = 0,
++    sglazy_hud = 0, sglazy_sound = 0, sglazy_pitched = 0;
++
++void sgpreloadstatsreport()
++{
++    conoutf(CON_INFO, "\f2sgpreloadstats: preloaded flatmodels=%d mapmodelbih=%d particles=%d sounds=%d pitched=%d ctf=%d",
++        sgpreload_flatmodels, sgpreload_mapmodelbih, sgpreload_particles, sgpreload_sounds, sgpreload_pitched, sgpreload_ctf);
++    conoutf(CON_INFO, "\f2sgpreloadstats: lazy hits flatmodel=%d mapmodelbih=%d alphamask=%d particle=%d hud=%d sound=%d pitched=%d",
++        sglazy_flatmodel, sglazy_mapmodelbih, sglazy_alphamask, sglazy_particle, sglazy_hud, sglazy_sound, sglazy_pitched);
++}
++ICOMMAND(sgpreloadstatsprint, "", (), sgpreloadstatsreport());   // on-demand debug print (real print-point is intermission, fpsgame/fps.cpp)
++
+ #ifndef SDL_IMAGE_VERSION_ATLEAST
+ #define SDL_IMAGE_VERSION_ATLEAST(X, Y, Z) \
+     (SDL_VERSIONNUM(SDL_IMAGE_MAJOR_VERSION, SDL_IMAGE_MINOR_VERSION, SDL_IMAGE_PATCHLEVEL) >= SDL_VERSIONNUM(X, Y, Z))
+@@ -1586,6 +1604,11 @@
+     copystring(tname, name);
+     Texture *t = textures.access(path(tname));
+     if(t) return t;
++    // SwiftGibs preload pass (patch 23, slate C): a cache miss on one of the HUD assets
++    // the CTF/capture/collect preload() sweep warms (fpsgame/ctf.h) means it slipped
++    // through and is still loading on the frame thread - count it so a scripted match
++    // can prove the preload eliminated the first-draw hitch.
++    if(sgpreloadstats && !sgpreloadsweep && (strstr(tname, "packages/hud/blip_")==tname || strstr(tname, "packages/hud/radar.png")==tname || strstr(tname, "packages/hud/compass.png")==tname)) sglazy_hud++;
+     int compress = 0;
+     ImageData s;
+     if(texturedata(s, tname, NULL, msg, &compress, &clamp)) return newtexture(NULL, tname, s, clamp, mipit, false, false, compress);
+Binary files /tmp/sg-pw1-pristine/engine/texture.o and /tmp/sg-pw1-work/engine/texture.o differ
+Binary files /tmp/sg-pw1-pristine/engine/water.o and /tmp/sg-pw1-work/engine/water.o differ
+Binary files /tmp/sg-pw1-pristine/engine/world.o and /tmp/sg-pw1-work/engine/world.o differ
+Binary files /tmp/sg-pw1-pristine/engine/worldio-standalone.o and /tmp/sg-pw1-work/engine/worldio-standalone.o differ
+--- a/engine/worldio.cpp
++++ b/engine/worldio.cpp
+@@ -1255,7 +1255,11 @@
+     extern void fixrotatedlightmaps();
+     if(hdr.version <= 31) fixrotatedlightmaps();
+ 
+-    preloadusedmapmodels(true);
++    // SwiftGibs preload pass (patch 23, slate C): bih=true forces every mapmodel's
++    // BIH build (and, for alpha-flagged meshes, the alphamask decode - preloadBIH()
++    // already does both, see model.h/animmodel.h) at load time instead of on the first
++    // shot ray that reaches it mid-combat (engine/bih.cpp mmintersect/triintersect).
++    preloadusedmapmodels(true, true);
+ 
+     game::preload();
+     flushpreloadedmodels();
+Binary files /tmp/sg-pw1-pristine/engine/worldio.o and /tmp/sg-pw1-work/engine/worldio.o differ
+Binary files /tmp/sg-pw1-pristine/fpsgame/ai.o and /tmp/sg-pw1-work/fpsgame/ai.o differ
+Binary files /tmp/sg-pw1-pristine/fpsgame/client.o and /tmp/sg-pw1-work/fpsgame/client.o differ
+--- a/fpsgame/ctf.h
++++ b/fpsgame/ctf.h
+@@ -513,6 +513,24 @@
+         }
+         static const int sounds[] = { S_FLAGPICKUP, S_FLAGDROP, S_FLAGRETURN, S_FLAGSCORE, S_FLAGRESET, S_FLAGFAIL };
+         loopi(sizeof(sounds)/sizeof(sounds[0])) preloadsound(sounds[i]);
++        // SwiftGibs preload pass (patch 23, slate C): drawhud()/drawblip() settexture()
++        // these on the FIRST frame the radar/blips are actually drawn (radar.png every
++        // frame; the flag-blip variants at the first flag pickup) - warm the cache here
++        // instead so that first draw is a hash hit, not a synchronous disk read + PNG
++        // decode + glTexImage on the render thread.
++        static const char * const hudtexnames[] = {
++            "packages/hud/radar.png", "packages/hud/compass.png",
++            "packages/hud/blip_neutral.png", "packages/hud/blip_neutral_flag.png",
++            "packages/hud/blip_blue.png", "packages/hud/blip_blue_flag.png",
++            "packages/hud/blip_red.png", "packages/hud/blip_red_flag.png"
++        };
++        sgpreloadsweep = true;
++        loopi((int)(sizeof(hudtexnames)/sizeof(hudtexnames[0])))
++        {
++            settexture(hudtexnames[i], 3);
++            if(sgpreloadstats) sgpreload_ctf++;
++        }
++        sgpreloadsweep = false;
+     }
+ 
+     void drawblip(fpsent *d, float x, float y, float s, const vec &pos, bool flagblip)
+Binary files /tmp/sg-pw1-pristine/fpsgame/entities-standalone.o and /tmp/sg-pw1-work/fpsgame/entities-standalone.o differ
+Binary files /tmp/sg-pw1-pristine/fpsgame/entities.o and /tmp/sg-pw1-work/fpsgame/entities.o differ
+--- a/fpsgame/fps.cpp
++++ b/fpsgame/fps.cpp
+@@ -1177,6 +1177,10 @@
+             execident("intermission");
+ 
+             fpsstatsmatchend();   // SwiftGibs: console summary + log row + recent-results entry
++
++            // SwiftGibs preload pass (patch 23, slate C): print what got warmed at map
++            // start vs what still had to load lazily during this match (debug only).
++            if(sgpreloadstats) sgpreloadstatsreport();
+         }
+     }
+ 
+Binary files /tmp/sg-pw1-pristine/fpsgame/fps.o and /tmp/sg-pw1-work/fpsgame/fps.o differ
+Binary files /tmp/sg-pw1-pristine/fpsgame/game.h.gch and /tmp/sg-pw1-work/fpsgame/game.h.gch differ
+Binary files /tmp/sg-pw1-pristine/fpsgame/monster.o and /tmp/sg-pw1-work/fpsgame/monster.o differ
+Binary files /tmp/sg-pw1-pristine/fpsgame/movable.o and /tmp/sg-pw1-work/fpsgame/movable.o differ
 --- a/fpsgame/render.cpp
 +++ b/fpsgame/render.cpp
-@@ -339,20 +339,23 @@
+@@ -121,6 +121,21 @@
+                 if(mdl->purpleteam) preloadmodel(mdl->purpleteam);
+             }
+             else preloadmodel(mdl->ffa);
++            // SwiftGibs preload pass (patch 23, slate C): the hitbox-models patch always
++            // supersedes the stock/team skin above with one of these 4 flat colour
++            // variants at render time ("%s/%s" with mdl.ffa/fc, see renderplayer() below)
++            // - preload them too so the first sighting of each colour doesn't do a
++            // synchronous loadmodel() mid-combat.
++            {
++                static const char * const flatskins[] = { "flatblue", "flatcyan", "flatred", "flatorange" };
++                loopj(4)
++                {
++                    string flatname;
++                    formatstring(flatname, "%s/%s", mdl->ffa, flatskins[j]);
++                    preloadmodel(flatname);
++                    if(sgpreloadstats) sgpreload_flatmodels++;
++                }
++            }
+             if(mdl->vwep) preloadmodel(mdl->vwep);
+             if(mdl->quad) preloadmodel(mdl->quad);
+             loopj(3) if(mdl->armour[j]) preloadmodel(mdl->armour[j]);
+@@ -339,20 +354,23 @@
              if(teamskins || m_teammode) team = isteam(teamviewplayer()->team, d->team) ? 1 : 2;
              renderplayer(d, getplayermodelinfo(d), team, 1, mainpass);
  
@@ -8,11 +389,17 @@
 -            float dist = dir.magnitude();
 -            dir.div(dist);
 -            if(d->state!=CS_EDITING && raycube(camera1->o, dir, dist, 0) < dist)
-+            if(mainpass)
-             {
+-            {
 -                d->info[0] = '\0';
 -                continue;
 -            }
+-
+-            copystring(d->info, colorname(d));
+-            if(d->state!=CS_DEAD)
++            if(mainpass)
+             {
+-                float offset = renderstatusbars(d, team);
+-                renderstatusicons(d, team, offset);
 +                vec dir = vec(d->o).sub(camera1->o);
 +                float dist = dir.magnitude();
 +                dir.div(dist);
@@ -21,12 +408,7 @@
 +                    d->info[0] = '\0';
 +                    continue;
 +                }
- 
--            copystring(d->info, colorname(d));
--            if(d->state!=CS_DEAD)
--            {
--                float offset = renderstatusbars(d, team);
--                renderstatusicons(d, team, offset);
++
 +                copystring(d->info, colorname(d));
 +                if(d->state!=CS_DEAD)
 +                {
@@ -36,3 +418,91 @@
              }
          }
          loopv(ragdolls)
+@@ -571,12 +589,42 @@
+         for(int i = S_BURN; i <= S_HIT; i++) preloadsound(i);
+     }
+ 
++    // SwiftGibs preload pass (patch 23, slate C): the fixed set of swiftgibs/* named
++    // sounds (killstreak, respawn pips, reload metronome ticks/ding) never went through
++    // preloadsounds() above (that only covers the stock S_* enum range) - they loaded on
++    // first use instead, mid-match, at the exact moment they're gameplay-salient. Also
++    // pre-warms the pitched-sound cache for whichever hit/fire/reload sound + pitch is
++    // currently configured, mirroring the real gate at each call site (weapon.cpp) so we
++    // only pay for combinations that will actually play.
++    void preloadswiftgibssounds()
++    {
++        static const char * const simplenames[] = {
++            "swiftgibs/streak", "swiftgibs/respawncount", "swiftgibs/respawnready",
++            "swiftgibs/tick_lo", "swiftgibs/tick_mid", "swiftgibs/tick_hi", "swiftgibs/ding"
++        };
++        loopi((int)(sizeof(simplenames)/sizeof(simplenames[0])))
++        {
++            preloadsoundname(simplenames[i], 100);
++            if(sgpreloadstats) sgpreload_sounds++;
++        }
++
++        extern int hitsound, hitsoundvol, hitsoundpitch;
++        extern const char *hitsndname();
++        extern int firesoundvol, firesoundpitch, reloadsoundvol, reloadsoundpitch;
++        extern int firesoundsel(), reloadsoundsel();
++        extern const char *firesndname(), *reloadsndname();
++        if(hitsound && hitsoundvol>0 && hitsoundpitch!=100) { preloadpitched(hitsndname(), hitsoundpitch); if(sgpreloadstats) sgpreload_pitched++; }
++        if(firesoundsel() && firesoundvol>0 && firesoundpitch!=100) { preloadpitched(firesndname(), firesoundpitch); if(sgpreloadstats) sgpreload_pitched++; }
++        if(reloadsoundsel() && reloadsoundvol>0 && reloadsoundpitch!=100) { preloadpitched(reloadsndname(), reloadsoundpitch); if(sgpreloadstats) sgpreload_pitched++; }
++    }
++
+     void preload()
+     {
+         if(hudgun) preloadweapons();
+         preloadbouncers();
+         preloadplayermodel();
+         preloadsounds();
++        preloadswiftgibssounds();
+         entities::preloadentities();
+         if(m_sp) preloadmonsters();
+     }
+Binary files /tmp/sg-pw1-pristine/fpsgame/render.o and /tmp/sg-pw1-work/fpsgame/render.o differ
+Binary files /tmp/sg-pw1-pristine/fpsgame/scoreboard.o and /tmp/sg-pw1-work/fpsgame/scoreboard.o differ
+Binary files /tmp/sg-pw1-pristine/fpsgame/server-standalone.o and /tmp/sg-pw1-work/fpsgame/server-standalone.o differ
+Binary files /tmp/sg-pw1-pristine/fpsgame/server.o and /tmp/sg-pw1-work/fpsgame/server.o differ
+Binary files /tmp/sg-pw1-pristine/fpsgame/sghttp.o and /tmp/sg-pw1-work/fpsgame/sghttp.o differ
+Binary files /tmp/sg-pw1-pristine/fpsgame/waypoint.o and /tmp/sg-pw1-work/fpsgame/waypoint.o differ
+Binary files /tmp/sg-pw1-pristine/fpsgame/weapon.o and /tmp/sg-pw1-work/fpsgame/weapon.o differ
+Binary files /tmp/sg-pw1-pristine/sauer_client and /tmp/sg-pw1-work/sauer_client differ
+Binary files /tmp/sg-pw1-pristine/sauer_server and /tmp/sg-pw1-work/sauer_server differ
+Binary files /tmp/sg-pw1-pristine/shared/crypto-standalone.o and /tmp/sg-pw1-work/shared/crypto-standalone.o differ
+Binary files /tmp/sg-pw1-pristine/shared/crypto.o and /tmp/sg-pw1-work/shared/crypto.o differ
+Binary files /tmp/sg-pw1-pristine/shared/cube.h.gch and /tmp/sg-pw1-work/shared/cube.h.gch differ
+Binary files /tmp/sg-pw1-pristine/shared/geom.o and /tmp/sg-pw1-work/shared/geom.o differ
+Binary files /tmp/sg-pw1-pristine/shared/glemu.o and /tmp/sg-pw1-work/shared/glemu.o differ
+--- a/shared/iengine.h
++++ b/shared/iengine.h
+@@ -583,6 +583,23 @@
+ extern int clips;                                               // SwiftGibs instant replay on/off
+ extern bool benchmeasuring;                                     // SwiftGibs benchmark mode (patch 22): limitfps() no-ops while this is set
+ 
++// SwiftGibs preload pass (patch 23, slate C): sgpreloadstats (0/1, VAR) counts what got
++// warmed at map start (sgpreload_*) vs what still loaded lazily during play (sglazy_*),
++// so a scripted before/after run can prove a preload eliminated the mid-match hitch it
++// targets. sgpreloadstatsreport() prints both sets at intermission (fpsgame/fps.cpp).
++extern int sgpreloadstats;
++extern int sgpreload_flatmodels, sgpreload_mapmodelbih, sgpreload_particles,
++           sgpreload_sounds, sgpreload_pitched, sgpreload_ctf;
++extern int sglazy_flatmodel, sglazy_mapmodelbih, sglazy_alphamask, sglazy_particle,
++           sglazy_hud, sglazy_sound, sglazy_pitched;
++extern void sgpreloadstatsreport();
++extern bool sgpreloadsweep;   // engine/rendermodel.cpp: true while a preload sweep is
++                              // actively loading (flushpreloadedmodels(), CTF/capture/
++                              // collect texture warms) so lazy-hit counters can tell a
++                              // preload's own first-time load apart from a real mid-match miss.
++extern void preloadsoundname(const char *name, int vol);  // engine/sound.cpp: preload-time playsoundname() equivalent, never plays
++extern void preloadpitched(const char *name, int pitch);  // engine/sound.cpp: preload-time playsoundpitched() cache warm, never plays
++
+ // crypto
+ extern void genprivkey(const char *seed, vector<char> &privstr, vector<char> &pubstr);
+ extern bool calcpubkey(const char *privstr, vector<char> &pubstr);
+Binary files /tmp/sg-pw1-pristine/shared/stream-standalone.o and /tmp/sg-pw1-work/shared/stream-standalone.o differ
+Binary files /tmp/sg-pw1-pristine/shared/stream.o and /tmp/sg-pw1-work/shared/stream.o differ
+Binary files /tmp/sg-pw1-pristine/shared/tools-standalone.o and /tmp/sg-pw1-work/shared/tools-standalone.o differ
+Binary files /tmp/sg-pw1-pristine/shared/tools.o and /tmp/sg-pw1-work/shared/tools.o differ
+Binary files /tmp/sg-pw1-pristine/shared/zip.o and /tmp/sg-pw1-work/shared/zip.o differ
