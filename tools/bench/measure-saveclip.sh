@@ -38,8 +38,14 @@ N_SAVES=5
 
 cleanup() {
   # exec-captured PIDs only (never pkill -f - project-wide hard rule, see make-workload.sh's own
-  # comment for the incident this rule exists because of).
-  kill "${BPID:-0}" "${APID:-0}" "${SERVERPID:-0}" 2>/dev/null || true
+  # comment for the incident this rule exists because of). Each PID is guarded individually and
+  # NEVER defaulted to 0 - kill(0, sig) targets the entire current process group, so a bare
+  # `kill "${BPID:-0}"` on a not-yet-set var would SIGTERM the caller (this script's own parent
+  # shell) if cleanup ran before the PIDs were assigned (e.g. a build failure under `set -e`
+  # firing the EXIT trap early). Only kill a PID that was actually captured.
+  [ -n "${BPID:-}" ] && kill "$BPID" 2>/dev/null || true
+  [ -n "${APID:-}" ] && kill "$APID" 2>/dev/null || true
+  [ -n "${SERVERPID:-}" ] && kill "$SERVERPID" 2>/dev/null || true
 }
 trap cleanup EXIT
 

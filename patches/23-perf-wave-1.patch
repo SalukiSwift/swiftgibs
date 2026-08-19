@@ -749,7 +749,7 @@
          for(int i = starti; i < idx.length(); i++)
          {
              // Only the STARTING keyframe carries the full synthesised welcome bundle - a
-@@ -2305,15 +2710,124 @@
+@@ -2305,15 +2710,146 @@
              stamp[1] = idx[i].chan == CLIPCHAN_KEYFRAME ? 1 : idx[i].chan;
              stamp[2] = idx[i].len;
              lilswap(stamp, 3);
@@ -851,14 +851,28 @@
 +
 +        delete[] filebuf;
 +
-+        if(!oldok || !newok) { conoutf("sgclipdeterminism: write failed (old=%d new=%d)", (int)oldok, (int)newok); return; }
++        if(!oldok || !newok)
++        {
++            conoutf("sgclipdeterminism: write failed (old=%d new=%d)", (int)oldok, (int)newok);
++            remove(findfile(path(relpatha, true), "wb"));
++            remove(findfile(path(relpathb, true), "wb"));
++            return;
++        }
 +
 +        // Byte-compare via plain stdio (both files are on-disk gzip streams - compare the raw
 +        // compressed bytes directly, not their decompressed content, since determinism means
 +        // "the two code paths emit the identical compressed byte stream").
 +        FILE *fa = fopen(findfile(path(relpatha, true), "rb"), "rb");
 +        FILE *fb = fopen(findfile(path(relpathb, true), "rb"), "rb");
-+        if(!fa || !fb) { conoutf("sgclipdeterminism: could not reopen output files for comparison"); if(fa) fclose(fa); if(fb) fclose(fb); return; }
++        if(!fa || !fb)
++        {
++            conoutf("sgclipdeterminism: could not reopen output files for comparison");
++            if(fa) fclose(fa);
++            if(fb) fclose(fb);
++            remove(findfile(path(relpatha, true), "wb"));
++            remove(findfile(path(relpathb, true), "wb"));
++            return;
++        }
 +        fseek(fa, 0, SEEK_END); long sizea = ftell(fa); fseek(fa, 0, SEEK_SET);
 +        fseek(fb, 0, SEEK_END); long sizeb = ftell(fb); fseek(fb, 0, SEEK_SET);
 +        bool match = sizea == sizeb && sizea >= 0;
@@ -872,13 +886,21 @@
 +        }
 +        fclose(fa); fclose(fb);
 +
++        // Debug-only scratch output, not a real clip - delete both so they never linger in the
++        // clips folder (they would otherwise show up in the clips menu/playclip listing).
++        // findfile() with the SAME "wb" mode used to create them deterministically reconstructs
++        // the identical path (homedir+filename, or bare filename with no homedir) - no search
++        // ambiguity, matches the original write-time resolution exactly.
++        remove(findfile(path(relpatha, true), "wb"));
++        remove(findfile(path(relpathb, true), "wb"));
++
 +        if(match) conoutf("sgclipdeterminism: MATCH (%ld bytes)", sizea);
 +        else conoutf("sgclipdeterminism: MISMATCH (oldsize=%ld newsize=%ld)", sizea, sizeb);
 +    });
      // === end SwiftGibs instant replay: keyframes + clip writing =============================
  
      // ---- SwiftGibs benchmark mode (patch 22) ----
-@@ -2802,14 +3316,21 @@
+@@ -2802,14 +3338,21 @@
  
      struct cliprecorder
      {
@@ -903,7 +925,7 @@
      static bool cliprecordarmed = false;   // set by cliprecordarmmatchstart() (fpsgame/fps.cpp startgame()
                                              // hook); consumed on the very next c2sinfo() tick, once the
                                              // whole welcome bundle for a fresh match (incl. the item list,
-@@ -2830,10 +3351,22 @@
+@@ -2830,10 +3373,22 @@
      // cliprecordwasactivematch() below - never on the per-frame path.
      static bool cliprecordseenthismatch = false;
  
@@ -928,7 +950,7 @@
      // Opens <clipdir>/<timestamp>_<map>_<mode>_rec-<label>.dmo (same gzipped stock demo format
      // saveclip() writes: 24-byte header, then {ms,chan,len} stamps + payload), starts the
      // engine-side sink buffer for `slot`, and seeds it with ONE synthesised opening keyframe
-@@ -2844,7 +3377,7 @@
+@@ -2844,7 +3399,7 @@
      // ordinary capture path (cliprecord()'s fan-out), same as the ring.
      static void startcliprecorder(cliprecorder &r, int slot, const char *label)
      {
@@ -937,7 +959,7 @@
  
          string mapname, mode, sstime;
          clipsanitize(mapname, sizeof(mapname), clientmap, "map");
-@@ -2854,17 +3387,35 @@
+@@ -2854,17 +3409,35 @@
          sstime[min(tlen, sizeof(sstime)-1)] = '\0';
          defformatstring(relpath, "%s%s%s_%s_%s_rec-%s.dmo", clipdir, clipdir[0] ? "/" : "", sstime, mapname, mode, label);
  
@@ -956,8 +978,7 @@
 -        f->write(&hdr, sizeof(demoheader));
 +        uchar *hdrbuf = new uchar[sizeof(demoheader)];
 +        memcpy(hdrbuf, &hdr, sizeof(demoheader));
- 
--        r.f = f;
++
 +        sgclipjob job = {};
 +        job.kind = SGCLIPJOB_RECOPEN;
 +        job.slot = slot;
@@ -973,12 +994,13 @@
 +            conoutf("record: writer busy, could not start (%s)", label);
 +            return;
 +        }
-+
+ 
+-        r.f = f;
 +        r.active = true;
          copystring(r.relpath, relpath);
          r.basems = -1;
          r.lastms = 0;
-@@ -2876,7 +3427,8 @@
+@@ -2876,7 +3449,8 @@
          writeclipwelcome(p);
          clipsinkput(slot, CLIPCHAN_KEYFRAME, p.buf, p.len);
  
@@ -988,7 +1010,7 @@
      }
  
      // A map-change finalise (cliprecordfinalizeall("map change"), called from the TOP of
-@@ -2910,7 +3462,7 @@
+@@ -2910,7 +3484,7 @@
      // that caused this finalise in the first place, never legitimate history.
      static void flushcliprecorder(cliprecorder &r, int slot, bool trimtrailingmapchange = false)
      {
@@ -997,7 +1019,7 @@
          vector<clipentry> idx;
          if(!clipsinkindex(slot, idx)) return;   // nothing buffered since the last flush - normal, no IO
          const uchar *data = clipsinkdata(slot);
-@@ -2920,23 +3472,64 @@
+@@ -2920,23 +3494,64 @@
              clipentry &last = idx[count-1];
              if(last.chan == 1 && isleadingmapchange(&data[last.offset], last.len)) count--;
          }
@@ -1023,18 +1045,9 @@
 -                r.wrotekeyframe = true;
 +                if(localwrote) continue;
 +                localwrote = true;
-             }
--            if(r.basems < 0) r.basems = idx[i].ms;
--            int stamp[3];
--            stamp[0] = idx[i].ms - r.basems;
--            stamp[1] = idx[i].chan == CLIPCHAN_KEYFRAME ? 1 : idx[i].chan;
--            stamp[2] = idx[i].len;
--            lilswap(stamp, 3);
--            r.f->write(stamp, sizeof(stamp));
--            if(idx[i].len) r.f->write(&data[idx[i].offset], idx[i].len);
--            r.lastms = idx[i].ms;
++            }
 +            totalbytes += stampsize + idx[i].len;
-         }
++        }
 +
 +        if(totalbytes > 0)
 +        {
@@ -1067,13 +1080,22 @@
 +            {
 +                delete[] buf;
 +                conoutf("record: writer busy, dropped a buffered segment (%s)", r.relpath);
-+            }
-+        }
+             }
+-            if(r.basems < 0) r.basems = idx[i].ms;
+-            int stamp[3];
+-            stamp[0] = idx[i].ms - r.basems;
+-            stamp[1] = idx[i].chan == CLIPCHAN_KEYFRAME ? 1 : idx[i].chan;
+-            stamp[2] = idx[i].len;
+-            lilswap(stamp, 3);
+-            r.f->write(stamp, sizeof(stamp));
+-            if(idx[i].len) r.f->write(&data[idx[i].offset], idx[i].len);
+-            r.lastms = idx[i].ms;
+         }
 +
          clipsinkreset(slot);   // the trimmed trailing record (if any) is simply discarded, never
                                  // written anywhere - correct: it belongs to the NEXT match, which
                                  // gets its own proper (synthesised-keyframe) opening instead, and
-@@ -2983,25 +3576,12 @@
+@@ -2983,25 +3598,12 @@
          }
      }
  
@@ -1105,7 +1127,7 @@
  
      // === SwiftGibs instant replay: clip folder listing (playback discoverability fix) =======
      // April's playtest-1 bug: clips land in clipdir, but neither the stock `demo` command nor
-@@ -3111,13 +3691,39 @@
+@@ -3111,13 +3713,39 @@
      // through here rather than leaving a file open, unflushed, or lost.
      static void finishcliprecorder(cliprecorder &r, int slot, const char *label, const char *reason)
      {
@@ -1150,7 +1172,7 @@
      }
  
      // Finalises WHATEVER is currently running (manual and/or auto - each no-ops independently
-@@ -3133,7 +3739,7 @@
+@@ -3133,7 +3761,7 @@
      // Manual start/stop (a named, bindable action - F9 by default, see overlay/autoexec.cfg).
      void togglerecord()
      {
