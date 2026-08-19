@@ -1,6 +1,5 @@
-diff -ruN /tmp/sg-bench-209564-pristine/engine/main.cpp /tmp/sg-bench-209564-work/engine/main.cpp
---- a/engine/main.cpp	2026-08-18 23:49:14.954060048 +0100
-+++ b/engine/main.cpp	2026-08-19 04:30:20.090414159 +0100
+--- a/engine/main.cpp
++++ b/engine/main.cpp
 @@ -1058,6 +1058,7 @@
  
  void limitfps(int &millis, int curmillis)
@@ -17,10 +16,9 @@ diff -ruN /tmp/sg-bench-209564-pristine/engine/main.cpp /tmp/sg-bench-209564-wor
          // SwiftGibs deterministic export capture: while (and only while) a clip export is
          // capturing, this paces the loop to the export's own frame rate and returns the exact
          // game-time step this frame must advance by, so every captured frame lands on an exact
-diff -ruN /tmp/sg-bench-209564-pristine/fpsgame/client.cpp /tmp/sg-bench-209564-work/fpsgame/client.cpp
---- a/fpsgame/client.cpp	2026-08-18 23:49:14.959890692 +0100
-+++ b/fpsgame/client.cpp	2026-08-19 04:30:20.091660466 +0100
-@@ -1,6 +1,17 @@
+--- a/fpsgame/client.cpp
++++ b/fpsgame/client.cpp
+@@ -1,6 +1,23 @@
  #include "game.h"
  #include "processpipe.h" // SwiftGibs clip export (Task 3): found via -Iengine on the include path (Makefile); a plain, self-contained header (no engine.h needed for the processpipe TYPE itself - see shared/iengine.h for the recorder:: functions this file also calls)
  
@@ -32,13 +30,19 @@ diff -ruN /tmp/sg-bench-209564-pristine/fpsgame/client.cpp /tmp/sg-bench-209564-
 +// - benchmeasuring is read by limitfps() (engine/main.cpp, also global scope) via the
 +//   `extern bool benchmeasuring;` in shared/iengine.h; defining it inside namespace game
 +//   would silently create a distinct game::benchmeasuring and fail to link.
++// - minimized is engine/main.cpp's own global-scope flag (true while the window is
++//   minimized); benchframe() below polls it directly during MEASURING to poison, not
++//   silently record, a pass captured while minimized. Same file-scope-extern reasoning as
++//   quit()/benchmeasuring above - inside namespace game this would declare a distinct,
++//   unresolvable game::minimized.
 +extern void quit();
++extern bool minimized;
 +bool benchmeasuring = false;
 +
  namespace game
  {
      VARP(minradarscale, 0, 384, 10000);
-@@ -2299,6 +2310,272 @@
+@@ -2299,6 +2316,290 @@
      COMMAND(saveclip, "");
      // === end SwiftGibs instant replay: keyframes + clip writing =============================
  
@@ -94,6 +98,14 @@ diff -ruN /tmp/sg-bench-209564-pristine/fpsgame/client.cpp /tmp/sg-bench-209564-
 +    // - On failure (missing file, playback never starts, disconnect before demoend, zero frames
 +    //   captured): print "BENCH ERROR: <reason>" and quit() anyway - runners detect success by
 +    //   CSV row growth, not by exit code.
++    // - Minimized window: the vendor main loop still calls game::benchframe() every
++    //   iteration even while minimized (engine/main.cpp's own `if(minimized) continue;`
++    //   only skips the render/swapbuffers call further down, not the top of the loop) - a
++    //   minimized window spins render-free and would otherwise silently inflate the pass
++    //   with garbage near-zero-render-cost deltas. If a frame is captured (see Window,
++    //   above) while `minimized` is true, the whole pass is poisoned instead: print
++    //   "BENCH ERROR: window minimized during measurement" and quit() with NO CSV row -
++    //   same failure contract as the other BENCH ERROR cases above.
 +    //
 +    // benchmeasuring itself is defined at TRUE FILE SCOPE, above namespace game's opening brace -
 +    // see the comment up there for why.
@@ -195,6 +207,16 @@ diff -ruN /tmp/sg-bench-209564-pristine/fpsgame/client.cpp /tmp/sg-bench-209564-
 +        double sincestart = double(now - benchstartticks) * 1000.0 / double(freq);
 +        if(sincestart >= 2000.0 && benchlastticks)
 +        {
++            if(minimized)
++            {
++                // Poison the whole pass rather than silently recording a render-free,
++                // spun-free frame delta - see the "Minimized window" measurement rule above.
++                bencharmed = false;
++                benchmeasuring = false;
++                conoutf("BENCH ERROR: window minimized during measurement");
++                quit();
++                return;
++            }
 +            double deltams = double(now - benchlastticks) * 1000.0 / double(freq);
 +            if(benchcount < BENCHCAP) benchframes_ms[benchcount++] = float(deltams);
 +            else benchtruncated = true;
@@ -311,9 +333,8 @@ diff -ruN /tmp/sg-bench-209564-pristine/fpsgame/client.cpp /tmp/sg-bench-209564-
      // === SwiftGibs clip POV scan (QoL batch: export from another player's POV) ==============
      //
      // Bounded, read-only scan of a clip/recording's opening keyframe (writeclipwelcome(),
-diff -ruN /tmp/sg-bench-209564-pristine/shared/iengine.h /tmp/sg-bench-209564-work/shared/iengine.h
---- a/shared/iengine.h	2026-08-18 23:49:14.959470896 +0100
-+++ b/shared/iengine.h	2026-08-19 04:30:20.090113913 +0100
+--- a/shared/iengine.h
++++ b/shared/iengine.h
 @@ -581,6 +581,7 @@
  extern int vsync;
  extern int bilinear;
@@ -322,9 +343,8 @@ diff -ruN /tmp/sg-bench-209564-pristine/shared/iengine.h /tmp/sg-bench-209564-wo
  
  // crypto
  extern void genprivkey(const char *seed, vector<char> &privstr, vector<char> &pubstr);
-diff -ruN /tmp/sg-bench-209564-pristine/shared/igame.h /tmp/sg-bench-209564-work/shared/igame.h
---- a/shared/igame.h	2026-08-18 23:49:14.959367797 +0100
-+++ b/shared/igame.h	2026-08-19 04:30:20.090216663 +0100
+--- a/shared/igame.h
++++ b/shared/igame.h
 @@ -51,6 +51,7 @@
  
      extern void updateworld();
