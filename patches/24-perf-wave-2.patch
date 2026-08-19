@@ -1,3 +1,14 @@
+--- a/engine/engine.h
++++ b/engine/engine.h
+@@ -126,7 +126,7 @@
+ }
+ 
+ // rendergl
+-extern bool hasVAO, hasFBO, hasAFBO, hasDS, hasTF, hasTRG, hasTSW, hasS3TC, hasFXT1, hasLATC, hasRGTC, hasAF, hasFBB, hasUBO, hasMBR;
++extern bool hasVAO, hasFBO, hasAFBO, hasDS, hasTF, hasTRG, hasTSW, hasS3TC, hasFXT1, hasLATC, hasRGTC, hasAF, hasFBB, hasUBO, hasMBR, hasSync;   // hasSync (patch 24 wave 2, GPU back-pressure): GL_ARB_sync availability, detected once in gl_checkextensions()
+ extern int glversion, glslversion, glcompat;
+ 
+ enum { DRAWTEX_NONE = 0, DRAWTEX_ENVMAP, DRAWTEX_MINIMAP, DRAWTEX_MODELPREVIEW };
 --- a/engine/main.cpp
 +++ b/engine/main.cpp
 @@ -81,7 +81,7 @@
@@ -17,7 +28,103 @@
      if(interceptkeysym) clearinterceptkey();
      //int lasttype = 0, lastbut = 0;
      bool mousemoved = false;
-@@ -1061,11 +1062,179 @@
+@@ -1051,21 +1052,275 @@
+     if(mousemoved) resetmousemotion();
+ }
+ 
++// SwiftGibs GPU back-pressure at swap (patch 24, perf wave 2 component 4). DEFAULT OFF -
++// sggpumaxqueue 0 touches nothing added below; swapbuffers() calls SDL_GL_SwapWindow()
++// exactly as before this existed, with only cheap `if(sggpumaxqueue)`-guarded branches
++// (all false) added to its body.
++//
++// Why: SDL_GL_SwapWindow() only REQUESTS a buffer swap - it does not itself block until the
++// GPU has actually finished the frame it just queued (crawl finding 40). A GPU-bound scene
++// can let the driver buffer several frames' worth of submitted work before the CPU is ever
++// made to wait on one, which adds input-to-photon latency the frame limiter cannot see or
++// pace (limitfps paces CPU-side submission timing, not GPU completion). sggpumaxqueue bounds
++// that buffering to one frame: after each swap, a fence marks "everything submitted up to
++// and including this swap" GPU-side; the NEXT call to this function waits for that fence -
++// i.e. confirms the PREVIOUS frame's GPU work is entirely finished - before letting this
++// frame's own swap go out, then deletes the fence. The wait is deliberately one frame behind
++// (never waiting on the fence this same call is about to create) so the CPU can keep
++// preparing/submitting the next frame's draw calls while the GPU works through the one
++// before it - a same-frame wait would serialize CPU and GPU completely and cost more
++// throughput than the latency bound is worth.
++//
++// Availability: GL_ARB_sync (core since GL 3.2) is detected ONCE, at boot, in
++// gl_checkextensions() (engine/rendergl.cpp) - the same hasext()/glversion machinery every
++// other optional GL feature in that function uses - into the global `hasSync` bool
++// (declared alongside hasFBO/hasTF/etc, engine/engine.h). If absent, `hasSync` stays false
++// forever and every branch below that would touch a sync object is skipped - the var
++// becomes a permanent no-op. The one-time console note fires lazily, the first time
++// sggpumaxqueue is actually turned on while hasSync is false (not unconditionally at boot),
++// so a player who never touches this var sees no extra log noise for a feature they never
++// engaged - every target GPU for this project has GL_ARB_sync regardless (spec), so this
++// path is a defensive fallback, not an expected case.
++//
++// Timeout: glClientWaitSync is given a bounded 100ms timeout (GL_TIMEOUT_IGNORED is NOT
++// used) - a driver bug or lost context that never signals the fence must cost one
++// slow/late frame, never hang the render loop forever. A timeout or wait failure is noted
++// once (same lazy, one-time console-note convention as the missing-extension case) and
++// otherwise falls through exactly as if the wait had succeeded - this is a best-effort
++// latency bound, not a correctness guarantee.
++//
++// Toggling off: if sggpumaxqueue drops to 0 (or hasSync is false) while a fence from a
++// still-on previous call is pending, it is deleted immediately instead of leaked or waited
++// on again - once off, no further back-pressure is being enforced, so there is nothing left
++// to wait for.
++//
++// GL calls stay on the render path only: swapbuffers() is called from exactly three sites
++// in this codebase - the main loop's render-gated block below (guarded by `if(!shouldrender)
++// continue;` above it, per the sgdecouplefps module comment above - a non-render decouple
++// tick never reaches this function at all) and two loading-screen presentation calls
++// (restorebackground()/renderprogress() earlier in this file, both outside the main loop's
++// per-tick flow entirely, during synchronous map/asset loading) - every call is a real
++// presented frame, never a tick that skipped rendering, so gating this logic inside
++// swapbuffers() itself is sufficient on its own; no separate decouple-awareness was needed.
++VARP(sggpumaxqueue, 0, 0, 1);
++
+ void swapbuffers(bool overlay)
+ {
+     recorder::capture(overlay);
+     gle::disable();
++
++    static GLsync pendingfence = NULL;   // patch 24 component 4: previous frame's fence, if any
++    if(sggpumaxqueue && hasSync)
++    {
++        if(pendingfence)
++        {
++            // bounded wait on the PREVIOUS frame's fence - see the module comment above for
++            // why this is one frame behind, not the frame just about to be submitted.
++            GLenum waitresult = glClientWaitSync_(pendingfence, GL_SYNC_FLUSH_COMMANDS_BIT, 100000000ull);
++            if(waitresult == GL_TIMEOUT_EXPIRED || waitresult == GL_WAIT_FAILED)
++            {
++                static bool warnedtimeout = false;
++                if(!warnedtimeout) { warnedtimeout = true; conoutf(CON_WARN, "sggpumaxqueue: GPU fence wait timed out or failed, continuing without full back-pressure"); }
++            }
++            glDeleteSync_(pendingfence);
++            pendingfence = NULL;
++        }
++    }
++    else if(pendingfence)
++    {
++        // var turned off (or sync unavailable) with a fence still outstanding: delete it
++        // rather than leak the GL object - see the module comment above.
++        glDeleteSync_(pendingfence);
++        pendingfence = NULL;
++    }
++
++    if(sggpumaxqueue && !hasSync)
++    {
++        static bool warnedmissingsync = false;
++        if(!warnedmissingsync) { warnedmissingsync = true; conoutf(CON_WARN, "sggpumaxqueue: GL_ARB_sync not available, ignoring"); }
++    }
++
+     SDL_GL_SwapWindow(screen);
++
++    if(sggpumaxqueue && hasSync) pendingfence = glFenceSync_(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);   // marks everything submitted up to and including this swap
+ }
+  
  VAR(menufps, 0, 60, 1000);
  VARP(maxfps, 0, 200, 1000);
  
@@ -201,7 +308,7 @@
      static int fpserror = 0;
      int delay = 1000/limit - (millis-curmillis);
      if(delay < 0) fpserror = 0;
-@@ -1393,8 +1562,9 @@
+@@ -1393,8 +1648,9 @@
      for(;;)
      {
          static int frames = 0;
@@ -212,7 +319,7 @@
          game::drainclipresults();    // SwiftGibs clip writer thread (Task 2): drains completion/failure
                                        // messages from the background clip/recording writer once per
                                        // frame (no-op unless the writer thread has ever been started)
-@@ -1405,9 +1575,14 @@
+@@ -1405,9 +1661,14 @@
          // happened to be. Returns 0, and does nothing at all, in every other situation. limitfps
          // still runs afterwards and is a no-op at any maxfps at or above the export's frame rate
          // (the delay it computes is already used up); a maxfps BELOW it still wins, and costs the
@@ -229,7 +336,7 @@
          elapsedtime = millis - totalmillis;
          static int timeerr = 0;
          int scaledtime = game::scaletime(elapsedtime) + timeerr;
-@@ -1419,7 +1594,13 @@
+@@ -1419,7 +1680,13 @@
  		lastmillis += curtime;
          totalmillis = millis;
          updatetime();
@@ -244,7 +351,7 @@
          checkinput();
          menuprocess();
          tryedit();
-@@ -1430,22 +1611,82 @@
+@@ -1430,22 +1697,82 @@
  
          serverslice(false, 0);
  
@@ -360,7 +467,56 @@
  
 --- a/engine/rendergl.cpp
 +++ b/engine/rendergl.cpp
-@@ -2025,7 +2025,13 @@
+@@ -2,7 +2,7 @@
+ 
+ #include "engine.h"
+ 
+-bool hasVAO = false, hasFBO = false, hasAFBO = false, hasDS = false, hasTF = false, hasTRG = false, hasTSW = false, hasS3TC = false, hasFXT1 = false, hasLATC = false, hasRGTC = false, hasAF = false, hasFBB = false, hasUBO = false, hasMBR = false;
++bool hasVAO = false, hasFBO = false, hasAFBO = false, hasDS = false, hasTF = false, hasTRG = false, hasTSW = false, hasS3TC = false, hasFXT1 = false, hasLATC = false, hasRGTC = false, hasAF = false, hasFBB = false, hasUBO = false, hasMBR = false, hasSync = false;
+ 
+ VAR(glversion, 1, 0, 0);
+ VAR(glslversion, 1, 0, 0);
+@@ -130,6 +130,15 @@
+ PFNGLGETSTRINGIPROC           glGetStringi_           = NULL;
+ PFNGLBINDFRAGDATALOCATIONPROC glBindFragDataLocation_ = NULL;
+ 
++// GL_ARB_sync (patch 24, perf wave 2 component 4: GPU back-pressure at swap). Function
++// pointers only - loaded via getprocaddress() in gl_checkextensions() below, same
++// unconditional-on-every-platform convention as the GL 3.0 pair just above (sync is new
++// enough that this file already loads GL 3.0 itself the same way on every platform, so
++// sync follows that precedent rather than growing a third loading convention).
++PFNGLFENCESYNCPROC      glFenceSync_      = NULL;
++PFNGLCLIENTWAITSYNCPROC glClientWaitSync_ = NULL;
++PFNGLDELETESYNCPROC     glDeleteSync_     = NULL;
++
+ // GL_EXT_framebuffer_object
+ PFNGLBINDRENDERBUFFERPROC        glBindRenderbuffer_        = NULL;
+ PFNGLDELETERENDERBUFFERSPROC     glDeleteRenderbuffers_     = NULL;
+@@ -396,6 +405,23 @@
+         if(glversion < 300 && dbgexts) conoutf(CON_INIT, "Using GL_ARB_texture_rg extension.");
+     }
+ 
++    // GL_ARB_sync (patch 24, perf wave 2 component 4): checked ONCE here, at extension-
++    // detection time, alongside every other optional feature this function determines - NOT
++    // re-checked per frame or per swapbuffers() call. sggpumaxqueue (engine/main.cpp, above
++    // swapbuffers()) reads hasSync and is a permanent no-op if this stays false; the console
++    // note for that case is deferred to first actual use of the var (swapbuffers()) rather
++    // than printed here unconditionally, so a player who never touches sggpumaxqueue sees no
++    // extra boot-log noise about a feature they never engage - detection is unconditional,
++    // the warning is opt-in-triggered.
++    if(glversion >= 320 || hasext("GL_ARB_sync"))
++    {
++        glFenceSync_      = (PFNGLFENCESYNCPROC)     getprocaddress("glFenceSync");
++        glClientWaitSync_ = (PFNGLCLIENTWAITSYNCPROC)getprocaddress("glClientWaitSync");
++        glDeleteSync_     = (PFNGLDELETESYNCPROC)    getprocaddress("glDeleteSync");
++        hasSync = glFenceSync_ && glClientWaitSync_ && glDeleteSync_;   // defensive: a driver could advertise the extension string without exporting every entry point
++        if(hasSync && glversion < 320 && dbgexts) conoutf(CON_INIT, "Using GL_ARB_sync extension.");
++    }
++
+     if(glversion >= 300 || hasext("GL_ARB_framebuffer_object"))
+     {
+         glBindRenderbuffer_        = (PFNGLBINDRENDERBUFFERPROC)       getprocaddress("glBindRenderbuffer");
+@@ -2025,7 +2051,13 @@
          gle::attrib(m.transform(vec2(0, 0)));
  
          // fade in log space so short blips don't disappear too quickly
@@ -787,6 +943,24 @@
      // === SwiftGibs clip POV scan (QoL batch: export from another player's POV) ==============
      //
      // Bounded, read-only scan of a clip/recording's opening keyframe (writeclipwelcome(),
+--- a/shared/glexts.h
++++ b/shared/glexts.h
+@@ -459,6 +459,15 @@
+ extern PFNGLBINDBUFFERBASEPROC       glBindBufferBase_;
+ extern PFNGLBINDBUFFERRANGEPROC      glBindBufferRange_;
+ 
++// GL_ARB_sync (patch 24, perf wave 2 component 4: GPU back-pressure at swap). The GLsync
++// type and PFNGLFENCESYNCPROC/PFNGLCLIENTWAITSYNCPROC/PFNGLDELETESYNCPROC typedefs already
++// come from <SDL_opengl.h>'s own GL_VERSION_3_2 block (included by shared/cube.h before
++// this header) - only the loaded-function-pointer externs are new here, following the exact
++// pattern of the GL 3.0 pair immediately above.
++extern PFNGLFENCESYNCPROC      glFenceSync_;
++extern PFNGLCLIENTWAITSYNCPROC glClientWaitSync_;
++extern PFNGLDELETESYNCPROC     glDeleteSync_;
++
+ #ifndef GL_VERSION_3_1
+ #define GL_VERSION_3_1 1
+ #define GL_TEXTURE_RECTANGLE              0x84F5
 --- a/shared/iengine.h
 +++ b/shared/iengine.h
 @@ -4,6 +4,7 @@
