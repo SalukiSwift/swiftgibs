@@ -8,10 +8,15 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TREE="${TREE:-}"
 TMP="$(mktemp -d /tmp/sg-skintest-$$-XXXX)"
 trap 'rm -rf "$TMP"' EXIT
-if [ -z "$TREE" ]; then TREE="$TMP/tree"; "$ROOT/build/apply-patches.sh" "$TREE" >/dev/null 2>&1; fi
+if [ -z "$TREE" ]; then
+  TREE="$TMP/tree"
+  "$ROOT/build/apply-patches.sh" "$TREE" > "$TMP/apply.log" 2>&1 || {
+    echo "FAIL: apply-patches.sh failed; last lines:"; tail -20 "$TMP/apply.log"; exit 1; }
+fi
 
-LINE="$(grep -h 'const char \*fc = flatteam' "$TREE/fpsgame/render.cpp" | head -1 | sed 's/^[[:space:]]*//')"
-[ -n "$LINE" ] || { echo "FAIL: could not find the flat-skin decision line in $TREE/fpsgame/render.cpp"; exit 1; }
+MATCHES="$(grep -c 'const char \*fc = flatteam' "$TREE/fpsgame/render.cpp" || true)"
+[ "$MATCHES" = "1" ] || { echo "FAIL: expected exactly 1 flat-skin decision line, found $MATCHES - the test would be testing the wrong line"; exit 1; }
+LINE="$(grep -h 'const char \*fc = flatteam' "$TREE/fpsgame/render.cpp" | sed 's/^[[:space:]]*//')"
 echo "under test: $LINE"
 
 cat > "$TMP/t.cpp" <<CPP
