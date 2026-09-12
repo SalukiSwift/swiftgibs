@@ -5,10 +5,10 @@
              else if(team == 2 && enemyfriendhl) mdlname = mdl.purpleteam;
          }
 +        // SwiftGibs: flat solid team-colour skin for every player -- teammate blue, friend cyan,
-+        // enemy red, friend-on-enemy orange (supersedes the stock/friend skin choice above)
++        // enemy red, friend-on-enemy orange; FFA/1v1 has no teams so friends count as enemies
 +        int flatteam = testteam ? testteam-1 : team;
 +        bool flatfriend = highlightfriends && isfriendname(d->name);
-+        const char *fc = flatteam==1 ? (flatfriend?"flatcyan":"flatblue") : flatteam==2 ? ((flatfriend && enemyfriendhl)?"flatorange":"flatred") : (flatfriend?"flatcyan":"flatred");
++        const char *fc = flatteam==1 ? (flatfriend?"flatcyan":"flatblue") : flatteam==2 ? ((flatfriend && enemyfriendhl)?"flatorange":"flatred") : ((flatfriend && enemyfriendhl)?"flatorange":"flatred");
 +        string flatname;
 +        formatstring(flatname, "%s/%s", mdl.ffa, fc);
 +        mdlname = flatname;
