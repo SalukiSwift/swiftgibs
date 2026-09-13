@@ -14,7 +14,7 @@
      VARP(teamcolorchat, 0, 1, 1);
 --- a/fpsgame/fps.cpp
 +++ b/fpsgame/fps.cpp
-@@ -691,6 +691,107 @@
+@@ -691,6 +691,112 @@
          else flagpopupmillis = 0;
      }
  
@@ -101,6 +101,11 @@
 +        sgendmillis = 0;
 +        sgendtext[0] = '\0';
 +        if(!sgendbanner) return;
++        // No banner for a match this client never saw. Joining a server that is already in
++        // intermission delivers N_MAPCHANGE and N_TIMEUP 0 in one welcome packet: startgame() has
++        // just zeroed maptime, and only updateworld() sets it again, on this map's first frame. A
++        // real match end always arrives after that first frame, so maptime is non-zero there.
++        if(!maptime) return;
 +        vector<const char *> bestteams;
 +        vector<fpsent *> bestplayers;
 +        if(m_teammode) getbestteams(bestteams);
@@ -122,7 +127,7 @@
      // === SwiftGibs career stats file writer (Task 6) ===
      ICOMMAND(writestatsfile, "iiiiiis", (int *m,int *f,int *d,int *dmg,int *sh,int *bs,char *ts),
      {
-@@ -1160,6 +1261,7 @@
+@@ -1160,6 +1266,7 @@
              // the next real match (see the startgame() hook above), not immediately here - there
              // is nothing to capture during intermission itself.
              cliprecordfinalizeall("intermission");
@@ -130,7 +135,7 @@
              player1->attacking = false;
              if(cmode) cmode->gameover();
              conoutf(CON_GAMEINFO, "\f2intermission:");
-@@ -1302,6 +1404,7 @@
+@@ -1302,6 +1409,7 @@
          killstreak = 0;
          matchbeststreak = 0;
          flagpopupmillis = 0;
@@ -138,7 +143,7 @@
          loopv(players) { players[i]->cstreak = 0; players[i]->bstreak = 0; }
  
          setclientmode();
-@@ -2174,11 +2277,41 @@
+@@ -2174,11 +2282,41 @@
          pophudmatrix();
      }
  
