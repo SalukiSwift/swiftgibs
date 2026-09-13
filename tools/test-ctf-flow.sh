@@ -5,6 +5,8 @@
 #   1. end-of-match banner: wording + colour class (sgendbannerresult, fpsgame/fps.cpp)
 #   2. round-end escalation: the clock's whole-second count, the once-per-second beep latch and the
 #      final-minute pulse window (the sgtimercue unit, fpsgame/fps.cpp)
+#   3. flag-not-home warning: the can't-capture decision (sgflagwarnactive, fpsgame/ctf.h) and the
+#      plain-ctf gate its HUD call passes it
 # Usage: [TREE=<patched tree>] tools/test-ctf-flow.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -353,8 +355,88 @@ CPP
   "$TMP/timercue" || return 1
 }
 
+# ---- 3. flag-not-home warning ------------------------------------------------------------------
+# A carrier cannot capture while their own flag is off its stand, so the warning fires only in that
+# moment: plain ctf, carrying the enemy flag, own flag not home (carried or dropped), and strictly
+# closer to its stand than sgflagwarndist. drawhud() gathers those inputs from the real flags and the
+# unit decides, so every other combination must stay quiet, including exactly at the limit. The HUD
+# call must gate on m_ctf_only: protect and hold share ctf.h's drawhud() but score differently, and a
+# plain m_ctf gate would switch the warning on in both.
+flagwarn_test() {
+  echo "== flag-not-home warning =="
+  extract_block "$TREE/fpsgame/ctf.h" "sgflagwarn" "$TMP/flagwarn-unit.inc" || return 1
+  cat > "$TMP/flagwarn.cpp" <<'CPP'
+#include <stdio.h>
+#include <string.h>
+// No engine stand-ins at all: the unit takes plain values. Anything it reaches for (m_ctf_only,
+// sgflagwarndist, flags, the hud player...) is engine state and fails to compile here, which is the point.
+
+#include "flagwarn-unit.inc"
+
+static int ran = 0, bad = 0;
+static void expect(const char *what, bool ctfonly, bool carrying, bool ownhome, float dist, int warndist, bool want)
+{
+    bool got = sgflagwarnactive(ctfonly, carrying, ownhome, dist, warndist);
+    printf("%s %-58s ctf %d carrying %d own home %d, %6g from stand, limit %3d -> %-5s (want %s)\n",
+           got == want ? "  ok  " : "  FAIL", what, ctfonly, carrying, ownhome, dist, warndist, got ? "WARN" : "quiet", want ? "WARN" : "quiet");
+    ran++;
+    if(got != want) bad++;
+}
+
+int main()
+{
+    const int D = 48;   // sgflagwarndist default: 3 x FLAGRADIUS (16), the real capture radius
+    // ---- the can't-cap moment: carrying, own flag away, near its stand ----
+    expect("running in to the stand", true, true, false, 40, D, true);
+    expect("inside the capture radius, where a home flag would score", true, true, false, 15.9f, D, true);
+    expect("standing on the stand", true, true, false, 0, D, true);
+    expect("just inside the limit", true, true, false, 47.99f, D, true);
+    // ---- any one condition missing: quiet ----
+    expect("not plain ctf (another mode, or protect / hold)", false, true, false, 40, D, false);
+    expect("not carrying", true, false, false, 40, D, false);
+    expect("own flag home: the capture works", true, true, true, 40, D, false);
+    expect("far from the stand", true, true, false, 900, D, false);
+    expect("exactly at the limit (strictly less than)", true, true, false, 48, D, false);
+    expect("no own flag found (the gather's home, 1e16 away)", true, true, true, 1e16f, D, false);
+    // ---- the limit is sgflagwarndist over its whole range (16..256) ----
+    expect("limit 16: 15.9 is inside", true, true, false, 15.9f, 16, true);
+    expect("limit 16: exactly 16 is outside", true, true, false, 16, 16, false);
+    expect("limit 256: 48 is inside (a wider limit warns earlier)", true, true, false, 48, 256, true);
+    expect("limit 256: 255.9 is inside", true, true, false, 255.9f, 256, true);
+    expect("limit 256: exactly 256 is outside", true, true, false, 256, 256, false);
+    // ---- all 16 combinations of (plain ctf, carrying, own flag home, near): exactly one warns ----
+    {
+        char got[512] = "";
+        int len = 0;
+        for(int c = 0; c < 16; c++)
+        {
+            bool ctf = c&1, carrying = c&2, ownhome = c&4, near = c&8;
+            if(!sgflagwarnactive(ctf, carrying, ownhome, near ? 20.0f : 100.0f, D)) continue;
+            len += snprintf(got + len, sizeof(got) - len, "%s(ctf %d, carrying %d, own home %d, near %d)", len ? " " : "", ctf, carrying, ownhome, near);
+        }
+        const char *want = "(ctf 1, carrying 1, own home 0, near 1)";
+        bool ok = !strcmp(got, want);
+        printf("%s %-58s -> %s (want %s)\n", ok ? "  ok  " : "  FAIL", "all 16 combinations: only the can't-cap moment warns", len ? got : "none", want);
+        ran++;
+        if(!ok) bad++;
+    }
+
+    if(bad) { printf("FAILED: %d of %d case(s)\n", bad, ran); return 1; }
+    printf("ALL %d CASES PASS\n", ran);
+    return 0;
+}
+CPP
+  g++ -O0 -Wall -fsigned-char -I"$TMP" -o "$TMP/flagwarn" "$TMP/flagwarn.cpp" || { echo "FAIL: flag warning unit did not compile standalone (engine state leaked in?)"; return 1; }
+  "$TMP/flagwarn" || return 1
+  local gated
+  gated="$(tr -d '\r' < "$TREE/fpsgame/ctf.h" | grep -c 'sgflagwarnactive(m_ctf_only, ' || true)"
+  [ "$gated" = "1" ] || { echo "FAIL: expected exactly 1 call gating the unit on m_ctf_only in fpsgame/ctf.h, found $gated - a plain m_ctf gate would warn in protect and hold"; return 1; }
+  echo "  ok   the HUD call gates the unit on m_ctf_only"
+}
+
 FAILED=0
 banner_test || FAILED=1
 timercue_test || FAILED=1
+flagwarn_test || FAILED=1
 [ "$FAILED" = "0" ] || { echo "FAILED: see the FAIL lines above"; exit 1; }
 echo "ALL SECTIONS PASS"

@@ -12,6 +12,120 @@
      }
  
      VARP(teamcolorchat, 0, 1, 1);
+--- a/fpsgame/ctf.h
++++ b/fpsgame/ctf.h
+@@ -3,6 +3,14 @@
+ #define ctfteamflag(s) (!strcmp(s, "good") ? 1 : (!strcmp(s, "evil") ? 2 : 0))
+ #define ctfflagteam(i) (i==1 ? "good" : (i==2 ? "evil" : NULL))
+ 
++#ifndef SERVMODE
++// SwiftGibs match cues (patch 22): flag-not-home warning cvars, drawn by drawflagwarn() below. Client
++// only and outside the struct: the server compiles this file too (fpsgame/server.cpp, SERVMODE) and
++// shares the struct body.
++VARP(sgflagwarn, 0, 1, 1);           // warning on/off
++VARP(sgflagwarndist, 16, 48, 256);   // 3 x FLAGRADIUS: warns on approach, not only on the spot
++#endif
++
+ #ifdef SERVMODE
+ VAR(ctftkpenalty, 0, 1, 1);
+ 
+@@ -544,6 +552,88 @@
+         return (h*(1 + 1 + 10))/(4*10);
+     }
+ 
++    // === SwiftGibs match cues (patch 22, CTF match-flow round): in-play flag cues ===============
++    // Design: docs/superpowers/specs/2026-09-13-ctf-match-flow-design.md (untracked locally). The cues
++    // follow drawhud()'s d (hudplayer(): the local player, or the player a spectator follows), the same
++    // player as the stock carried-flag icon, so following a carrier shows that carrier's cues.
++    // Presentation only: they read flag state every client already has.
++    //
++    // Flag-not-home warning: in plain ctf a carrier scores only by touching their own flag while it is
++    // home (the server's takeflag() returns a dropped one instead, and nobody can touch a carried one),
++    // so a carrier who runs in to their stand while their own flag is carried off or lying dropped gets
++    // one pulsing line under the crosshair instead of a silent non-capture. The cvars are at the top of
++    // this file.
++
++    // sgflagwarn: begin pure unit - tools/test-ctf-flow.sh compiles this block on its own, so it must stay free of engine state
++    // True in the can't-capture moment. ctfonly: m_ctf_only (protect and hold share this code but score
++    // differently). carrying: d carries an enemy flag. ownflaghome: d's own flag is on its stand.
++    // diststand: from d's feet to that stand. warndist: sgflagwarndist, and only strictly closer warns.
++    static bool sgflagwarnactive(bool ctfonly, bool carrying, bool ownflaghome, float diststand, int warndist)
++    {
++        return ctfonly && carrying && !ownflaghome && diststand < warndist;
++    }
++    // sgflagwarn: end pure unit
++
++    // d's flags as the in-play cues read them, gathered once per drawhud() call by drawflagcues().
++    struct sgflagstate
++    {
++        int carried;     // index in flags of the enemy flag d carries, -1 = none
++        int own;         // index of d's own team's flag, -1 = none (on a map with several, the stand nearest d)
++        bool ownhome;    // that flag is on its stand: nobody carries it and it is not dropped
++        float owndist;   // distance from d's feet to that stand (its spawnloc)
++    };
++
++    void sggetflagstate(fpsent *d, sgflagstate &st)
++    {
++        st.carried = st.own = -1;
++        st.ownhome = true;
++        st.owndist = 1e16f;
++        // A flag's team is 1 (good) or 2 (evil), the numbers ctfteamflag() gives a player's team, so
++        // f.team == ctfteamflag(d->team) is d's own flag: the same comparison checkitems() and aicheck()
++        // below and the server's takeflag() make.
++        int team = ctfteamflag(d->team);
++        vec feet = d->feetpos();   // checkitems() measures the capture from the feet too
++        loopv(flags)
++        {
++            flag &f = flags[i];
++            if(!ctfflagteam(f.team)) continue;
++            if(f.team != team) { if(f.owner == d) st.carried = i; continue; }
++            float dist = feet.dist(f.spawnloc);
++            if(st.own >= 0 && dist >= st.owndist) continue;
++            st.own = i;
++            st.ownhome = !f.owner && !f.droptime;
++            st.owndist = dist;
++        }
++    }
++
++    void drawflagwarn(fpsent *d, const sgflagstate &st, int w, int h)
++    {
++        if(!sgflagwarn || d->state != CS_ALIVE || intermission) return;
++        if(!sgflagwarnactive(m_ctf_only, st.carried >= 0, st.ownhome, st.owndist, sgflagwarndist)) return;
++        const char *msg = "YOUR FLAG IS NOT HOME - CANNOT CAPTURE";
++        int tw, th;
++        text_bounds(msg, tw, th);
++        // A gentle pulse, never a blink: once a second the line swells by 5% and its red lightens, then
++        // it settles back. It never dims below the base colour.
++        float breath = 0.5f - 0.5f*cosf(lastmillis*PI2/1000), scale = 1.1f*(1 + 0.05f*breath);
++        int glow = int(120*breath);
++        pushhudmatrix();
++        hudmatrix.translate(1800*w/h/2, 900 + 320, 0);   // centred 320 under the crosshair: below the reload countdown's Digits style (165 under it, fps.cpp) and clear of it
++        hudmatrix.scale(scale, scale, 1);
++        flushhudmatrix();
++        draw_text(msg, -tw/2, -th/2, 255, 72 + glow, 72 + glow);
++        pophudmatrix();
++    }
++
++    // Called once per drawhud() call, after the minimap: gathers d's flags once for every cue it draws.
++    void drawflagcues(fpsent *d, int w, int h)
++    {
++        sgflagstate st;
++        sggetflagstate(d, st);
++        drawflagwarn(d, st, w, h);
++    }
++    // === end SwiftGibs in-play flag cues ==========================================================
++
+     void drawhud(fpsent *d, int w, int h)
+     {
+         if(d->state == CS_ALIVE)
+@@ -603,6 +693,7 @@
+             drawblip(d, x, y, s, i, true);
+         }
+         drawteammates(d, x, y, s);
++        drawflagcues(d, w, h);   // SwiftGibs match cues (patch 22): flag-not-home warning, see drawflagcues()
+         if(d->state == CS_DEAD && (m_efficiency || !m_protect))
+         {
+             int wait = respawnwait(d);
 --- a/fpsgame/fps.cpp
 +++ b/fpsgame/fps.cpp
 @@ -354,6 +354,7 @@
