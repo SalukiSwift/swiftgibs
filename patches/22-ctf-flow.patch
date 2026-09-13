@@ -37,7 +37,7 @@
  #ifdef SERVMODE
  VAR(ctftkpenalty, 0, 1, 1);
  
-@@ -544,6 +553,181 @@
+@@ -544,6 +553,186 @@
          return (h*(1 + 1 + 10))/(4*10);
      }
  
@@ -66,6 +66,11 @@
 +    {
 +        return ctfonly && carrying && !ownflaghome && diststand < warndist;
 +    }
++
++    // A flag is home exactly when nobody carries it (owned) and it is not lying dropped (droptime !=
++    // 0): the server's plain-ctf capture rule (takeflag()). sggetflagstate() below calls this for
++    // ownhome instead of computing the same two-part check inline.
++    static bool sgflaghome(bool owned, int droptime) { return !owned && !droptime; }
 +    // sgflagwarn: end pure unit
 +
 +    // d's flags as the in-play cues read them, gathered once per drawhud() call by drawflagcues().
@@ -95,7 +100,7 @@
 +            float dist = feet.dist(f.spawnloc);
 +            if(st.own >= 0 && dist >= st.owndist) continue;
 +            st.own = i;
-+            st.ownhome = !f.owner && !f.droptime;
++            st.ownhome = sgflaghome(f.owner != NULL, f.droptime);
 +            st.owndist = dist;
 +        }
 +    }
@@ -109,7 +114,7 @@
 +        text_bounds(msg, tw, th);
 +        // A gentle pulse, never a blink: once a second the line swells by 5% and its red lightens, then
 +        // it settles back. It never dims below the base colour.
-+        float breath = 0.5f - 0.5f*cosf(lastmillis*PI2/1000), scale = 1.1f*(1 + 0.05f*breath);
++        float breath = 0.5f - 0.5f*cosf((lastmillis%1000)*PI2/1000), scale = 1.1f*(1 + 0.05f*breath);
 +        int glow = int(120*breath);
 +        pushhudmatrix();
 +        hudmatrix.translate(1800*w/h/2, 900 + 320, 0);   // centred 320 under the crosshair: below the reload countdown's Digits style (165 under it, fps.cpp) and clear of it
@@ -198,7 +203,7 @@
 +        gle::begin(GL_TRIANGLES);
 +        loopi(2) { gle::attribf(rim[0], rim[1]); gle::attribf(rim[2*i+2], rim[2*i+3]); gle::attribf(rim[2*i+4], rim[2*i+5]); }
 +        gle::end();
-+        gle::colorf(1, 192/255.0f, 64/255.0f);   // amber, the colour of the flag-carry popup's RUN IT HOME, which opens as the arrow first appears
++        gle::colorf(1, 192/255.0f, 64/255.0f);   // amber: the same colour as the flag-carry popup's RUN IT HOME text. Only the carrier sees that popup; a spectator following the carrier sees this arrow without it.
 +        gle::begin(GL_TRIANGLES);
 +        loopi(2) { gle::attribf(fill[0], fill[1]); gle::attribf(fill[2*i+2], fill[2*i+3]); gle::attribf(fill[2*i+4], fill[2*i+5]); }
 +        gle::end();
@@ -219,7 +224,7 @@
      void drawhud(fpsent *d, int w, int h)
      {
          if(d->state == CS_ALIVE)
-@@ -603,6 +787,7 @@
+@@ -603,6 +792,7 @@
              drawblip(d, x, y, s, i, true);
          }
          drawteammates(d, x, y, s);
@@ -245,7 +250,7 @@
          if(!maptime) { maptime = lastmillis; maprealtime = totalmillis; return; }
          if(!curtime) { gets2c(); if(player1->clientnum>=0) c2sinfo(); return; }
  
-@@ -691,6 +693,203 @@
+@@ -691,6 +693,215 @@
          else flagpopupmillis = 0;
      }
  
@@ -282,12 +287,24 @@
 +        bool spectating = self->state == CS_SPECTATOR;
 +        if(teammode)
 +        {
-+            if(bestteams.length() != 1) { copystring(text, "DRAW", len); return SGEND_NEUTRAL; }   // level, or no team scored (0-0 ctf lists none)
 +            if(spectating)
 +            {
++                if(bestteams.length() != 1) { copystring(text, "DRAW", len); return SGEND_NEUTRAL; }   // level, or no team scored (0-0 ctf lists none)
 +                nformatstring(text, len, "%s WINS", bestteams[0]);
 +                for(char *c = text; *c; c++) *c = cubeupper(*c);   // GOOD WINS, not good WINS
 +                return SGEND_NEUTRAL;
++            }
++            if(bestteams.length() != 1)
++            {
++                // A tie at the top (2+ teams listed) is a draw only for a team actually in it: with
++                // 3+ teams a non-tied team has lost outright (final review Minor 2). An empty list
++                // (no team could have scored, e.g. a CTF map with no flag bases) is a draw for
++                // everyone, the same as the spectator wording above.
++                bool ontied = false;
++                loopv(bestteams) if(!strcmp(self->team, bestteams[i])) { ontied = true; break; }
++                bool draw = !bestteams.length() || ontied;
++                copystring(text, draw ? "DRAW" : "DEFEAT", len);
++                return draw ? SGEND_NEUTRAL : SGEND_LOSS;
 +            }
 +            bool won = !strcmp(self->team, bestteams[0]);
 +            copystring(text, won ? "VICTORY" : "DEFEAT", len);
@@ -449,7 +466,7 @@
      // === SwiftGibs career stats file writer (Task 6) ===
      ICOMMAND(writestatsfile, "iiiiiis", (int *m,int *f,int *d,int *dmg,int *sh,int *bs,char *ts),
      {
-@@ -1160,6 +1359,7 @@
+@@ -1160,6 +1371,7 @@
              // the next real match (see the startgame() hook above), not immediately here - there
              // is nothing to capture during intermission itself.
              cliprecordfinalizeall("intermission");
@@ -457,7 +474,7 @@
              player1->attacking = false;
              if(cmode) cmode->gameover();
              conoutf(CON_GAMEINFO, "\f2intermission:");
-@@ -1302,6 +1502,7 @@
+@@ -1302,6 +1514,7 @@
          killstreak = 0;
          matchbeststreak = 0;
          flagpopupmillis = 0;
@@ -465,7 +482,7 @@
          loopv(players) { players[i]->cstreak = 0; players[i]->bstreak = 0; }
  
          setclientmode();
-@@ -1670,9 +1871,23 @@
+@@ -1670,9 +1883,23 @@
  
          pushhudmatrix();
          hudmatrix.scale(gameclockscale, gameclockscale, 1);
@@ -489,7 +506,7 @@
          draw_text(buf, int(offset.x), int(offset.y), (color>>16)&0xFF, (color>>8)&0xFF, color&0xFF, gameclockalpha);
  
          pophudmatrix();
-@@ -2174,11 +2389,41 @@
+@@ -2174,11 +2401,41 @@
          pophudmatrix();
      }
  
@@ -531,7 +548,7 @@
          if(!reloaddemoing() && !hitmarkerdemoing() && !streakfxdemoing()) return;
          reloadoverlaypass = true;
          pushhudmatrix();
-@@ -2469,6 +2714,7 @@
+@@ -2469,6 +2726,7 @@
          if(!m_edit && !m_sp)
          {
              if(gameclock) drawgameclock(w, h);

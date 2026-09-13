@@ -9,6 +9,9 @@
 #      plain-ctf gate its HUD call passes it
 #   4. capture-direction arrow: the bearing to the capture point, the on-screen hide check and the
 #      screen spot for a bearing (the sgcaparrow unit, fpsgame/ctf.h), plus the gates its HUD call uses
+#   5. glue code: exactly-one-match asserts on the engine glue lines that feed the units above (call
+#      sites, gates, per-frame hooks in fps.cpp, client.cpp, ctf.h), so one going missing or being
+#      duplicated by a future hand recapture fails loudly even though every pure unit above stays green
 # Usage: [TREE=<patched tree>] tools/test-ctf-flow.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -34,6 +37,28 @@ extract_block() {
     echo "FAIL: '$marker: end' comes before '$marker: begin' in ${file#"$TREE"/}"; return 1; }
   tr -d '\r' < "$file" | sed -n "/$marker: begin/,/$marker: end/p" | sed '1d;$d' > "$out"
   echo "under test: $marker, $(wc -l < "$out") lines from ${file#"$TREE"/}"
+}
+
+# assert_one_match <file> <description> <pattern> [regex]: fails unless <pattern> matches exactly one
+# line of <file> (CRs stripped first), so the assert catches the glue line being deleted (0 matches)
+# or duplicated (2+ matches) just as surely as it catches the file being wrong. Plain patterns are a
+# literal substring (grep -F), which is enough when the target text is not also a substring of
+# something else in the file (a forward declaration, an extern line). Pass "regex" as the 4th
+# argument for a line-anchored regex (grep -P, "^[[:space:]]*pattern") in the few cases where the
+# same call text also occurs, prefixed, in a declaration.
+assert_one_match() {
+  local file="$1" desc="$2" pat="$3" mode="${4:-}" n
+  if [ "$mode" = "regex" ]; then
+    n="$(tr -d '\r' < "$file" | grep -cP "$pat" || true)"
+  else
+    n="$(tr -d '\r' < "$file" | grep -cF "$pat" || true)"
+  fi
+  if [ "$n" = "1" ]; then
+    echo "  ok   $desc"
+    return 0
+  fi
+  echo "FAIL: expected exactly 1 match for $desc in ${file#"$TREE"/}, found $n"
+  return 1
 }
 
 # ---- 1. end-of-match banner --------------------------------------------------------------------
@@ -126,6 +151,16 @@ int main()
       expect("team, playing: teams level", true, m, self, "DRAW", SGEND_NEUTRAL); }
     { match m; fpsent *self = m.add("april", "good", CS_ALIVE, 6); m.add("bot", "evil", CS_ALIVE, 3);
       expect("team, playing: no team reported (0-0 ctf lists none)", true, m, self, "DRAW", SGEND_NEUTRAL); }
+    // ---- 3+ teams, playing: a tie at the top is a draw only for a team actually in it ----
+    { match m; fpsent *self = m.add("april", "red", CS_ALIVE, 10); m.add("bot", "blue", CS_ALIVE, 10); m.add("bot", "green", CS_ALIVE, 4);
+      m.bestteams.add("red"); m.bestteams.add("blue");
+      expect("3 teams, playing: two tied at the top, self on a tied team", true, m, self, "DRAW", SGEND_NEUTRAL); }
+    { match m; m.add("bot", "red", CS_ALIVE, 10); m.add("bot", "blue", CS_ALIVE, 10); fpsent *self = m.add("april", "green", CS_ALIVE, 4);
+      m.bestteams.add("red"); m.bestteams.add("blue");
+      expect("3 teams, playing: two tied at the top, self on the third team", true, m, self, "DEFEAT", SGEND_LOSS); }
+    { match m; m.add("bot", "red", CS_ALIVE, 12); fpsent *self = m.add("april", "blue", CS_ALIVE, 10); m.add("bot", "green", CS_ALIVE, 4);
+      m.bestteams.add("red");
+      expect("3 teams, playing: one clear winner, self not on it", true, m, self, "DEFEAT", SGEND_LOSS); }
     // ---- team modes, spectating: informative, team name upper-cased, never "you" ----
     { match m; fpsent *self = m.add("april", "good", CS_SPECTATOR, 0); m.add("bot", "good", CS_ALIVE, 3); m.add("bot", "evil", CS_ALIVE, 9);
       m.bestteams.add("evil");
@@ -423,6 +458,25 @@ int main()
         if(!ok) bad++;
     }
 
+    // ---- per-flag home rule (sgflaghome), extracted from sggetflagstate's inline check ----
+    // Expected values come from the server's plain-ctf capture rule (takeflag()), not from the code.
+    {
+        struct { const char *what; bool owned; int droptime; bool want; } homerows[] = {
+            { "owned -> not home", true, 0, false },
+            { "dropped (droptime != 0) -> not home", false, 5000, false },
+            { "neither -> home", false, 0, true },
+        };
+        for(unsigned i = 0; i < sizeof(homerows)/sizeof(homerows[0]); i++)
+        {
+            bool got = sgflaghome(homerows[i].owned, homerows[i].droptime);
+            printf("%s %-58s owned %d droptime %-5d -> %-8s (want %s)\n",
+                   got == homerows[i].want ? "  ok  " : "  FAIL", homerows[i].what, homerows[i].owned, homerows[i].droptime,
+                   got ? "home" : "not home", homerows[i].want ? "home" : "not home");
+            ran++;
+            if(got != homerows[i].want) bad++;
+        }
+    }
+
     if(bad) { printf("FAILED: %d of %d case(s)\n", bad, ran); return 1; }
     printf("ALL %d CASES PASS\n", ran);
     return 0;
@@ -631,10 +685,43 @@ CPP
   echo "  ok   the HUD call feeds camera1, fov and the capture stand, and gates on alive, not intermission, m_ctf_only, carrying"
 }
 
+# ---- 5. glue code -------------------------------------------------------------------------------
+# The pure units above have no regression guard on the handful of engine glue lines that feed them:
+# the call sites, gates and per-frame hooks in fps.cpp, client.cpp and ctf.h. A future hand recapture
+# (the shelved perf-round rebase touches these same two files) could drop or duplicate one of them
+# with every pure-unit test above still green. Each row is an exactly-one-match check against the
+# patched tree, in the style of the caparrow and flagwarn call-site asserts above.
+glue_test() {
+  echo "== glue code =="
+  local ok=0
+  assert_one_match "$TREE/fpsgame/fps.cpp" "sgendbannertrigger(): the join-during-intermission guard (if(!maptime) return;)" \
+    'if(!maptime) return;' || ok=1
+  assert_one_match "$TREE/fpsgame/fps.cpp" "timeupdate(): sgendbannertrigger() called right after cliprecordfinalizeall(\"intermission\")" \
+    'sgendbannertrigger();' || ok=1
+  assert_one_match "$TREE/fpsgame/fps.cpp" "updateworld(): the updatetimercue() call itself, not its forward declaration" \
+    '^[[:space:]]*updatetimercue\(\);' regex || ok=1
+  assert_one_match "$TREE/fpsgame/fps.cpp" "updatetimercue(): the live gate (connected, sgtimercue>=2, m_timed, maplimit>0, !intermission)" \
+    'bool live = connected && sgtimercue >= 2 && m_timed && maplimit > 0 && !intermission;' || ok=1
+  assert_one_match "$TREE/fpsgame/fps.cpp" "updatetimercue(): the beep latch fed maplimit-lastmillis" \
+    'if(sgtimerbeepdue(live, sgtimerremaining(maplimit-lastmillis), sgtimerlastbeep)) sgtimerbeep();' || ok=1
+  assert_one_match "$TREE/fpsgame/fps.cpp" "startgame(): the sgmatchcuesreset() call" \
+    'sgmatchcuesreset();' || ok=1
+  assert_one_match "$TREE/fpsgame/client.cpp" "gamedisconnect(): the local extern sgmatchcuesreset() declaration" \
+    'extern void sgmatchcuesreset();' || ok=1
+  assert_one_match "$TREE/fpsgame/client.cpp" "gamedisconnect(): the sgmatchcuesreset() call itself, not the extern declaration" \
+    '^[[:space:]]*sgmatchcuesreset\(\);' regex || ok=1
+  assert_one_match "$TREE/fpsgame/ctf.h" "drawhud(): the drawflagcues(d, w, h) hook" \
+    'drawflagcues(d, w, h);' || ok=1
+  assert_one_match "$TREE/fpsgame/ctf.h" "sggetflagstate(): the home predicate goes through sgflaghome(), not an inline copy" \
+    'st.ownhome = sgflaghome(' || ok=1
+  [ "$ok" = "0" ] || return 1
+}
+
 FAILED=0
 banner_test || FAILED=1
 timercue_test || FAILED=1
 flagwarn_test || FAILED=1
 caparrow_test || FAILED=1
+glue_test || FAILED=1
 [ "$FAILED" = "0" ] || { echo "FAILED: see the FAIL lines above"; exit 1; }
 echo "ALL SECTIONS PASS"
