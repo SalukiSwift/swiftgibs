@@ -14,14 +14,31 @@
      VARP(teamcolorchat, 0, 1, 1);
 --- a/fpsgame/fps.cpp
 +++ b/fpsgame/fps.cpp
-@@ -691,6 +691,112 @@
+@@ -354,6 +354,7 @@
+     void updatereloadmetronome();
+     void checkautorespawn();   // SwiftGibs Task 7: defined below, after the cue-demo helpers it checks
+     void checkautospec();      // SwiftGibs AFK-aware auto-respawn Part B: defined below, after checkautorespawn()
++    void updatetimercue();     // SwiftGibs match cues (patch 22): final-ten-seconds beeps, defined in the match cues section below
+     void updateworld()        // main game update loop
+     {
+         // SwiftGibs clip export (Task 3): a genuinely unconditional per-frame hook (updateworld()
+@@ -366,6 +367,7 @@
+         // No-op (one int compare) whenever no export is in progress.
+         checkclipexport();
+         updatereloadmetronome();
++        updatetimercue();   // SwiftGibs match cues (patch 22): every frame like the metronome, so the beeps never depend on the clock being drawn
+         if(!maptime) { maptime = lastmillis; maprealtime = totalmillis; return; }
+         if(!curtime) { gets2c(); if(player1->clientnum>=0) c2sinfo(); return; }
+ 
+@@ -691,6 +693,203 @@
          else flagpopupmillis = 0;
      }
  
 +    // === SwiftGibs match cues (patch 22, CTF match-flow round) ==================================
 +    // Design: docs/superpowers/specs/2026-09-13-ctf-match-flow-design.md (untracked locally).
 +    // Per-match state for this round's cues lives in this section, above its first users
-+    // (timeupdate() and startgame() below); sgmatchcuesreset() at the end clears all of it.
++    // (timeupdate(), startgame() and the HUD code below; updateworld() above reaches updatetimercue()
++    // through a forward declaration); sgmatchcuesreset() at the end clears all of it.
 +    //
 +    // End-of-match banner: at intermission one large centred line gives the result from the local
 +    // player's point of view (VICTORY / DEFEAT / DRAW, WON / LOST, "3rd of 8", or "<X> WINS" for a
@@ -114,6 +131,95 @@
 +        sgendmillis = lastmillis;
 +    }
 +
++    // Round-end escalation: in the final minute of a timed match the match clock breathes (scale and
++    // colour, drawgameclock()) from the moment the stock clock switches to gameclocklowcolour, faster
++    // and stronger for the last ten seconds, and with sgtimercue 2 each of those ten seconds also beeps
++    // once. The beeps run every frame from updateworld() (updatetimercue()), not from the clock draw,
++    // which only runs while the clock is shown. The clock is hidden by default (gameclock 0), so the
++    // cue shows it for the final minute (gameplayhud()). Presentation only: demos and clips may pulse
++    // and beep too.
++    VARP(sgtimercue, 0, 2, 2);          // 0 = off, 1 = visual only, 2 = visual + sound
++    VARP(sgtimercuevol, 0, 200, 255);   // beep volume (0..255; 0 = silent), the same default as the other cue volumes
++
++    // sgtimercue: begin pure unit - tools/test-ctf-flow.sh compiles this block on its own, so it must stay free of engine state
++    // Whole seconds left for msleft = maplimit-lastmillis, counted exactly as drawgameclock() counts
++    // them before it splits off the minutes: 60 reads 1:00, 59 reads 0:59, 1 is the last second and 0
++    // is at or past the limit. Every threshold below uses this total, never the seconds of the minute.
++    static int sgtimerremaining(int msleft) { return max(msleft + 999, 0)/1000; }
++
++    // The beep latch, fed once a frame. live: every gate except the clock (sgtimercue 2, a timed match
++    // with a known limit, not intermission, connected). lastbeep: the last whole second already beeped,
++    // -1 = armed. True exactly when a beep is due: once for each of 10..1, never twice in a row for the
++    // same second, and re-armed whenever more than ten seconds are left again (overtime and other
++    // server time changes can move maplimit back out).
++    static bool sgtimerbeepdue(bool live, int remaining, int &lastbeep)
++    {
++        if(remaining > 10) { lastbeep = -1; return false; }
++        if(!live || remaining < 1 || remaining == lastbeep) return false;
++        lastbeep = remaining;
++        return true;
++    }
++
++    // The clock pulse at msleft. Returns false outside 0:59..0:01, the stretch in which the stock clock
++    // already shows gameclocklowcolour; otherwise writes scale (never below 1, so the clock never
++    // shrinks) and glow (0..1, how far its colour lightens towards white). Until 0:11 it breathes once
++    // every two seconds, starting from rest at 0:59; for the last ten seconds it kicks on every second
++    // change, the frame the beep fires, and settles before the next one.
++    static bool sgtimerpulse(int msleft, float &scale, float &glow)
++    {
++        scale = 1;
++        glow = 0;
++        int remaining = sgtimerremaining(msleft);
++        if(remaining < 1 || remaining > 59) return false;
++        if(remaining > 10)
++        {
++            float breath = 0.5f - 0.5f*cosf((59000 - msleft)*PI/1000);   // 0 at 0:59, 1 at 0:58, 0 at 0:57...
++            scale += 0.06f*breath;
++            glow = 0.3f*breath;
++        }
++        else
++        {
++            float kick = 1 - (remaining*1000 - msleft)/1000.0f;   // 1 as the second changes, down to 0 by the next
++            kick *= kick*kick;
++            scale += 0.25f*kick;
++            glow = 0.75f*kick;
++        }
++        return true;
++    }
++
++    // color (0xRRGGBB) lightened towards white by glow (0..1), channel by channel.
++    static int sgtimerglow(int color, float glow)
++    {
++        int r = (color>>16)&0xFF, g = (color>>8)&0xFF, b = color&0xFF;
++        r += int((255-r)*glow);
++        g += int((255-g)*glow);
++        b += int((255-b)*glow);
++        return (r<<16) | (g<<8) | b;
++    }
++    // sgtimercue: end pure unit
++
++    static int sgtimerlastbeep = -1;   // last whole second already beeped, -1 = armed (see sgtimerbeepdue())
++
++    // swiftgibs/respawncount is the bundled countdown tone the design picks (swiftgibs/tick_mid is the
++    // fallback if it clashes with the respawn countdown by ear). Volume 0 plays nothing: the engine
++    // reads a raw 0 as "default volume", so it is never passed on.
++    static void sgtimerbeep() { if(sgtimercuevol > 0) playsoundname("swiftgibs/respawncount", NULL, sgtimercuevol); }
++    ICOMMAND(playtimercuepreview, "", (), sgtimerbeep());   // the match cues page auditions the beep at the current volume
++
++    // Called every frame from updateworld(), right after updatereloadmetronome().
++    void updatetimercue()
++    {
++        bool live = connected && sgtimercue >= 2 && m_timed && maplimit > 0 && !intermission;
++        if(sgtimerbeepdue(live, sgtimerremaining(maplimit-lastmillis), sgtimerlastbeep)) sgtimerbeep();
++    }
++
++    // True in the final minute of a timed match while the cue is on: from 0:59 (0:00 included) until
++    // intermission. drawgameclock() pulses inside it; gameplayhud() shows a hidden clock for it.
++    static bool sgtimerfinalminute()
++    {
++        return sgtimercue && m_timed && maplimit > 0 && !intermission && sgtimerremaining(maplimit-lastmillis) < 60;
++    }
++
 +    // Clears every per-match cue latch in this section so nothing from one match can bleed into the
 +    // next. Called from startgame() (every real match start) and from gamedisconnect()
 +    // (fpsgame/client.cpp: every disconnect and quit), the same two-site idiom as resetafklatches().
@@ -121,13 +227,14 @@
 +    {
 +        sgendmillis = 0;
 +        sgendtext[0] = '\0';
++        sgtimerlastbeep = -1;
 +    }
 +    // === end SwiftGibs match cues state =========================================================
 +
      // === SwiftGibs career stats file writer (Task 6) ===
      ICOMMAND(writestatsfile, "iiiiiis", (int *m,int *f,int *d,int *dmg,int *sh,int *bs,char *ts),
      {
-@@ -1160,6 +1266,7 @@
+@@ -1160,6 +1359,7 @@
              // the next real match (see the startgame() hook above), not immediately here - there
              // is nothing to capture during intermission itself.
              cliprecordfinalizeall("intermission");
@@ -135,7 +242,7 @@
              player1->attacking = false;
              if(cmode) cmode->gameover();
              conoutf(CON_GAMEINFO, "\f2intermission:");
-@@ -1302,6 +1409,7 @@
+@@ -1302,6 +1502,7 @@
          killstreak = 0;
          matchbeststreak = 0;
          flagpopupmillis = 0;
@@ -143,7 +250,31 @@
          loopv(players) { players[i]->cstreak = 0; players[i]->bstreak = 0; }
  
          setclientmode();
-@@ -2174,11 +2282,41 @@
+@@ -1670,9 +1871,23 @@
+ 
+         pushhudmatrix();
+         hudmatrix.scale(gameclockscale, gameclockscale, 1);
++        // SwiftGibs match cues (patch 22): the final-minute pulse. The clock grows sideways about
++        // gameclockx (every gameclockalign keeps its edge) and away from the nearer top or bottom edge
++        // of the screen (the default clock sits 3% from the top, where a centred pulse would clip), and
++        // its colour lightens below.
++        float sgscale = 1, sgglow = 0;
++        if(sgtimerfinalminute() && sgtimerpulse(maplimit-lastmillis, sgscale, sgglow))
++        {
++            vec2 anchor = vec2(gameclockx, gameclocky).mul(vec2(w, h).div(gameclockscale));
++            anchor.y += gameclocky < 0.5f ? -th/2.0f : th/2.0f;
++            hudmatrix.translate(anchor.x, anchor.y, 0);
++            hudmatrix.scale(sgscale, sgscale, 1);
++            hudmatrix.translate(-anchor.x, -anchor.y, 0);
++        }
+         flushhudmatrix();
+ 
+         int color = mins < 1 ? gameclocklowcolour : gameclockcolour;
++        if(sgglow > 0) color = sgtimerglow(color, sgglow);   // SwiftGibs match cues (patch 22): final-minute pulse
+         draw_text(buf, int(offset.x), int(offset.y), (color>>16)&0xFF, (color>>8)&0xFF, color&0xFF, gameclockalpha);
+ 
+         pophudmatrix();
+@@ -2174,11 +2389,41 @@
          pophudmatrix();
      }
  
@@ -185,3 +316,11 @@
          if(!reloaddemoing() && !hitmarkerdemoing() && !streakfxdemoing()) return;
          reloadoverlaypass = true;
          pushhudmatrix();
+@@ -2469,6 +2714,7 @@
+         if(!m_edit && !m_sp)
+         {
+             if(gameclock) drawgameclock(w, h);
++            else if(sgtimerfinalminute()) drawgameclock(w, h);   // SwiftGibs match cues (patch 22): the timer cue shows a hidden clock for the final minute
+             if(hudscore) drawhudscore(w, h);
+         }
+     }

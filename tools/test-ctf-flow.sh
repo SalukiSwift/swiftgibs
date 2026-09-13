@@ -3,6 +3,8 @@
 # patched tree and asserts its full matrix, so a logic hole a screenshot cannot show (a wrong
 # placement count, "you won" for a spectator) cannot come back unnoticed.
 #   1. end-of-match banner: wording + colour class (sgendbannerresult, fpsgame/fps.cpp)
+#   2. round-end escalation: the clock's whole-second count, the once-per-second beep latch and the
+#      final-minute pulse window (the sgtimercue unit, fpsgame/fps.cpp)
 # Usage: [TREE=<patched tree>] tools/test-ctf-flow.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -196,7 +198,163 @@ CPP
   "$TMP/banner" || return 1
 }
 
+# ---- 2. round-end escalation -------------------------------------------------------------------
+# Every threshold counts TOTAL seconds left, the way the clock counts them before drawgameclock()
+# splits off the minutes: a count taken after that split reads 1:10 as 10 and beeps or pulses in the
+# last seconds of every minute. The latch is fed frame by frame the way updateworld() feeds it
+# (msleft = maplimit-lastmillis, live = every gate but the clock) at normal and 10x game speed,
+# through hitches, a paused clock, intermission and overtime.
+timercue_test() {
+  echo "== round-end escalation =="
+  extract_block "$TREE/fpsgame/fps.cpp" "sgtimercue" "$TMP/timercue-unit.inc" || return 1
+  cat > "$TMP/timercue.cpp" <<'CPP'
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+// Minimal stand-ins for the only engine pieces the unit may touch (shared/tools.h). Anything else it
+// reaches for (maplimit, lastmillis, intermission, sgtimercue...) is engine state and fails to
+// compile here, which is the point.
+#define PI (3.1415927f)
+template<class T> static inline T max(T a, T b) { return a > b ? a : b; }
+template<class T> static inline T min(T a, T b) { return a < b ? a : b; }
+
+#include "timercue-unit.inc"
+
+static int ran = 0, bad = 0;
+static void check(const char *what, bool ok, const char *got, const char *want)
+{
+    printf("%s %-72s -> %s (want %s)\n", ok ? "  ok  " : "  FAIL", what, got, want);
+    ran++;
+    if(!ok) bad++;
+}
+
+static void remaining(int msleft, int want, const char *reads)
+{
+    char what[96], got[16], w[16];
+    snprintf(what, sizeof(what), "count: %dms left is %s", msleft, reads);
+    int r = sgtimerremaining(msleft);
+    snprintf(got, sizeof(got), "%d", r); snprintf(w, sizeof(w), "%d", want);
+    check(what, r == want, got, w);
+}
+
+// One match clock seen frame by frame, the beeps it produced written out in order (a runaway latch
+// that beeps every frame is cut off with "..." rather than overrunning the buffer).
+struct clockrun
+{
+    int lastbeep, len; char beeps[256];
+    clockrun() : lastbeep(-1), len(0) { beeps[0] = '\0'; }
+    void frame(int msleft, bool live)
+    {
+        int r = sgtimerremaining(msleft);
+        if(!sgtimerbeepdue(live, r, lastbeep)) return;
+        if(len >= 200) { if(beeps[len-1] != '.') len += snprintf(beeps + len, sizeof(beeps) - len, " ..."); return; }
+        len += snprintf(beeps + len, sizeof(beeps) - len, len ? " %d" : "%d", r);
+    }
+    void run(int from, int to, int step) { for(int t = from; t >= to; t -= step) frame(t, true); }
+};
+static void beeps(const char *what, const clockrun &c, const char *want)
+{
+    char w[64]; snprintf(w, sizeof(w), "\"%s\"", want);
+    char got[300]; snprintf(got, sizeof(got), "\"%s\"", c.beeps);
+    check(what, !strcmp(c.beeps, want), got, w);
+}
+
+// msleft of each pulse peak (a sample above the one before and not below the one after), 10ms samples.
+static int peaks(int from, int to, int *at, int maxat)
+{
+    int n = 0; float prev = 0, cur = 0, next = 0, g;
+    for(int t = from; t >= to; t -= 10)
+    {
+        sgtimerpulse(t + 10, prev, g); sgtimerpulse(t, cur, g); sgtimerpulse(t - 10, next, g);
+        if(cur > prev && cur >= next && n < maxat) at[n++] = t;
+    }
+    return n;
+}
+static bool evenlyspaced(const int *at, int n, int gap, int mod)
+{
+    if(n < 3) return false;
+    for(int i = 1; i < n; i++) if(at[i-1] - at[i] != gap) return false;
+    return mod <= 0 || at[0] % mod == 0;
+}
+
+int main()
+{
+    const char *all10 = "10 9 8 7 6 5 4 3 2 1";
+    // ---- the count: total seconds, exactly as the clock shows them (1:00 is 60, 0:59 is 59) ----
+    remaining(600000, 600, "10:00");
+    remaining(70000, 70, "1:10 (70, not the 10 of 1:10)");
+    remaining(60000, 60, "1:00");
+    remaining(59001, 60, "still 1:00");
+    remaining(59000, 59, "0:59, where the stock clock turns gameclocklowcolour");
+    remaining(10001, 11, "0:11");
+    remaining(10000, 10, "0:10");
+    remaining(9001, 10, "still 0:10");
+    remaining(1, 1, "0:01");
+    remaining(0, 0, "0:00");
+    remaining(-2500, 0, "past the limit, 0:00");
+
+    // ---- the beep latch: 10 down to 1, each exactly once, however the frames fall ----
+    { clockrun c; c.run(75000, -2000, 16); beeps("beeps: 60fps frames from 1:15 to past the limit", c, all10); }
+    { clockrun c; c.run(75003, -2000, 167); beeps("beeps: gamespeed 1000 frames (167ms of game time each)", c, all10); }
+    { clockrun c; c.run(75000, -2000, 1000); beeps("beeps: frames landing exactly on every second change", c, all10); }
+    { clockrun c; c.run(12000, -2000, 1500); beeps("beeps: 1.5s hitches beep each new value once, never a missed one late", c, "9 8 6 5 3 2"); }
+    { clockrun c; c.run(75000, 5000, 16); for(int i = 0; i < 500; i++) c.frame(5000, true); c.run(4984, -2000, 16);
+      beeps("beeps: clock paused at 0:05 for 500 frames", c, all10); }
+    { clockrun c; for(int t = 75000; t >= -2000; t -= 16) c.frame(t, false);
+      beeps("beeps: gate closed throughout (cue below 2, untimed, not connected)", c, ""); }
+    { clockrun c; for(int t = 15000; t >= -2000; t -= 16) c.frame(t, t > 4000);
+      beeps("beeps: intermission at 0:04 (score limit): nothing after it", c, "10 9 8 7 6 5"); }
+    { clockrun c; for(int t = 15000; t >= -2000; t -= 16) c.frame(t, t <= 6500);
+      beeps("beeps: sound switched on at 0:06.5 joins at the current second", c, "7 6 5 4 3 2 1"); }
+    { clockrun c; c.run(75000, 5000, 16); c.run(120000, -2000, 16);
+      beeps("beeps: overtime at 0:05 puts 2:00 back: re-armed, 10..1 again", c, "10 9 8 7 6 5 10 9 8 7 6 5 4 3 2 1"); }
+    { clockrun c; c.run(15000, 9500, 16); c.run(120000, -2000, 16);   // only a re-arm lets a countdown restart on the value last beeped
+      beeps("beeps: time moved back out right after the 0:10 beep: the next 0:10 beeps", c, "10 10 9 8 7 6 5 4 3 2 1"); }
+    { clockrun c; c.run(15000, 3000, 16); c.run(7000, -2000, 16);
+      beeps("beeps: limit moved from 0:03 to 0:07: the new seconds beep again", c, "10 9 8 7 6 5 4 3 7 6 5 4 3 2 1"); }
+
+    // ---- the pulse: on from 0:59 (with the low colour) to 0:01, stronger and faster for the last ten ----
+    { bool any = false; float s, g; char got[48] = "none";
+      for(int t = 600000; t >= 59001; t -= 7) if(sgtimerpulse(t, s, g) || s != 1 || g != 0) { snprintf(got, sizeof(got), "pulse at %dms", t); any = true; break; }
+      check("pulse: none while the clock reads 1:00 or more (10:00 down to 1:00)", !any, got, "none"); }
+    { float s, g; bool on = sgtimerpulse(59000, s, g);
+      check("pulse: starts at 0:59, the frame the stock clock turns low colour", on, on ? "on" : "off", "on"); }
+    { float s, g; bool on = sgtimerpulse(1, s, g);
+      check("pulse: still on at 0:01", on, on ? "on" : "off", "on"); }
+    { bool any = false; float s, g;
+      for(int t = 0; t >= -5000; t -= 7) if(sgtimerpulse(t, s, g) || s != 1 || g != 0) any = true;
+      check("pulse: none at 0:00 or past the limit", !any, any ? "pulse" : "none", "none"); }
+    { bool ok = true; float s, g; char got[64] = "all within";
+      for(int t = 61000; t >= -1000; t--) { sgtimerpulse(t, s, g); if(s < 1 || g < 0 || g > 1) { snprintf(got, sizeof(got), "scale %.3f glow %.3f at %dms", s, g, t); ok = false; break; } }
+      check("pulse: never smaller than the stock clock, glow within 0..1", ok, got, "all within"); }
+    { float s, g, minute = 0, ten = 0, minuteg = 0, teng = 0; char got[64];
+      for(int t = 59000; t > 10000; t--) { sgtimerpulse(t, s, g); minute = max(minute, s); minuteg = max(minuteg, g); }
+      for(int t = 10000; t >= 1; t--) { sgtimerpulse(t, s, g); ten = max(ten, s); teng = max(teng, g); }
+      snprintf(got, sizeof(got), "peak scale %.2f vs %.2f, glow %.2f vs %.2f", ten, minute, teng, minuteg);
+      check("pulse: stronger in the last ten seconds than before", ten > minute && teng > minuteg, got, "both higher"); }
+    { int at[64], n = peaks(58990, 10010, at, 64); char got[48]; snprintf(got, sizeof(got), "%d peaks, first at %dms", n, n ? at[0] : 0);
+      check("pulse: breathes once every 2s from 0:59 to 0:11", evenlyspaced(at, n, 2000, 0), got, "every 2000ms"); }
+    { int at[64], n = peaks(9990, 10, at, 64); char got[48]; snprintf(got, sizeof(got), "%d peaks, first at %dms", n, n ? at[0] : 0);
+      check("pulse: kicks every 1s in the last ten, on the second change (the beep)", evenlyspaced(at, n, 1000, 1000), got, "every 1000ms, on whole seconds"); }
+    { char got[16]; int c = sgtimerglow(0xFFC040, 0); snprintf(got, sizeof(got), "%06X", c);
+      check("glow 0 keeps the stock colour", c == 0xFFC040, got, "FFC040"); }
+    { char got[16]; int c = sgtimerglow(0xFFC040, 1); snprintf(got, sizeof(got), "%06X", c);
+      check("glow 1 is white", c == 0xFFFFFF, got, "FFFFFF"); }
+    { char got[16]; int c = sgtimerglow(0x204080, 0.5f); snprintf(got, sizeof(got), "%06X", c);
+      int r = (c>>16)&0xFF, gr = (c>>8)&0xFF, b = c&0xFF;
+      check("glow 0.5 lands each channel halfway to white", r >= 0x8F && r <= 0x90 && gr >= 0x9F && gr <= 0xA0 && b >= 0xBF && b <= 0xC0, got, "8F9FBF (+1)"); }
+
+    if(bad) { printf("FAILED: %d of %d case(s)\n", bad, ran); return 1; }
+    printf("ALL %d CASES PASS\n", ran);
+    return 0;
+}
+CPP
+  g++ -O0 -Wall -fsigned-char -I"$TMP" -o "$TMP/timercue" "$TMP/timercue.cpp" || { echo "FAIL: timer cue unit did not compile standalone (engine state leaked in?)"; return 1; }
+  "$TMP/timercue" || return 1
+}
+
 FAILED=0
 banner_test || FAILED=1
+timercue_test || FAILED=1
 [ "$FAILED" = "0" ] || { echo "FAILED: see the FAIL lines above"; exit 1; }
 echo "ALL SECTIONS PASS"
