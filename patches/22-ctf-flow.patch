@@ -1,6 +1,13 @@
 --- a/fpsgame/client.cpp
 +++ b/fpsgame/client.cpp
-@@ -1216,6 +1216,11 @@
+@@ -1,5 +1,6 @@
+ #include "game.h"
+ #include "processpipe.h" // SwiftGibs clip export (Task 3): found via -Iengine on the include path (Makefile); a plain, self-contained header (no engine.h needed for the processpipe TYPE itself - see shared/iengine.h for the recorder:: functions this file also calls)
++#include "texture.h"   // SwiftGibs match cues (patch 22): hudshader and hudnotextureshader for the capture-direction arrow (fpsgame/ctf.h), the same include fps.cpp has
+ 
+ namespace game
+ {
+@@ -1216,6 +1217,11 @@
          // resetafklatches() (fpsgame/fps.cpp) for the full reasoning.
          extern void resetafklatches();
          resetafklatches();
@@ -14,22 +21,23 @@
      VARP(teamcolorchat, 0, 1, 1);
 --- a/fpsgame/ctf.h
 +++ b/fpsgame/ctf.h
-@@ -3,6 +3,14 @@
+@@ -3,6 +3,15 @@
  #define ctfteamflag(s) (!strcmp(s, "good") ? 1 : (!strcmp(s, "evil") ? 2 : 0))
  #define ctfflagteam(i) (i==1 ? "good" : (i==2 ? "evil" : NULL))
  
 +#ifndef SERVMODE
-+// SwiftGibs match cues (patch 22): flag-not-home warning cvars, drawn by drawflagwarn() below. Client
-+// only and outside the struct: the server compiles this file too (fpsgame/server.cpp, SERVMODE) and
-+// shares the struct body.
++// SwiftGibs match cues (patch 22): the flag-not-home warning and capture-direction arrow cvars, drawn by
++// drawflagwarn() and drawcaparrow() below. Client only and outside the struct: the server compiles this
++// file too (fpsgame/server.cpp, SERVMODE) and shares the struct body.
 +VARP(sgflagwarn, 0, 1, 1);           // warning on/off
 +VARP(sgflagwarndist, 16, 48, 256);   // 3 x FLAGRADIUS: warns on approach, not only on the spot
++VARP(sgcaparrow, 0, 1, 1);           // capture-direction arrow on/off
 +#endif
 +
  #ifdef SERVMODE
  VAR(ctftkpenalty, 0, 1, 1);
  
-@@ -544,6 +552,88 @@
+@@ -544,6 +553,181 @@
          return (h*(1 + 1 + 10))/(4*10);
      }
  
@@ -42,8 +50,13 @@
 +    // Flag-not-home warning: in plain ctf a carrier scores only by touching their own flag while it is
 +    // home (the server's takeflag() returns a dropped one instead, and nobody can touch a carried one),
 +    // so a carrier who runs in to their stand while their own flag is carried off or lying dropped gets
-+    // one pulsing line under the crosshair instead of a silent non-capture. The cvars are at the top of
-+    // this file.
++    // one pulsing line under the crosshair instead of a silent non-capture.
++    //
++    // Capture-direction arrow: while d carries an enemy flag, an amber arrow near the edge of the screen
++    // points the way to d's own stand, the capture point, and steps aside once that stand is in view.
++    // Stand positions are static map data, so the arrow tells nobody anything the map does not.
++    //
++    // The cvars for both are at the top of this file.
 +
 +    // sgflagwarn: begin pure unit - tools/test-ctf-flow.sh compiles this block on its own, so it must stay free of engine state
 +    // True in the can't-capture moment. ctfonly: m_ctf_only (protect and hold share this code but score
@@ -106,23 +119,111 @@
 +        pophudmatrix();
 +    }
 +
++    // sgcaparrow: begin pure unit - tools/test-ctf-flow.sh compiles this block on its own, so it must stay free of engine state
++    enum { SGCAPARROW_MARGIN = 5, SGCAPARROW_RIM = 6 };   // degrees kept inside the fov edge; width of the arrow's dark rim
++
++    // Signed horizontal angle in degrees from the camera's view direction to a target: 0 dead ahead, +90
++    // to the right, -90 to the left, +/-180 behind. yaw: the camera's yaw; dx, dy: target minus camera in
++    // world x and y. This is the radar's own transform (drawblip() above): vecfromyawpitch() puts forward
++    // at (-sin yaw, cos yaw) and left at (cos yaw, sin yaw), so rotated by -yaw the view looks along +y
++    // and +x is to the left.
++    static float sgcaparrowbearing(float yaw, float dx, float dy)
++    {
++        float c = cosf(-yaw*RAD), s = sinf(-yaw*RAD),
++              ahead = c*dy + s*dx, left = c*dx - s*dy;   // the y and x of vec(dx, dy, 0).rotate_around_z(-yaw*RAD)
++        return atan2f(-left, ahead)/RAD;
++    }
++
++    // True while the target is already on screen: inside the horizontal fov (the fov cvar; zoom is
++    // ignored) with SGCAPARROW_MARGIN degrees to spare, so a stand right at the edge of the view still
++    // gets its arrow.
++    static bool sgcaparrowhidden(float bearing, int fov)
++    {
++        return fabs(bearing) < fov/2.0f - SGCAPARROW_MARGIN;
++    }
++
++    // Where the arrow sits for a bearing, in drawhud()'s HUD units (1800 high, hudw = 1800*w/h wide);
++    // (dirx, diry) is the way it points on screen, so behind points down and right points right. (x, y)
++    // rides an ellipse 140 units in from the left and right edges, centred 180 below the crosshair with a
++    // vertical radius of 420: low enough at the top to pass under the minimap and the killstreak counter
++    // below it, and at the bottom to swing under the flag-not-home warning line yet stay above the HUD
++    // icons and the SPECTATOR label, at every aspect from 5:4 to 32:9. Straight ahead is hidden by the fov
++    // check anyway.
++    static void sgcaparrowspot(float bearing, float hudw, float &x, float &y, float &dirx, float &diry)
++    {
++        dirx = sinf(bearing*RAD);
++        diry = -cosf(bearing*RAD);
++        x = hudw/2 + (hudw/2 - 140)*dirx;
++        y = 1080 + 420*diry;
++    }
++
++    // The arrow's outline into v as x, y pairs: tip, wing, notch, other wing. An arrowhead 110 long and 96
++    // wide (a HUD icon is 120) with a notch cut 28 deep, so it reads the right way round at any angle,
++    // which a plain triangle does not; it is drawn as the two triangles tip-wing-notch. (x, y) is its
++    // anchor and (dirx, diry) the way it points. grow moves every edge out by exactly that many units, for
++    // the dark rim drawn under it.
++    static void sgcaparrowshape(float x, float y, float dirx, float diry, float grow, float v[8])
++    {
++        static const float shape[8] = { 66, 0,  -44, 48,  -16, 0,  -44, -48 };   // (along, across) pairs, counter-clockwise
++        for(int i = 0; i < 4; i++)
++        {
++            const float *a = &shape[(i+3)%4*2], *b = &shape[i*2], *c = &shape[(i+1)%4*2];
++            float e1x = b[0] - a[0], e1y = b[1] - a[1], l1 = sqrtf(e1x*e1x + e1y*e1y),
++                  e2x = c[0] - b[0], e2y = c[1] - b[1], l2 = sqrtf(e2x*e2x + e2y*e2y),
++                  n1x = e1y/l1, n1y = -e1x/l1, n2x = e2y/l2, n2y = -e2x/l2,   // outward normals of the two edges meeting here
++                  k = grow/(1 + n1x*n2x + n1y*n2y),                        // mitre: both edges move out by exactly grow
++                  along = b[0] + (n1x + n2x)*k, across = b[1] + (n1y + n2y)*k;
++            v[i*2] = x + dirx*along - diry*across;
++            v[i*2+1] = y + diry*along + dirx*across;
++        }
++    }
++    // sgcaparrow: end pure unit
++
++    void drawcaparrow(fpsent *d, const sgflagstate &st, int w, int h)
++    {
++        if(!sgcaparrow || d->state != CS_ALIVE || intermission || !m_ctf_only || st.carried < 0 || st.own < 0) return;
++        const vec &stand = flags[st.own].spawnloc;
++        float bearing = sgcaparrowbearing(camera1->yaw, stand.x - camera1->o.x, stand.y - camera1->o.y);
++        if(sgcaparrowhidden(bearing, fov)) return;
++        float x, y, dirx, diry, rim[8], fill[8];
++        sgcaparrowspot(bearing, 1800.0f*w/h, x, y, dirx, diry);
++        sgcaparrowshape(x, y, dirx, diry, SGCAPARROW_RIM, rim);
++        sgcaparrowshape(x, y, dirx, diry, 0, fill);
++        // Untextured, like the reload countdown shapes and hit markers (fpsgame/fps.cpp), then back to
++        // hudshader and white for the stock text drawn after the cues.
++        hudnotextureshader->set();
++        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++        gle::defvertex(2);
++        gle::colorf(0, 0, 0, 0.6f);   // a dark rim, like the outline on HUD text, so the arrow reads on bright walls and sky
++        gle::begin(GL_TRIANGLES);
++        loopi(2) { gle::attribf(rim[0], rim[1]); gle::attribf(rim[2*i+2], rim[2*i+3]); gle::attribf(rim[2*i+4], rim[2*i+5]); }
++        gle::end();
++        gle::colorf(1, 192/255.0f, 64/255.0f);   // amber, the colour of the flag-carry popup's RUN IT HOME, which opens as the arrow first appears
++        gle::begin(GL_TRIANGLES);
++        loopi(2) { gle::attribf(fill[0], fill[1]); gle::attribf(fill[2*i+2], fill[2*i+3]); gle::attribf(fill[2*i+4], fill[2*i+5]); }
++        gle::end();
++        gle::colorf(1, 1, 1);
++        hudshader->set();
++    }
++
 +    // Called once per drawhud() call, after the minimap: gathers d's flags once for every cue it draws.
 +    void drawflagcues(fpsent *d, int w, int h)
 +    {
 +        sgflagstate st;
 +        sggetflagstate(d, st);
 +        drawflagwarn(d, st, w, h);
++        drawcaparrow(d, st, w, h);
 +    }
 +    // === end SwiftGibs in-play flag cues ==========================================================
 +
      void drawhud(fpsent *d, int w, int h)
      {
          if(d->state == CS_ALIVE)
-@@ -603,6 +693,7 @@
+@@ -603,6 +787,7 @@
              drawblip(d, x, y, s, i, true);
          }
          drawteammates(d, x, y, s);
-+        drawflagcues(d, w, h);   // SwiftGibs match cues (patch 22): flag-not-home warning, see drawflagcues()
++        drawflagcues(d, w, h);   // SwiftGibs match cues (patch 22): flag-not-home warning and capture-direction arrow, see drawflagcues()
          if(d->state == CS_DEAD && (m_efficiency || !m_protect))
          {
              int wait = respawnwait(d);

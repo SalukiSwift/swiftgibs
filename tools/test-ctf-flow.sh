@@ -7,6 +7,8 @@
 #      final-minute pulse window (the sgtimercue unit, fpsgame/fps.cpp)
 #   3. flag-not-home warning: the can't-capture decision (sgflagwarnactive, fpsgame/ctf.h) and the
 #      plain-ctf gate its HUD call passes it
+#   4. capture-direction arrow: the bearing to the capture point, the on-screen hide check and the
+#      screen spot for a bearing (the sgcaparrow unit, fpsgame/ctf.h), plus the gates its HUD call uses
 # Usage: [TREE=<patched tree>] tools/test-ctf-flow.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -434,9 +436,205 @@ CPP
   echo "  ok   the HUD call gates the unit on m_ctf_only"
 }
 
+# ---- 4. capture-direction arrow ----------------------------------------------------------------
+# The arrow must point the right way round: a sign or 180-degree slip turns "behind you" into "ahead"
+# and hides the arrow exactly when it is needed, and a bot's view in a screenshot can happen to be
+# symmetric. Every expected bearing is built from the engine's own direction convention, NOT from the
+# code under test: vecfromyawpitch(yaw, 0, move, strafe) (engine/physics.cpp) gives forward (move 1) =
+# (-sin yaw, cos yaw) and left (strafe 1, the "left" key) = (cos yaw, sin yaw). A target placed along
+# forward is ahead (0), along -left is to the right (+90), along left is to the left (-90), along
+# -forward is behind (+/-180). The hide check keeps the arrow off while the capture point is inside the
+# horizontal fov with a margin to spare, and the spot puts behind at the bottom, right on the right.
+# The unit is compiled twice: plain, and with the engine's own float flags (Makefile: -O3 -ffast-math).
+caparrow_test() {
+  echo "== capture-direction arrow =="
+  extract_block "$TREE/fpsgame/ctf.h" "sgcaparrow" "$TMP/caparrow-unit.inc" || return 1
+  cat > "$TMP/caparrow.cpp" <<'CPP'
+#include <stdio.h>
+#include <math.h>
+// Minimal stand-ins for the only engine pieces the unit may touch (shared/tools.h). Anything else it
+// reaches for (camera1, fov, flags, the hud player...) is engine state and fails to compile here,
+// which is the point.
+#define PI  (3.1415927f)
+#define RAD (PI / 180.0f)
+
+#include "caparrow-unit.inc"
+
+static int ran = 0, bad = 0;
+static void check(const char *what, bool ok, const char *got, const char *want)
+{
+    printf("%s %-74s -> %s (want %s)\n", ok ? "  ok  " : "  FAIL", what, got, want);
+    ran++;
+    if(!ok) bad++;
+}
+
+// The engine's convention, written out independently of the unit: vecfromyawpitch(yaw, 0, 1, 0) and
+// vecfromyawpitch(yaw, 0, 0, 1) (engine/physics.cpp), in double precision.
+static void forward(double yaw, double &x, double &y) { x = -sin(yaw*M_PI/180); y = cos(yaw*M_PI/180); }
+static void leftward(double yaw, double &x, double &y) { x = cos(yaw*M_PI/180); y = sin(yaw*M_PI/180); }
+
+static const double CAMX = 512.5, CAMY = -130.25;   // the camera is never at the origin in a real map
+
+// Bearing of a target at camera + dist*(f*forward + l*left); want is the expected bearing in degrees,
+// where +/-180 accepts either sign.
+static void bearing(const char *dir, double yaw, double f, double l, double dist, double want)
+{
+    double fx, fy, lx, ly; forward(yaw, fx, fy); leftward(yaw, lx, ly);
+    double tx = CAMX + dist*(f*fx + l*lx), ty = CAMY + dist*(f*fy + l*ly);
+    float got = sgcaparrowbearing(float(yaw), float(tx - CAMX), float(ty - CAMY));
+    double err = fabs(got - want);
+    if(fabs(want) == 180) err = fabs(fabs(got) - 180);
+    char what[96], g[24], w[24];
+    snprintf(what, sizeof(what), "bearing: yaw %6.2f, target %-16s %6g away", yaw, dir, dist);
+    snprintf(g, sizeof(g), "%.3f", got);
+    snprintf(w, sizeof(w), fabs(want) == 180 ? "+/-180" : "%g", want);
+    check(what, err < 0.01, g, w);
+}
+
+static void hidden(float b, int fov, bool want, const char *note)
+{
+    bool got = sgcaparrowhidden(b, fov);
+    char what[96]; snprintf(what, sizeof(what), "hide: bearing %7.2f at fov %3d%s%s", b, fov, note[0] ? ", " : "", note);
+    check(what, got == want, got ? "hidden" : "shown", want ? "hidden" : "shown");
+}
+
+int main()
+{
+    // ---- bearing: the four sides at yaw 0, 90, 180, 270 and two off-axis yaws ----
+    const double yaws[] = { 0, 90, 180, 270, 37.5, 301.25 };
+    for(int i = 0; i < 6; i++)
+    {
+        bearing("ahead",  yaws[i],  1,  0, 600, 0);
+        bearing("right",  yaws[i],  0, -1, 600, 90);
+        bearing("left",   yaws[i],  0,  1, 600, -90);
+        bearing("behind", yaws[i], -1,  0, 600, 180);
+    }
+    // ---- bearing: the diagonals, near and far, at an off-axis yaw ----
+    bearing("ahead-right",  37.5,  1, -1, 400, 45);
+    bearing("ahead-left",   37.5,  1,  1, 400, -45);
+    bearing("behind-right", 37.5, -1, -1, 400, 135);
+    bearing("behind-left",  37.5, -1,  1, 400, -135);
+    bearing("right (near)", 301.25, 0, -1, 1, 90);
+    bearing("left (far)",   301.25, 0,  1, 40000, -90);
+    // ---- bearing: every yaw, sixteen directions each, stays exact and inside -180..180 ----
+    {
+        bool ok = true; char got[96] = "all within 0.01 and in range";
+        for(int y = 0; y < 720 && ok; y++)
+            for(int a = -7; a <= 8 && ok; a++)
+            {
+                double yaw = y*0.5, want = a*22.5, fx, fy, lx, ly;
+                forward(yaw, fx, fy); leftward(yaw, lx, ly);
+                // want degrees clockwise from forward: cos(want) along forward, sin(want) along right (= -left)
+                double c = cos(want*M_PI/180), s = sin(want*M_PI/180);
+                float b = sgcaparrowbearing(float(yaw), float(300*(c*fx - s*lx)), float(300*(c*fy - s*ly)));
+                double err = a == 8 ? fabs(fabs(b) - 180) : fabs(b - want);
+                // range with the same 0.01 slack: -ffast-math may divide pi by RAD to 180.00001
+                if(err >= 0.01 || b < -180.01 || b > 180.01) { snprintf(got, sizeof(got), "yaw %.1f, want %.1f, got %.5f", yaw, want, b); ok = false; }
+            }
+        check("bearing: yaw 0..359.5 in half degrees x 16 directions", ok, got, "all within 0.01 and in range");
+    }
+
+    // ---- hide: only while the capture point is well inside the horizontal fov ----
+    hidden(0, 100, true, "dead ahead, default fov");
+    hidden(44.9f, 100, true, "just inside fov/2 - 5");
+    hidden(-44.9f, 100, true, "just inside, left");
+    hidden(45, 100, false, "exactly fov/2 - 5 (strictly less hides)");
+    hidden(-45, 100, false, "exactly fov/2 - 5, left");
+    hidden(50, 100, false, "on the screen edge");
+    hidden(90, 100, false, "right");
+    hidden(-90, 100, false, "left");
+    hidden(180, 100, false, "behind");
+    hidden(-180, 100, false, "behind, other sign");
+    hidden(39.9f, 90, true, "fov 90 inside");
+    hidden(40, 90, false, "fov 90 boundary");
+    hidden(69.9f, 150, true, "widest fov inside");
+    hidden(-70, 150, false, "widest fov boundary");
+    hidden(0, 10, false, "narrowest fov: the margin is the whole half view");
+
+    // ---- spot: behind at the bottom, right on the right, left on the left, inside the screen ----
+    const float widths[] = { 2400, 3200 };   // 4:3 (800x600) and 16:9 (1280x720) in HUD units, 1800 high
+    for(int i = 0; i < 2; i++)
+    {
+        float hudw = widths[i], cx = hudw/2, x, y, dx, dy;
+        char what[96], got[96];
+        sgcaparrowspot(180, hudw, x, y, dx, dy);
+        snprintf(what, sizeof(what), "spot %4.0f wide: behind is bottom centre, pointing down", hudw);
+        snprintf(got, sizeof(got), "(%.1f, %.1f) dir (%.2f, %.2f)", x, y, dx, dy);
+        check(what, fabs(x - cx) < 0.5f && y > 900 + 300 && fabs(dx) < 0.01f && dy > 0.99f, got, "x centre, y below crosshair, dir (0, 1)");
+        sgcaparrowspot(90, hudw, x, y, dx, dy);
+        snprintf(what, sizeof(what), "spot %4.0f wide: right is at the right edge, pointing right", hudw);
+        snprintf(got, sizeof(got), "(%.1f, %.1f) dir (%.2f, %.2f)", x, y, dx, dy);
+        check(what, x > cx + cx*0.8f && x < hudw && dx > 0.99f && fabs(dy) < 0.01f, got, "x in the outer tenth, dir (1, 0)");
+        sgcaparrowspot(-90, hudw, x, y, dx, dy);
+        snprintf(what, sizeof(what), "spot %4.0f wide: left is at the left edge, pointing left", hudw);
+        snprintf(got, sizeof(got), "(%.1f, %.1f) dir (%.2f, %.2f)", x, y, dx, dy);
+        check(what, x < cx*0.2f && x > 0 && dx < -0.99f && fabs(dy) < 0.01f, got, "x in the outer tenth, dir (-1, 0)");
+        sgcaparrowspot(135, hudw, x, y, dx, dy);
+        snprintf(what, sizeof(what), "spot %4.0f wide: behind-right is bottom right, pointing down-right", hudw);
+        snprintf(got, sizeof(got), "(%.1f, %.1f) dir (%.2f, %.2f)", x, y, dx, dy);
+        check(what, x > cx && y > 900 && dx > 0.7f && dy > 0.7f, got, "right of and below centre, dir (0.71, 0.71)");
+        bool inside = true, mirror = true, tipout = true, rimout = true; char rimgot[96] = "all"; snprintf(got, sizeof(got), "all");
+        for(float b = -180; b <= 180; b += 0.25f)
+        {
+            float v[8], m[8], mx, my, mdx, mdy;
+            sgcaparrowspot(b, hudw, x, y, dx, dy);
+            sgcaparrowshape(x, y, dx, dy, SGCAPARROW_RIM, v);
+            for(int k = 0; k < 8; k += 2) if(v[k] < 16 || v[k] > hudw - 16 || v[k+1] < 16 || v[k+1] > 1800 - 16) { inside = false; snprintf(got, sizeof(got), "vertex (%.1f, %.1f) at bearing %.2f", v[k], v[k+1], b); }
+            sgcaparrowspot(-b, hudw, mx, my, mdx, mdy);
+            if(fabs(mx - (hudw - x)) > 0.05f || fabs(my - y) > 0.05f) mirror = false;
+            sgcaparrowshape(x, y, dx, dy, 0, m);
+            float tx = m[0] - x, ty = m[1] - y, tl = sqrt(tx*tx + ty*ty);   // m[0..1] is the tip
+            if(tl < 1 || fabs(tx/tl - sin(b*RAD)) > 0.001f || fabs(ty/tl + cos(b*RAD)) > 0.001f) tipout = false;
+            // the rim: each of its corners lies exactly SGCAPARROW_RIM outside both arrow edges that meet
+            // at the matching corner (outside = the far side from a point inside the arrow, between tip and notch)
+            float inx = (m[0] + m[4])/2, iny = (m[1] + m[5])/2;
+            for(int k = 0; k < 4; k++) for(int e = 0; e < 2; e++)
+            {
+                int a = e ? k : (k+3)%4, c = e ? (k+1)%4 : k;   // edge a->c: the one arriving at corner k, then the one leaving it
+                float ex = m[c*2] - m[a*2], ey = m[c*2+1] - m[a*2+1], el = sqrt(ex*ex + ey*ey);
+                float dv = (ex*(v[k*2+1] - m[a*2+1]) - ey*(v[k*2] - m[a*2]))/el, di = (ex*(iny - m[a*2+1]) - ey*(inx - m[a*2]))/el;
+                if(fabs(fabs(dv) - SGCAPARROW_RIM) > 0.01f || dv*di >= 0) { rimout = false; snprintf(rimgot, sizeof(rimgot), "corner %d edge %d->%d at %.3f (inside side %s) at bearing %.2f", k, a, c, dv, dv*di >= 0 ? "yes" : "no", b); }
+            }
+        }
+        snprintf(what, sizeof(what), "spot %4.0f wide: every bearing, arrow and rim 16+ inside the screen", hudw);
+        check(what, inside, inside ? "all" : got, "all");
+        snprintf(what, sizeof(what), "spot %4.0f wide: every bearing, -bearing is the mirror image", hudw);
+        check(what, mirror, mirror ? "mirrored" : "not mirrored", "mirrored");
+        snprintf(what, sizeof(what), "spot %4.0f wide: every bearing, the tip points along the bearing", hudw);
+        check(what, tipout, tipout ? "along" : "off", "along");
+        snprintf(what, sizeof(what), "shape %4.0f wide: every bearing, the rim is SGCAPARROW_RIM outside every edge", hudw);
+        check(what, rimout, rimgot, "all");
+    }
+
+    if(bad) { printf("FAILED: %d of %d case(s)\n", bad, ran); return 1; }
+    printf("ALL %d CASES PASS\n", ran);
+    return 0;
+}
+CPP
+  g++ -O0 -Wall -fsigned-char -I"$TMP" -o "$TMP/caparrow" "$TMP/caparrow.cpp" || { echo "FAIL: cap arrow unit did not compile standalone (engine state leaked in?)"; return 1; }
+  "$TMP/caparrow" || return 1
+  echo "  -- again with the engine's float flags (-O3 -ffast-math) --"
+  g++ -O3 -fomit-frame-pointer -ffast-math -Wall -fsigned-char -I"$TMP" -o "$TMP/caparrow-fast" "$TMP/caparrow.cpp" || { echo "FAIL: cap arrow unit did not compile with the engine's flags"; return 1; }
+  "$TMP/caparrow-fast" > "$TMP/caparrow-fast.log" || { cat "$TMP/caparrow-fast.log"; return 1; }
+  tail -1 "$TMP/caparrow-fast.log"
+  # The HUD call must feed the unit the real camera and fov, and gate on plain ctf (protect and hold
+  # share this drawhud()) and on carrying with a known own stand.
+  local n pat
+  for pat in 'sgcaparrowbearing(camera1->yaw, stand.x - camera1->o.x, stand.y - camera1->o.y)' \
+             'sgcaparrowhidden(bearing, fov)' \
+             'if(!sgcaparrow || d->state != CS_ALIVE || intermission || !m_ctf_only || st.carried < 0 || st.own < 0) return;' \
+             'const vec &stand = flags[st.own].spawnloc;' \
+             'drawcaparrow(d, st, w, h);'; do
+    n="$(tr -d '\r' < "$TREE/fpsgame/ctf.h" | grep -cF "$pat" || true)"
+    [ "$n" = "1" ] || { echo "FAIL: expected exactly 1 line '$pat' in fpsgame/ctf.h, found $n"; return 1; }
+  done
+  echo "  ok   the HUD call feeds camera1, fov and the capture stand, and gates on alive, not intermission, m_ctf_only, carrying"
+}
+
 FAILED=0
 banner_test || FAILED=1
 timercue_test || FAILED=1
 flagwarn_test || FAILED=1
+caparrow_test || FAILED=1
 [ "$FAILED" = "0" ] || { echo "FAILED: see the FAIL lines above"; exit 1; }
 echo "ALL SECTIONS PASS"
