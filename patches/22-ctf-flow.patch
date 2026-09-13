@@ -1,0 +1,182 @@
+--- a/fpsgame/client.cpp
++++ b/fpsgame/client.cpp
+@@ -1216,6 +1216,11 @@
+         // resetafklatches() (fpsgame/fps.cpp) for the full reasoning.
+         extern void resetafklatches();
+         resetafklatches();
++        // SwiftGibs match cues (patch 22): same every-disconnect-and-quit reasoning as the resets
++        // above - no per-match cue state (the end-of-match banner and later cues) may outlive its
++        // match. See sgmatchcuesreset() (fpsgame/fps.cpp).
++        extern void sgmatchcuesreset();
++        sgmatchcuesreset();
+     }
+ 
+     VARP(teamcolorchat, 0, 1, 1);
+--- a/fpsgame/fps.cpp
++++ b/fpsgame/fps.cpp
+@@ -691,6 +691,107 @@
+         else flagpopupmillis = 0;
+     }
+ 
++    // === SwiftGibs match cues (patch 22, CTF match-flow round) ==================================
++    // Design: docs/superpowers/specs/2026-09-13-ctf-match-flow-design.md (untracked locally).
++    // Per-match state for this round's cues lives in this section, above its first users
++    // (timeupdate() and startgame() below); sgmatchcuesreset() at the end clears all of it.
++    //
++    // End-of-match banner: at intermission one large centred line gives the result from the local
++    // player's point of view (VICTORY / DEFEAT / DRAW, WON / LOST, "3rd of 8", or "<X> WINS" for a
++    // spectator, never "you"), then fades out over sgendbannertime so it is gone before the player
++    // reads the scoreboard. Presentation only: it reads the same winner lists the stock win
++    // animation uses (getbestteams()/getbestplayers(), fpsgame/scoreboard.cpp) and changes no game
++    // state, so it may also show in demo/clip playback, which is correct. Drawn by drawendbanner().
++    VARP(sgendbanner, 0, 1, 1);                 // banner on/off
++    VARP(sgendbannertime, 1000, 4000, 10000);   // ms on screen: full strength for the first half, then fading out
++
++    // sgendbannerresult: begin pure unit - tools/test-ctf-flow.sh compiles this block on its own, so it must stay free of engine state
++    enum { SGEND_NEUTRAL = 0, SGEND_WIN, SGEND_LOSS };   // banner colour class: white, win colour, loss colour
++
++    // Writes the banner line into text and returns its SGEND_* class. Every input is passed in by
++    // sgendbannertrigger() below:
++    //   teammode     m_teammode
++    //   self         the local player (player1)
++    //   players      game::players as the engine keeps it, which INCLUDES the local player
++    //                (initclient() adds player1), so the count loop skips self and self is
++    //                counted exactly once
++    //   bestteams    getbestteams() output, read in team modes
++    //   bestplayers  getbestplayers() output, read by an FFA spectator
++    static int sgendbannerresult(char *text, int len, bool teammode, const fpsent *self, const vector<fpsent *> &players,
++                                 const vector<const char *> &bestteams, const vector<fpsent *> &bestplayers)
++    {
++        bool spectating = self->state == CS_SPECTATOR;
++        if(teammode)
++        {
++            if(bestteams.length() != 1) { copystring(text, "DRAW", len); return SGEND_NEUTRAL; }   // level, or no team scored (0-0 ctf lists none)
++            if(spectating)
++            {
++                nformatstring(text, len, "%s WINS", bestteams[0]);
++                for(char *c = text; *c; c++) *c = cubeupper(*c);   // GOOD WINS, not good WINS
++                return SGEND_NEUTRAL;
++            }
++            bool won = !strcmp(self->team, bestteams[0]);
++            copystring(text, won ? "VICTORY" : "DEFEAT", len);
++            return won ? SGEND_WIN : SGEND_LOSS;
++        }
++        if(spectating)
++        {
++            if(bestplayers.length() != 1) { copystring(text, "DRAW", len); return SGEND_NEUTRAL; }
++            nformatstring(text, len, "%s WINS", bestplayers[0]->name);   // player names keep their own case
++            return SGEND_NEUTRAL;
++        }
++        int total = 1, ahead = 0, level = 0;   // total starts at 1 for self: playing, so scoring
++        loopv(players)
++        {
++            const fpsent *o = players[i];
++            if(o == self || o->state == CS_SPECTATOR) continue;
++            total++;
++            if(o->frags > self->frags) ahead++;
++            else if(o->frags == self->frags) level++;
++        }
++        if(total == 2)   // duel: exactly two scoring players, self included
++        {
++            copystring(text, ahead ? "LOST" : level ? "DRAW" : "WON", len);
++            return ahead ? SGEND_LOSS : level ? SGEND_NEUTRAL : SGEND_WIN;
++        }
++        int place = ahead + 1;   // standard competition ranking: players level on frags share a place
++        if(place == 1) { nformatstring(text, len, "VICTORY - 1st of %d", total); return SGEND_WIN; }
++        int tens = place%100, units = place%10;
++        const char *suffix = tens >= 11 && tens <= 13 ? "th" : units == 1 ? "st" : units == 2 ? "nd" : units == 3 ? "rd" : "th";
++        nformatstring(text, len, "%d%s of %d", place, suffix, total);
++        return SGEND_NEUTRAL;
++    }
++    // sgendbannerresult: end pure unit
++
++    static int sgendmillis = 0;              // lastmillis when the banner was triggered, 0 = idle
++    static int sgendclass = SGEND_NEUTRAL;   // colour class of sgendtext
++    static string sgendtext;                 // the line to show
++
++    // Called from timeupdate() where intermission is set: gathers what the pure unit above needs,
++    // the same winner lists render.cpp gathers for the stock win animation.
++    static void sgendbannertrigger()
++    {
++        sgendmillis = 0;
++        sgendtext[0] = '\0';
++        if(!sgendbanner) return;
++        vector<const char *> bestteams;
++        vector<fpsent *> bestplayers;
++        if(m_teammode) getbestteams(bestteams);
++        else getbestplayers(bestplayers);
++        sgendclass = sgendbannerresult(sgendtext, sizeof(sgendtext), m_teammode, player1, players, bestteams, bestplayers);
++        sgendmillis = lastmillis;
++    }
++
++    // Clears every per-match cue latch in this section so nothing from one match can bleed into the
++    // next. Called from startgame() (every real match start) and from gamedisconnect()
++    // (fpsgame/client.cpp: every disconnect and quit), the same two-site idiom as resetafklatches().
++    void sgmatchcuesreset()
++    {
++        sgendmillis = 0;
++        sgendtext[0] = '\0';
++    }
++    // === end SwiftGibs match cues state =========================================================
++
+     // === SwiftGibs career stats file writer (Task 6) ===
+     ICOMMAND(writestatsfile, "iiiiiis", (int *m,int *f,int *d,int *dmg,int *sh,int *bs,char *ts),
+     {
+@@ -1160,6 +1261,7 @@
+             // the next real match (see the startgame() hook above), not immediately here - there
+             // is nothing to capture during intermission itself.
+             cliprecordfinalizeall("intermission");
++            sgendbannertrigger();   // SwiftGibs match cues (patch 22): end-of-match banner
+             player1->attacking = false;
+             if(cmode) cmode->gameover();
+             conoutf(CON_GAMEINFO, "\f2intermission:");
+@@ -1302,6 +1404,7 @@
+         killstreak = 0;
+         matchbeststreak = 0;
+         flagpopupmillis = 0;
++        sgmatchcuesreset();   // SwiftGibs match cues (patch 22): no cue state survives into a new match
+         loopv(players) { players[i]->cstreak = 0; players[i]->bstreak = 0; }
+ 
+         setclientmode();
+@@ -2174,11 +2277,41 @@
+         pophudmatrix();
+     }
+ 
++    // SwiftGibs match cues (patch 22): end-of-match banner. State and trigger live in the match
++    // cues section further up (sgendbannertrigger()). Drawn from the post-gui overlay just below,
++    // not from gameplayhud(): gl_drawhud() (engine/rendergl.cpp) runs gameplayhud() BEFORE
++    // g3d_render2d() draws the 2D guis, so a gameplayhud() banner sits under the translucent
++    // intermission scoreboard that showscores(true) opens. Here it sits on top while it fades.
++    // Same visibility gate as gameplayhud() itself (!hidehud && !mainmenu), same centred, scaled,
++    // upper-third idiom as drawflagpopup().
++    void drawendbanner(int w, int h)
++    {
++        if(!sgendbanner || !sgendmillis || hidehud || mainmenu) return;
++        int t = lastmillis - sgendmillis;
++        if(t >= sgendbannertime) { sgendmillis = 0; return; }
++        float fade = 1.0f - float(t)/float(sgendbannertime);
++        int a = int(255*min(1.0f, fade*2.0f));   // full strength for the first half, then fade out
++        static const uchar colours[3][3] = { { 255, 255, 255 }, { 255, 200, 64 }, { 255, 72, 72 } };   // SGEND_NEUTRAL white, SGEND_WIN gold, SGEND_LOSS red
++        const uchar *col = colours[sgendclass];
++        int cx = 1800*w/h/2, cy = 1800/3;
++        int tw, th; text_bounds(sgendtext, tw, th);
++        float scale = min(2.5f, 0.9f*1800*w/h/max(tw, 1));   // a long name shrinks to fit instead of running off the screen
++        pushhudmatrix();
++        hudmatrix.scale(h/1800.0f, h/1800.0f, 1);
++        hudmatrix.translate(cx, cy, 0);
++        hudmatrix.scale(scale, scale, 1);
++        flushhudmatrix();
++        hudshader->set();   // draw_text() binds no shader and the gui pass may end on an untextured one, same as drawstreakfx()
++        draw_text(sgendtext, -tw/2, -th/2, col[0], col[1], col[2], a);
++        pophudmatrix();
++    }
++
+     // Post-gui overlay: cue demos must draw AFTER g3d_render2d or menu windows cover them
+     // (that is exactly where a player is when auditioning styles). Real reloads keep the
+     // normal gameplayhud draw above.
+     void reloadhudoverlay(int w, int h)
+     {
++        drawendbanner(w, h);   // SwiftGibs match cues (patch 22): over the intermission scoreboard, see drawendbanner()
+         if(!reloaddemoing() && !hitmarkerdemoing() && !streakfxdemoing()) return;
+         reloadoverlaypass = true;
+         pushhudmatrix();
