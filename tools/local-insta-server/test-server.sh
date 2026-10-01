@@ -5,10 +5,11 @@
 #   2. a suicided player is auto-respawned with no N_TRYSPAWN sent
 #   3. a player killed by a real rifle hit is auto-respawned
 #   4. control: with autospawn 0 the same probe stays dead (the test can fail)
-#   5. insta reload: off by default (control: no re-arm, 100ms follow-up shot
+#   5. insta reload: off by default (control: no re-arm, 300ms follow-up shot
 #      rejected), "/servcmd instareload on" re-arms the killer on a kill (self
 #      N_SHOTFX + wrapped N_GUNSELECT) and the follow-up shot lands, and with a
 #      master present only the master may toggle ("#instareload off" by chat)
+# Shares /tmp/local-insta-server and port 28985 with test-client.sh: run one at a time.
 #   6. instareloadgun 2 sends the chaingun as the re-arm fx gun
 # Runs on test port 28985 so a live 28785 server is left alone.
 set -euo pipefail
@@ -50,15 +51,15 @@ start_server 0
 run_probe nospawn
 stop_server
 
-echo "== insta reload: off control, servcmd toggle, master-only rule (publicserver 2 lets the probe claim master) =="
-start_server 1 'publicserver 2\n'
+echo "== insta reload: off control, servcmd toggle, master-only rule (the probe claims master with /setmaster 1, as any player may while nobody holds it) =="
+start_server 1
 run_probe instareload-off
 run_probe instareload
 run_probe instareload-master
 stop_server
 
 echo "== insta reload: instareloadgun 2 re-arms with the chaingun fx =="
-start_server 1 'publicserver 2\ninstareloadgun 2\n'
+start_server 1 'instareloadgun 2\n'
 SPAWNPROBE_FXGUN=2 run_probe instareload
 stop_server
 

@@ -53,7 +53,7 @@ FAILED=0
 run_mode() { # $1 = on|off
   local mode=$1
   local clog="$H/client-$mode.log" plog="$H/probe-$mode.log"
-  printf 'serverport %s\nupdatemaster 0\nmaxclients 8\ndefaultmap "fdm6"\ndefaultmode 3\nautospawn 1\nautospawndelay 0\npublicserver 2\n' "$PORT" > "$H/server-init.cfg"
+  printf 'serverport %s\nupdatemaster 0\nmaxclients 8\ndefaultmap "fdm6"\ndefaultmode 3\nautospawn 1\nautospawndelay 0\n' "$PORT" > "$H/server-init.cfg"
   "$B/sauer_server" -q"$H" > "$H/server-$mode.log" 2>&1 & SERVER_PID=$!
   sleep 1
   SPAWNPROBE_IDLE_MS=90000 "$B/spawnprobe" "$PORT" idle > "$plog" 2>&1 & PROBE_PID=$!

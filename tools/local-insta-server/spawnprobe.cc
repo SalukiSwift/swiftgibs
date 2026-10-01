@@ -17,11 +17,11 @@
 //                               expects the server's re-arm pair back (an
 //                               N_SHOTFX for ITSELF with the fx gun, then an
 //                               N_CLIENT-wrapped N_GUNSELECT restoring its
-//                               rifle), and 100ms later kills the bystander -
+//                               rifle), and 300ms later kills the bystander -
 //                               a shot the stock 1500ms rifle wait would reject
 //   spawnprobe <port> instareload-off
 //                               control, mode off: killer gets no self
-//                               N_SHOTFX and the 100ms follow-up shot is
+//                               N_SHOTFX and the 300ms follow-up shot is
 //                               rejected (bystander survives)
 //   spawnprobe <port> instareload-master
 //                               killer claims master (server needs
@@ -282,6 +282,7 @@ static void handlemsg(Conn &c, buf &p)
         case N_CLIENT:
         {
             int scn = getint(p); int len = getuint(p);
+            if(len > p.len - p.pos) len = p.len - p.pos; // never read past the packet on a bad length
             if(scn == c.cn) // only insta reload wraps a message in OUR cn: expect N_GUNSELECT <gun>
             {
                 buf q(p.data + p.pos, len);
@@ -470,9 +471,10 @@ static bool waitservmsg(Conn *conns[], int nconns, Conn &who, const char *needle
     return false;
 }
 
-// insta reload scenarios share one shape: killer A frags victim B, then 100ms later (by the
+// insta reload scenarios share one shape: killer A frags victim B, then 300ms later (by the
 // client clock the server is told) shoots bystander C. Stock rifle wait is 1500ms, so the
-// follow-up lands only if the server re-armed A on the kill.
+// follow-up lands only if the server re-armed A on the kill (its wait becomes the fx gun's:
+// 250ms fist, 100ms chaingun - the server keeps that much of a rate limit on purpose).
 static int instareloadround(Conn *cs[], Conn &a, Conn &b, Conn &c, bool expecton, int fxgun)
 {
     a.selfshotfx = 0; a.selfshotfxgun = -1; a.wrappedgunsel = -1;
@@ -487,10 +489,10 @@ static int instareloadround(Conn *cs[], Conn &a, Conn &b, Conn &c, bool expecton
     }
     else if(a.selfshotfx || a.wrappedgunsel >= 0)
     { printf("FAIL: mode off but got re-arm traffic (selfshotfx=%d wrappedgunsel=%d)\n", a.selfshotfx, a.wrappedgunsel); return 1; }
-    shootat(a, c, 200); // 100ms after the kill shot on the client clock
+    shootat(a, c, 400); // 300ms after the kill shot on the client clock
     bool cdied = waitdied(cs, 3, c, 1000);
-    if(expecton && !cdied) { printf("FAIL: follow-up shot 100ms after the kill was rejected (server wait not reset)\n"); return 1; }
-    if(!expecton && cdied) { printf("FAIL: follow-up shot 100ms after the kill was ACCEPTED with the mode off\n"); return 1; }
+    if(expecton && !cdied) { printf("FAIL: follow-up shot 300ms after the kill was rejected (server wait not reset)\n"); return 1; }
+    if(!expecton && cdied) { printf("FAIL: follow-up shot 300ms after the kill was ACCEPTED with the mode off\n"); return 1; }
     return 0;
 }
 
@@ -563,13 +565,13 @@ static int run(int argc, char **argv)
             servcmd(*a, "instareload on");
             if(!waitservmsg(cs, 3, *a, "ON", 1000)) { printf("FAIL: '/servcmd instareload on' not acknowledged\n"); return 1; }
             if(instareloadround(cs, *a, *b, *c, true, fxgun)) return 1;
-            printf("PASS: kill re-armed the killer (self N_SHOTFX gun %d + wrapped N_GUNSELECT rifle) and a shot 100ms later killed the bystander\n", fxgun);
+            printf("PASS: kill re-armed the killer (self N_SHOTFX gun %d + wrapped N_GUNSELECT rifle) and a shot 300ms later killed the bystander\n", fxgun);
             return 0;
         }
         if(!strcmp(scen, "instareload-off"))
         {
             if(instareloadround(cs, *a, *b, *c, false, fxgun)) return 1;
-            printf("PASS: mode off (control) - no re-arm traffic and the 100ms follow-up shot was rejected\n");
+            printf("PASS: mode off (control) - no re-arm traffic and the 300ms follow-up shot was rejected\n");
             return 0;
         }
         if(!strcmp(scen, "instareload-master"))

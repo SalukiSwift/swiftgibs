@@ -7,7 +7,8 @@
 # The box remembers which patch it has as src/applied-local-insta-server.patch (written by this
 # script). The first deploy predates that file, so pass the patch it was built with:
 #   OLD_PATCH=/path/to/previous/local-insta-server.patch tools/local-insta-server/deploy-scringle.sh
-# DRY_RUN=1 only checks that both patch steps would apply cleanly (read-only on the box).
+# DRY_RUN=1 only checks that both patch steps would apply cleanly (touches nothing outside
+# $APP/deploy/ on the box).
 # The service config (server-init.cfg) is never touched; add `instareload 1` there by hand if the
 # mode should boot on.
 set -euo pipefail
@@ -25,23 +26,29 @@ ssh "$HOST" bash -s "$APP" "${DRY_RUN:-0}" "$([ -n "$OLD" ] && echo 1 || echo 0)
 set -euo pipefail
 APP=$1 DRY=$2 HAVEOLD=$3
 cd "$APP/src"
-OLD="$APP/src/applied-local-insta-server.patch"
-[ -f "$OLD" ] || { [ "$HAVEOLD" = 1 ] && OLD="$APP/deploy/previous.patch"; } || { echo "no record of the box's current patch: pass OLD_PATCH"; exit 1; }
-echo "== revert current patch (dry run) =="; patch -R -p1 --dry-run < "$OLD"
+RECORD="$APP/src/applied-local-insta-server.patch"   # the patch the box's src currently carries
+if [ -f "$RECORD" ]; then OLD="$RECORD"; elif [ "$HAVEOLD" = 1 ]; then OLD="$APP/deploy/previous.patch"; else echo "no record of the box's current patch: pass OLD_PATCH"; exit 1; fi
+echo "== revert current patch (dry run) =="; patch -R -p1 --fuzz=0 --dry-run < "$OLD"
 echo "== apply incoming patch on the reverted tree (dry run via scratch copy) =="
 rm -rf "$APP/deploy/scratch"; mkdir -p "$APP/deploy/scratch/fpsgame"; cp fpsgame/server.cpp "$APP/deploy/scratch/fpsgame/"
-( cd "$APP/deploy/scratch" && patch -R -p1 -s < "$OLD" && patch -p1 --dry-run < "$APP/deploy/incoming.patch" )
+( cd "$APP/deploy/scratch" && patch -R -p1 --fuzz=0 -s < "$OLD" && patch -p1 --fuzz=0 --dry-run < "$APP/deploy/incoming.patch" )
 if [ "$DRY" = 1 ]; then echo "DRY RUN OK: both steps apply cleanly; nothing changed"; exit 0; fi
-patch -R -p1 < "$OLD"
-patch -p1 < "$APP/deploy/incoming.patch"
-cp "$APP/deploy/incoming.patch" "$OLD"
+patch -R -p1 --fuzz=0 < "$OLD"
+patch -p1 --fuzz=0 < "$APP/deploy/incoming.patch"
+cp "$APP/deploy/incoming.patch" "$RECORD"
 echo "== build =="; make -j"$(nproc)" server > "$APP/deploy/build.log" 2>&1 || { tail -20 "$APP/deploy/build.log"; exit 1; }
-STAMP=$(date +%F-%H%M)
-cp "$APP/sauer_server" "$APP/sauer_server.bak-$STAMP"
+STAMP=$(date +%F-%H%M%S)
+cp -p "$APP/sauer_server" "$APP/sauer_server.bak-$STAMP"
 install -o sauer -g sauer -m 755 sauer_server "$APP/sauer_server"
 systemctl restart scringle-insta
 sleep 2
-systemctl is-active scringle-insta
+if ! systemctl is-active --quiet scringle-insta; then
+  echo "!! new server did not come up - rolling back to sauer_server.bak-$STAMP"
+  journalctl -u scringle-insta -n 20 --no-pager
+  install -o sauer -g sauer -m 755 "$APP/sauer_server.bak-$STAMP" "$APP/sauer_server"
+  systemctl restart scringle-insta; sleep 2; systemctl is-active scringle-insta || true
+  exit 1
+fi
 journalctl -u scringle-insta -n 3 --no-pager
 echo "deployed; previous binary kept as sauer_server.bak-$STAMP"
 REMOTE

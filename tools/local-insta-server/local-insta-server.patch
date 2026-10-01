@@ -10,7 +10,7 @@
 +    VAR(autospawn, 0, 0, 1);         // 1 = server respawns dead players itself
 +    VAR(autospawndelay, 0, 0, 5000); // extra ms on top of the engine's DEATHMILLIS flush window
 +    VAR(instareload, 0, 0, 1);       // 1 = a kill re-arms the killer's rifle (see instareloadkiller); chat/servcmd toggle
-+    VAR(instareloadgun, 0, 0, 6);    // gun the killer's client is told it just fired: 0 fist = 250ms + chainsaw rev, 2 chaingun = 100ms + bang/flash
++    VAR(instareloadgun, 0, 0, 2);    // gun the killer's client is told it just fired: 0 fist = 250ms + chainsaw rev, 2 chaingun = 100ms + bang/flash (1 = fist too)
 +    void changemap(const char *s, int mode);
 +
      void maprotationreset()
@@ -24,7 +24,7 @@
      }
  
      int numclients(int exclude = -1, bool nospec = true, bool noai = true, bool priv = false)
-@@ -2316,6 +2326,65 @@
+@@ -2316,6 +2326,66 @@
  
      void startintermission() { gamelimit = min(gamelimit, gamemillis); checkintermission(true); }
  
@@ -39,13 +39,14 @@
 +    // player1 through a client-originated message) puts the rifle back in the same packet, so no
 +    // frame ever renders the fx gun. What the player notices: the fx gun's shot sound (fist = a
 +    // ~300ms chainsaw rev with chainsawhudgun 1, the default; a punch whoosh with 0) plus the
-+    // weapon-load click. The server half is just gunwait = 0 so the next shot is accepted at once.
++    // weapon-load click. The server half mirrors that: the wait becomes the fx gun's delay, which
++    // a stock client cannot beat, so a cheating client gets no better fire rate than an honest one.
 +    void instareloadkiller(clientinfo *actor)
 +    {
 +        gamestate &gs = actor->state;
 +        if(gs.state!=CS_ALIVE || gs.aitype!=AI_NONE) return;
-+        gs.gunwait = 0;
-+        int fxgun = clamp(instareloadgun, int(GUN_FIST), int(GUN_PISTOL));
++        int fxgun = instareloadgun==2 ? GUN_CG : GUN_FIST; // only these two make sense: see the cvar
++        gs.gunwait = guns[fxgun].attackdelay;
 +        vec o = gs.o.x > -1e9f ? gs.o : vec(0, 0, 0);
 +        ivec fx(vec(o.x, o.y, o.z - 4096).mul(DMF)); // far below the map: the chaingun option's sparks/decal land out of sight
 +        packetbuf p(MAXTRANS, ENET_PACKET_FLAG_RELIABLE);
@@ -90,15 +91,15 @@
      void dodamage(clientinfo *target, clientinfo *actor, int damage, int gun, const vec &hitpush = vec(0, 0, 0))
      {
          gamestate &ts = target->state;
-@@ -2344,6 +2413,7 @@
+@@ -2344,6 +2414,7 @@
              teaminfo *t = m_teammode ? teaminfos.access(actor->team) : NULL;
              if(t) t->frags += fragvalue; 
              sendf(-1, 1, "ri5", N_DIED, target->clientnum, actor->clientnum, actor->state.frags, t ? t->frags : 0);
-+            if(instareload && fragvalue>0) instareloadkiller(actor);
++            if(instareload && fragvalue>0 && gun==GUN_RIFLE) instareloadkiller(actor); // rifle kills only: a voted non-insta mode keeps its other guns' rates
              target->position.setsize(0);
              if(smode) smode->died(target, actor);
              ts.state = CS_DEAD;
-@@ -2537,6 +2607,24 @@
+@@ -2537,6 +2608,24 @@
              else if(!m_timed || gamemillis < gamelimit)
              {
                  processevents();
@@ -123,7 +124,7 @@
                  if(curtime)
                  {
                      loopv(sents) if(sents[i].spawntime) // spawn entities when timer reached
-@@ -2693,6 +2781,7 @@
+@@ -2693,6 +2782,7 @@
      {
          bannedips.shrink(0);
          aiman::clearai();
@@ -131,7 +132,7 @@
      }
  
      void localconnect(int n)
-@@ -3333,10 +3422,11 @@
+@@ -3333,10 +3423,11 @@
  
              case N_TEXT:
              {
@@ -145,7 +146,7 @@
                  QUEUE_STR(text);
                  if(isdedicatedserver() && cq) logoutf("%s: %s", colorname(cq), text);
                  break;
-@@ -3790,6 +3880,7 @@
+@@ -3790,6 +3881,7 @@
  
              case N_SERVCMD:
                  getstring(text, p);
