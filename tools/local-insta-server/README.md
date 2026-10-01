@@ -81,8 +81,8 @@ Only rifle kills count, so a voted non-insta mode keeps its other guns' rates.
 
 What it does: the moment a rifle kill registers, the server drops the killer's
 gun wait to the re-arm gun's delay (the most a stock client can use, so a
-cheating client gains nothing) and sends the killer's client a two-message
-packet that re-arms its own rifle gate. Why that is needed, and
+modified client gains at most about one round trip) and sends the killer's
+client a two-message packet that re-arms its own rifle gate. Why that is needed, and
 why "instant" is really ~250ms: a stock 2020 client gates its own rifle purely
 locally (`fpsgame/weapon.cpp shoot()`: no shot until
 `lastmillis - lastaction >= gunwait`, 1500ms for the rifle), and the only
@@ -110,8 +110,8 @@ gate itself opened at ~270ms.
 
 SwiftGibs clients: the reload countdown, ready flash and metronome all key on
 `lastattackgun == GUN_RIFLE`, so after the fist re-arm they simply vanish (no
-ready cue) and the reload-charge sound still plays its full 1.5s; replay
-clips keep the fist rev. A small client patch could turn the self N_SHOTFX
+ready cue) and the reload-charge sound, if `reloadsound` is on, still plays
+its full 1.5s; replay clips keep the fist rev. A small client patch could turn the self N_SHOTFX
 into a proper "ready" cue if the mode sticks - deliberately not done here.
 
 ## Test it
@@ -137,6 +137,6 @@ script hooks (fire, spawn, aim, reload-state dump) so a `-x` script can drive
 it headless (SDL offscreen video on llvmpipe, dummy audio). The idle probe
 parks a victim 10 units in front of the client; the client kills it, dumps
 its gate, then shoots the bystander that takes the victim's spot. Mode on: the
-dump shows the fist re-arm and the bystander dies ~500ms after the victim.
+dump shows the fist re-arm and the bystander dies ~540ms after the victim.
 Mode off (control): the stock 1500ms gate holds and no second shot happens.
 Each mode takes ~40s, mostly waiting for the software-rendered map load.

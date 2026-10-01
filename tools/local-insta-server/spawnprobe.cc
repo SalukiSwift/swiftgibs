@@ -24,11 +24,15 @@
 //                               N_SHOTFX and the 300ms follow-up shot is
 //                               rejected (bystander survives)
 //   spawnprobe <port> instareload-master
-//                               killer claims master (server needs
-//                               publicserver 2), turns the mode off by chat
+//                               killer claims master (any player may, while
+//                               nobody holds it), turns the mode off by chat
 //                               "#instareload off"; the bystander's
 //                               "#instareload on" is refused while a master is
 //                               on; follow-up shot still rejected
+//   spawnprobe <port> instareload-floor
+//                               mode on, but the follow-up comes 200ms after
+//                               the kill: the server must still reject it (its
+//                               wait is the fist's 250ms, never 0)
 //
 //   spawnprobe <port> idle      stand-in victim (cn 0) + bystander (cn 1) for
 //                               test-client.sh: parked in front of a REAL
@@ -282,7 +286,7 @@ static void handlemsg(Conn &c, buf &p)
         case N_CLIENT:
         {
             int scn = getint(p); int len = getuint(p);
-            if(len > p.len - p.pos) len = p.len - p.pos; // never read past the packet on a bad length
+            if(len < 0 || len > p.len - p.pos) die("N_CLIENT length outside the packet");
             if(scn == c.cn) // only insta reload wraps a message in OUR cn: expect N_GUNSELECT <gun>
             {
                 buf q(p.data + p.pos, len);
@@ -475,7 +479,7 @@ static bool waitservmsg(Conn *conns[], int nconns, Conn &who, const char *needle
 // client clock the server is told) shoots bystander C. Stock rifle wait is 1500ms, so the
 // follow-up lands only if the server re-armed A on the kill (its wait becomes the fx gun's:
 // 250ms fist, 100ms chaingun - the server keeps that much of a rate limit on purpose).
-static int instareloadround(Conn *cs[], Conn &a, Conn &b, Conn &c, bool expecton, int fxgun)
+static int instareloadround(Conn *cs[], Conn &a, Conn &b, Conn &c, bool expecton, int fxgun, int followms = 300)
 {
     a.selfshotfx = 0; a.selfshotfxgun = -1; a.wrappedgunsel = -1;
     shootat(a, b, 100);
@@ -489,10 +493,10 @@ static int instareloadround(Conn *cs[], Conn &a, Conn &b, Conn &c, bool expecton
     }
     else if(a.selfshotfx || a.wrappedgunsel >= 0)
     { printf("FAIL: mode off but got re-arm traffic (selfshotfx=%d wrappedgunsel=%d)\n", a.selfshotfx, a.wrappedgunsel); return 1; }
-    shootat(a, c, 400); // 300ms after the kill shot on the client clock
+    shootat(a, c, 100 + followms); // followms after the kill shot on the client clock
     bool cdied = waitdied(cs, 3, c, 1000);
-    if(expecton && !cdied) { printf("FAIL: follow-up shot 300ms after the kill was rejected (server wait not reset)\n"); return 1; }
-    if(!expecton && cdied) { printf("FAIL: follow-up shot 300ms after the kill was ACCEPTED with the mode off\n"); return 1; }
+    if(expecton && !cdied) { printf("FAIL: follow-up shot %dms after the kill was rejected (server wait not reset)\n", followms); return 1; }
+    if(!expecton && cdied) { printf("FAIL: follow-up shot %dms after the kill was ACCEPTED (mode off, or the server wait fell below the fx gun's delay)\n", followms); return 1; }
     return 0;
 }
 
@@ -501,7 +505,7 @@ int main(int argc, char **argv) { int rc = run(argc, argv); leaveall(); return r
 
 static int run(int argc, char **argv)
 {
-    if(argc != 3) { fprintf(stderr, "usage: spawnprobe <port> <suicide|kill|nospawn|instareload|instareload-off|instareload-master|idle>\n"); return 2; }
+    if(argc != 3) { fprintf(stderr, "usage: spawnprobe <port> <suicide|kill|nospawn|instareload|instareload-off|instareload-floor|instareload-master|idle>\n"); return 2; }
     int port = atoi(argv[1]);
     const char *scen = argv[2];
     if(enet_initialize() < 0) die("enet_initialize failed");
@@ -572,6 +576,20 @@ static int run(int argc, char **argv)
         {
             if(instareloadround(cs, *a, *b, *c, false, fxgun)) return 1;
             printf("PASS: mode off (control) - no re-arm traffic and the 300ms follow-up shot was rejected\n");
+            return 0;
+        }
+        if(!strcmp(scen, "instareload-floor"))
+        {
+            servcmd(*a, "instareload on");
+            if(!waitservmsg(cs, 3, *a, "ON", 1000)) { printf("FAIL: '/servcmd instareload on' not acknowledged\n"); return 1; }
+            // mode on, so the re-arm pair arrives, but the 200ms follow-up must still be refused
+            a->selfshotfx = 0; shootat(*a, *b, 100);
+            if(!waitdied(cs, 3, *b, 1000)) { printf("FAIL: rifle hit did not kill the victim\n"); return 1; }
+            pump(cs, 3, 50);
+            if(a->selfshotfx != 1) { printf("FAIL: expected the re-arm (mode is on), got %d self N_SHOTFX\n", a->selfshotfx); return 1; }
+            shootat(*a, *c, 300);
+            if(waitdied(cs, 3, *c, 600)) { printf("FAIL: follow-up 200ms after the kill was ACCEPTED - the server wait fell below the fist's 250ms\n"); return 1; }
+            printf("PASS: re-armed, yet a follow-up 200ms after the kill was rejected (server keeps the fist's 250ms floor)\n");
             return 0;
         }
         if(!strcmp(scen, "instareload-master"))

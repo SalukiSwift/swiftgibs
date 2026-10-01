@@ -8,9 +8,10 @@
 #   5. insta reload: off by default (control: no re-arm, 300ms follow-up shot
 #      rejected), "/servcmd instareload on" re-arms the killer on a kill (self
 #      N_SHOTFX + wrapped N_GUNSELECT) and the follow-up shot lands, and with a
-#      master present only the master may toggle ("#instareload off" by chat)
-# Shares /tmp/local-insta-server and port 28985 with test-client.sh: run one at a time.
+#      master present only the master may toggle ("#instareload off" by chat);
+#      a follow-up 200ms after a kill is still rejected (250ms fist floor)
 #   6. instareloadgun 2 sends the chaingun as the re-arm fx gun
+# Shares /tmp/local-insta-server and port 28985 with test-client.sh: run one at a time.
 # Runs on test port 28985 so a live 28785 server is left alone.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -55,6 +56,7 @@ echo "== insta reload: off control, servcmd toggle, master-only rule (the probe 
 start_server 1
 run_probe instareload-off
 run_probe instareload
+run_probe instareload-floor
 run_probe instareload-master
 stop_server
 

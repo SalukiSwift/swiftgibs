@@ -36,17 +36,21 @@ if [ "$DRY" = 1 ]; then echo "DRY RUN OK: both steps apply cleanly; nothing chan
 patch -R -p1 --fuzz=0 < "$OLD"
 patch -p1 --fuzz=0 < "$APP/deploy/incoming.patch"
 cp "$APP/deploy/incoming.patch" "$RECORD"
-echo "== build =="; make -j"$(nproc)" server > "$APP/deploy/build.log" 2>&1 || { tail -20 "$APP/deploy/build.log"; exit 1; }
+echo "== build =="; make -j"$(nproc)" server > "$APP/deploy/build.log" 2>&1 || { tail -20 "$APP/deploy/build.log"; echo "note: build failed; src and $RECORD carry the NEW patch, the live binary is unchanged"; exit 1; }
 STAMP=$(date +%F-%H%M%S)
 cp -p "$APP/sauer_server" "$APP/sauer_server.bak-$STAMP"
 install -o sauer -g sauer -m 755 sauer_server "$APP/sauer_server"
-systemctl restart scringle-insta
+# A refused/failed start must reach the rollback below, not exit under set -e.
+systemctl restart scringle-insta || true
 sleep 2
 if ! systemctl is-active --quiet scringle-insta; then
   echo "!! new server did not come up - rolling back to sauer_server.bak-$STAMP"
-  journalctl -u scringle-insta -n 20 --no-pager
+  journalctl -u scringle-insta -n 20 --no-pager || true
   install -o sauer -g sauer -m 755 "$APP/sauer_server.bak-$STAMP" "$APP/sauer_server"
-  systemctl restart scringle-insta; sleep 2; systemctl is-active scringle-insta || true
+  systemctl reset-failed scringle-insta || true   # a crash loop can trip the start limit
+  systemctl restart scringle-insta || true; sleep 2
+  systemctl is-active --quiet scringle-insta && echo "rolled back: old binary running again" || echo "!! rollback did not come up either - fix by hand"
+  echo "note: src and $RECORD now carry the NEW patch while the live binary is the OLD one"
   exit 1
 fi
 journalctl -u scringle-insta -n 3 --no-pager

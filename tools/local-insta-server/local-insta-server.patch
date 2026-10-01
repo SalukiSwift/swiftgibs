@@ -40,7 +40,7 @@
 +    // frame ever renders the fx gun. What the player notices: the fx gun's shot sound (fist = a
 +    // ~300ms chainsaw rev with chainsawhudgun 1, the default; a punch whoosh with 0) plus the
 +    // weapon-load click. The server half mirrors that: the wait becomes the fx gun's delay, which
-+    // a stock client cannot beat, so a cheating client gets no better fire rate than an honest one.
++    // a stock client cannot beat, so a modified client gains at most about one round trip.
 +    void instareloadkiller(clientinfo *actor)
 +    {
 +        gamestate &gs = actor->state;
