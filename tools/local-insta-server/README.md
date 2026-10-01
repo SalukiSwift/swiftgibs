@@ -15,6 +15,8 @@ server cvars (none shipped in any bundle):
   joined or just loaded a map still self-spawn the vanilla way)
 - `autospawndelay` - extra ms of death-cam on top of the 300ms flush window,
   if truly-instant ever feels too abrupt
+- `instareload` / `instareloadgun` - a kill re-arms the killer's rifle; see
+  "Insta reload" below
 
 ## Run it
 
@@ -63,6 +65,45 @@ and IP detection died silently, printing no address for friends to use.
 Friends need any Sauerbraten 2020 / SwiftGibs client - protocol 260, and fdm6
 is a stock map, so no downloads are needed.
 
+## Insta reload (a kill re-arms the rifle)
+
+Toggle in game, from any client, no client changes needed:
+
+    #instareload            (chat; toggles)      #instareload on / off
+    /servcmd instareload    (same, as a / command - "/instareload" itself never
+                             leaves a stock client: "/" runs client-side commands)
+
+The server answers with a message everyone sees. Anyone may toggle while no
+master or admin is on; once one is, only they may. Default is off; put
+`instareload 1` in server-init.cfg to boot with it on.
+
+What it does: the moment a kill registers, the server zeroes the killer's
+gun wait (so it accepts their next shot at once) and sends the killer's client
+a two-message packet that re-arms its own rifle gate. Why that is needed, and
+why "instant" is really ~250ms: a stock 2020 client gates its own rifle purely
+locally (`fpsgame/weapon.cpp shoot()`: no shot until
+`lastmillis - lastaction >= gunwait`, 1500ms for the rifle), and the only
+server message that touches those two fields on your own player is
+`N_SHOTFX`, which the client applies to any cn including its own. So the
+server tells the client it just fired `instareloadgun`, which sets the wait to
+THAT gun's delay, then an `N_GUNSELECT` wrapped in `N_CLIENT` with the
+killer's own cn puts the rifle back in the same packet, so no frame ever
+shows the other gun. Nothing else the server can send resets the gate without
+side effects (the respawn messages also zero it, but they teleport you or
+clear your velocity and held keys).
+
+- `instareloadgun 0` (fist, default): ready 250ms after the kill registers.
+  Side effects: a ~300ms chainsaw rev (the fist's attack sound; the stock
+  `chainsawhudgun 1` default) and the weapon-load click. A player who sets
+  `/chainsawhudgun 0` hears a punch whoosh instead.
+- `instareloadgun 2` (chaingun): ready after 100ms, but with a chaingun bang,
+  hud muzzle flash and a tracer. Louder and flashier; try it, see which reads
+  better in a duel.
+
+Measured with a real, unmodified 2020 client (test-client.sh below): the
+next shot landed 512ms after the kill, the script's own trigger timing; the
+gate itself opened at ~270ms.
+
 ## Test it
 
     tools/local-insta-server/test-server.sh
@@ -71,4 +112,20 @@ is a stock map, so no downloads are needed.
 WSLg). On test port 28985 it asserts the boot map/mode, then proves instant
 respawn on both death paths (suicide, and a real rifle kill between two probe
 clients) by watching for an UNSOLICITED spawnstate - the probe never sends
-N_TRYSPAWN. An `autospawn 0` control run proves the probe can fail.
+N_TRYSPAWN. An `autospawn 0` control run proves the probe can fail. The insta
+reload scenarios then prove the server half from the wire: off by default (a
+shot 100ms after a kill is rejected, no re-arm traffic), `/servcmd instareload
+on` re-arms the killer (self N_SHOTFX + wrapped N_GUNSELECT) and the 100ms
+follow-up shot kills, the master-only rule, and `instareloadgun 2`.
+
+    tools/local-insta-server/test-client.sh
+
+proves the half a player feels, against a REAL stock client: the vanilla 2020
+tree at `~/repos/sauerbraten/src` plus `harness-client.patch`, which only adds
+script hooks (fire, spawn, aim, reload-state dump) so a `-x` script can drive
+it headless (SDL offscreen video on llvmpipe, dummy audio). The idle probe
+parks a victim 10 units in front of the client; the client kills it, dumps
+its gate, then shoots the bystander that takes the victim's spot. Mode on: the
+dump shows the fist re-arm and the bystander dies ~500ms after the victim.
+Mode off (control): the stock 1500ms gate holds and no second shot happens.
+Each mode takes ~40s, mostly waiting for the software-rendered map load.

@@ -5,6 +5,11 @@
 #   2. a suicided player is auto-respawned with no N_TRYSPAWN sent
 #   3. a player killed by a real rifle hit is auto-respawned
 #   4. control: with autospawn 0 the same probe stays dead (the test can fail)
+#   5. insta reload: off by default (control: no re-arm, 100ms follow-up shot
+#      rejected), "/servcmd instareload on" re-arms the killer on a kill (self
+#      N_SHOTFX + wrapped N_GUNSELECT) and the follow-up shot lands, and with a
+#      master present only the master may toggle ("#instareload off" by chat)
+#   6. instareloadgun 2 sends the chaingun as the re-arm fx gun
 # Runs on test port 28985 so a live 28785 server is left alone.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -23,8 +28,8 @@ SERVER_PID=""
 stop_server() { [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null && wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=""; }
 trap stop_server EXIT
 
-start_server() { # $1 = autospawn value
-  printf 'serverport %s\nupdatemaster 0\nmaxclients 8\ndefaultmap "fdm6"\ndefaultmode 3\nautospawn %s\nautospawndelay 0\n' "$PORT" "$1" > "$H/server-init.cfg"
+start_server() { # $1 = autospawn value, $2 = extra config lines (optional)
+  printf 'serverport %s\nupdatemaster 0\nmaxclients 8\ndefaultmap "fdm6"\ndefaultmode 3\nautospawn %s\nautospawndelay 0\n%b' "$PORT" "$1" "${2:-}" > "$H/server-init.cfg"
   "$B/sauer_server" -q"$H" & SERVER_PID=$!
   sleep 1
 }
@@ -43,6 +48,18 @@ stop_server
 echo "== autospawn 0 control: probe must stay dead =="
 start_server 0
 run_probe nospawn
+stop_server
+
+echo "== insta reload: off control, servcmd toggle, master-only rule (publicserver 2 lets the probe claim master) =="
+start_server 1 'publicserver 2\n'
+run_probe instareload-off
+run_probe instareload
+run_probe instareload-master
+stop_server
+
+echo "== insta reload: instareloadgun 2 re-arms with the chaingun fx =="
+start_server 1 'publicserver 2\ninstareloadgun 2\n'
+SPAWNPROBE_FXGUN=2 run_probe instareload
 stop_server
 
 [ "$FAILED" = 0 ] && echo "ALL PASS" || { echo "FAILURES"; exit 1; }

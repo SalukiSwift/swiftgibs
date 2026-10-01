@@ -1,6 +1,6 @@
 --- a/fpsgame/server.cpp
 +++ b/fpsgame/server.cpp
-@@ -453,6 +453,13 @@
+@@ -453,6 +453,15 @@
  
      VAR(lockmaprotation, 0, 0, 2);
  
@@ -9,12 +9,14 @@
 +    VAR(defaultmode, 0, 3, 22);      // mode used with defaultmap (3 = instagib)
 +    VAR(autospawn, 0, 0, 1);         // 1 = server respawns dead players itself
 +    VAR(autospawndelay, 0, 0, 5000); // extra ms on top of the engine's DEATHMILLIS flush window
++    VAR(instareload, 0, 0, 1);       // 1 = a kill re-arms the killer's rifle (see instareloadkiller); chat/servcmd toggle
++    VAR(instareloadgun, 0, 0, 6);    // gun the killer's client is told it just fired: 0 fist = 250ms + chainsaw rev, 2 chaingun = 100ms + bang/flash
 +    void changemap(const char *s, int mode);
 +
      void maprotationreset()
      {
          maprotations.setsize(0);
-@@ -780,6 +787,7 @@
+@@ -780,6 +789,7 @@
      {
          smapname[0] = '\0';
          resetitems();
@@ -22,7 +24,81 @@
      }
  
      int numclients(int exclude = -1, bool nospec = true, bool noai = true, bool priv = false)
-@@ -2478,6 +2486,24 @@
+@@ -2316,6 +2326,65 @@
+ 
+     void startintermission() { gamelimit = min(gamelimit, gamemillis); checkintermission(true); }
+ 
++    // === INSTA RELOAD (tools/local-insta-server; not shipped in any bundle) ===
++    // A stock 2020 client gates its own rifle purely locally: fpsgame/weapon.cpp shoot() refuses
++    // until lastmillis - lastaction >= gunwait, and the only server message that touches those
++    // fields on player1 is N_SHOTFX, which fpsgame/client.cpp applies to ANY cn including the
++    // client's own (there is no d==player1 guard). So on a kill the server tells the killer's
++    // client it just fired instareloadgun: lastaction becomes now and gunwait that gun's
++    // attackdelay (fist 250ms instead of the rifle's 1500ms), and gunselect flips to it. An
++    // N_GUNSELECT wrapped in N_CLIENT with the killer's OWN cn (the one way the server can address
++    // player1 through a client-originated message) puts the rifle back in the same packet, so no
++    // frame ever renders the fx gun. What the player notices: the fx gun's shot sound (fist = a
++    // ~300ms chainsaw rev with chainsawhudgun 1, the default; a punch whoosh with 0) plus the
++    // weapon-load click. The server half is just gunwait = 0 so the next shot is accepted at once.
++    void instareloadkiller(clientinfo *actor)
++    {
++        gamestate &gs = actor->state;
++        if(gs.state!=CS_ALIVE || gs.aitype!=AI_NONE) return;
++        gs.gunwait = 0;
++        int fxgun = clamp(instareloadgun, int(GUN_FIST), int(GUN_PISTOL));
++        vec o = gs.o.x > -1e9f ? gs.o : vec(0, 0, 0);
++        ivec fx(vec(o.x, o.y, o.z - 4096).mul(DMF)); // far below the map: the chaingun option's sparks/decal land out of sight
++        packetbuf p(MAXTRANS, ENET_PACKET_FLAG_RELIABLE);
++        putint(p, N_SHOTFX); putint(p, actor->clientnum); putint(p, fxgun); putint(p, 0);
++        putint(p, fx.x); putint(p, fx.y); putint(p, fx.z); putint(p, fx.x); putint(p, fx.y); putint(p, fx.z);
++        uchar gunsel[8];
++        ucharbuf q(gunsel, sizeof(gunsel));
++        putint(q, N_GUNSELECT); putint(q, gs.gunselect);
++        putint(p, N_CLIENT); putint(p, actor->clientnum); putuint(p, q.length()); p.put(q.buf, q.length());
++        sendpacket(actor->clientnum, 1, p.finalize());
++    }
++
++    // "#instareload [on|off]" in chat, or "/servcmd instareload [on|off]" ("/instareload" itself
++    // never leaves a stock client: '/' runs a client-side command). No argument toggles. Anyone
++    // may toggle while no master/admin is on; once one is, only they may.
++    bool instareloadcommand(clientinfo *ci, clientinfo *cq, const char *cmd)
++    {
++        const char *s = cmd;
++        while(*s==' ') s++;
++        if(strncmp(s, "instareload", 11)) return false;
++        s += 11;
++        if(*s && *s!=' ') return false;
++        while(*s==' ') s++;
++        bool privileged = ci->local || ci->privilege>=PRIV_MASTER, hasmaster = false;
++        loopv(clients) if(clients[i]->local || clients[i]->privilege>=PRIV_MASTER) hasmaster = true;
++        if(hasmaster && !privileged)
++        {
++            sendf(ci->clientnum, 1, "ris", N_SERVMSG, "insta reload: only the master can toggle it while a master is on");
++            return true;
++        }
++        int val;
++        if(!*s) val = instareload ? 0 : 1;
++        else if(!strcmp(s, "on") || !strcmp(s, "1")) val = 1;
++        else if(!strcmp(s, "off") || !strcmp(s, "0")) val = 0;
++        else { sendf(ci->clientnum, 1, "ris", N_SERVMSG, "usage: #instareload [on|off]"); return true; }
++        instareload = val;
++        sendservmsgf("insta reload %s (%s): a kill %s the killer's rifle", val ? "\f0ON\f7" : "\f3OFF\f7", colorname(cq), val ? "now re-arms" : "no longer re-arms");
++        if(isdedicatedserver()) logoutf("insta reload %s by %s", val ? "on" : "off", colorname(cq));
++        return true;
++    }
++
+     void dodamage(clientinfo *target, clientinfo *actor, int damage, int gun, const vec &hitpush = vec(0, 0, 0))
+     {
+         gamestate &ts = target->state;
+@@ -2344,6 +2413,7 @@
+             teaminfo *t = m_teammode ? teaminfos.access(actor->team) : NULL;
+             if(t) t->frags += fragvalue; 
+             sendf(-1, 1, "ri5", N_DIED, target->clientnum, actor->clientnum, actor->state.frags, t ? t->frags : 0);
++            if(instareload && fragvalue>0) instareloadkiller(actor);
+             target->position.setsize(0);
+             if(smode) smode->died(target, actor);
+             ts.state = CS_DEAD;
+@@ -2537,6 +2607,24 @@
              else if(!m_timed || gamemillis < gamelimit)
              {
                  processevents();
@@ -47,7 +123,7 @@
                  if(curtime)
                  {
                      loopv(sents) if(sents[i].spawntime) // spawn entities when timer reached
-@@ -2634,6 +2660,7 @@
+@@ -2693,6 +2781,7 @@
      {
          bannedips.shrink(0);
          aiman::clearai();
@@ -55,3 +131,25 @@
      }
  
      void localconnect(int n)
+@@ -3333,10 +3422,11 @@
+ 
+             case N_TEXT:
+             {
+-                QUEUE_AI;
+-                QUEUE_MSG;
+                 getstring(text, p);
+                 filtertext(text, text, true, true);
++                if(text[0]=='#' && ci && cq && instareloadcommand(ci, cq, text+1)) break; // server command, not relayed
++                QUEUE_AI;
++                QUEUE_INT(N_TEXT);
+                 QUEUE_STR(text);
+                 if(isdedicatedserver() && cq) logoutf("%s: %s", colorname(cq), text);
+                 break;
+@@ -3790,6 +3880,7 @@
+ 
+             case N_SERVCMD:
+                 getstring(text, p);
++                if(ci && cq) instareloadcommand(ci, cq, text);
+                 break;
+                      
+             #define PARSEMESSAGES 1

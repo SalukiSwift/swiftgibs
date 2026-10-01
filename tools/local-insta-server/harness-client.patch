@@ -1,0 +1,19 @@
+--- a/fpsgame/client.cpp
++++ b/fpsgame/client.cpp
+@@ -950,6 +950,16 @@
+ 
+     ICOMMAND(servcmd, "C", (char *cmd), addmsg(N_SERVCMD, "rs", cmd));
+ 
++    // PROBE harness only (swiftgibs tools/local-insta-server/test-client.sh): script-driven firing,
++    // positioning, aiming and a reload-state dump. Not part of any shipped client.
++    extern void doattack(bool on);
++    ICOMMAND(probeattack, "i", (int *on), { doattack(*on!=0); });
++    extern void respawn();
++    ICOMMAND(probespawn, "", (), { if(player1->state==CS_DEAD) respawn(); }); // spawn without a stray shot
++    ICOMMAND(probenear, "ifff", (int *cn, float *dx, float *dy, float *dz), { fpsent *d = getclient(*cn); if(d) { player1->o = vec(d->o).add(vec(*dx, *dy, *dz)); player1->newpos = player1->o; player1->resetinterp(); conoutf("PROBE near cn %d at %.1f %.1f %.1f (me %.1f %.1f %.1f)", *cn, d->o.x, d->o.y, d->o.z, player1->o.x, player1->o.y, player1->o.z); } else conoutf("PROBE near: no client %d", *cn); });
++    ICOMMAND(probeaimat, "i", (int *cn), { fpsent *d = getclient(*cn); if(d) { vec dir = vec(d->o).sub(player1->o); vectoyawpitch(dir, player1->yaw, player1->pitch); player1->roll = 0; } else conoutf("PROBE aimat: no client %d", *cn); });
++    ICOMMAND(probereload, "s", (char *tag), { conoutf("PROBE %s t=%d since=%d gunwait=%d gunselect=%d lastattackgun=%d state=%d cn=%d", tag, lastmillis, lastmillis-player1->lastaction, player1->gunwait, player1->gunselect, player1->lastattackgun, player1->state, player1->clientnum); });
++
+     static void sendposition(fpsent *d, packetbuf &q)
+     {
+         putint(q, N_POS);
