@@ -1,0 +1,57 @@
+--- a/fpsgame/server.cpp
++++ b/fpsgame/server.cpp
+@@ -453,6 +453,13 @@
+ 
+     VAR(lockmaprotation, 0, 0, 2);
+ 
++    // === LOCAL INSTA server (tools/local-insta-server; not shipped in any bundle) ===
++    SVAR(defaultmap, "");            // map to load at boot and whenever the server empties
++    VAR(defaultmode, 0, 3, 22);      // mode used with defaultmap (3 = instagib)
++    VAR(autospawn, 0, 0, 1);         // 1 = server respawns dead players itself
++    VAR(autospawndelay, 0, 0, 5000); // extra ms on top of the engine's DEATHMILLIS flush window
++    void changemap(const char *s, int mode);
++
+     void maprotationreset()
+     {
+         maprotations.setsize(0);
+@@ -780,6 +787,7 @@
+     {
+         smapname[0] = '\0';
+         resetitems();
++        if(defaultmap[0]) changemap(defaultmap, defaultmode);
+     }
+ 
+     int numclients(int exclude = -1, bool nospec = true, bool noai = true, bool priv = false)
+@@ -2478,6 +2486,24 @@
+             else if(!m_timed || gamemillis < gamelimit)
+             {
+                 processevents();
++                // autospawn: respawn dead players without waiting for N_TRYSPAWN.
++                // lastdeath>0 keeps fresh joiners / map loads on the vanilla self-spawn
++                // path; the DEATHMILLIS wait lets in-flight hit events settle first.
++                if(autospawn && !m_edit && !interm) loopv(clients)
++                {
++                    clientinfo *ci = clients[i];
++                    gamestate &gs = ci->state;
++                    if(gs.state!=CS_DEAD || gs.lastspawn>=0 || gs.lastdeath<=0) continue;
++                    if(gamemillis - gs.lastdeath < DEATHMILLIS + autospawndelay) continue;
++                    if(smode && !smode->canspawn(ci)) continue;
++                    if(gs.deadflush)
++                    {
++                        flushevents(ci, gs.deadflush);
++                        gs.respawn();
++                    }
++                    cleartimedevents(ci);
++                    sendspawn(ci);
++                }
+                 if(curtime)
+                 {
+                     loopv(sents) if(sents[i].spawntime) // spawn entities when timer reached
+@@ -2634,6 +2660,7 @@
+     {
+         bannedips.shrink(0);
+         aiman::clearai();
++        if(defaultmap[0]) changemap(defaultmap, defaultmode); // fresh match for the next visit
+     }
+ 
+     void localconnect(int n)
