@@ -24,6 +24,15 @@ DATA="${DATA:-}"
 TMP="$(mktemp -d /tmp/sg-firstrun-$$-XXXX)"
 trap 'rm -rf "$TMP"' EXIT
 
+# The client searches its home dir first and then the -k package dir for EVERY file, config.cfg
+# included, so a DATA that is a real install (whose root holds the owner's config.cfg and
+# autoexec.cfg) would quietly feed those to the "fresh" scenario. Hand -k a clean dir that holds
+# only the game data, so the scratch home dir is the one and only place a config can come from.
+PKG="$TMP/pkg"
+mkdir -p "$PKG"
+ln -s "$DATA/data" "$PKG/data"
+ln -s "$DATA/packages" "$PKG/packages"
+
 # The schema version the first-run block stamps and the newest upgrade step lands on. Bump it in
 # the same commit that adds a step, together with the rows below that spell out what that step
 # must force.
@@ -39,16 +48,19 @@ run_scenario() {
   [ "$cfg" = "-" ] || printf '%s\n' "$cfg" > "$home/config.cfg"
   # -x runs last in init, after config.cfg and autoexec.cfg; quit writes config.cfg back and exits.
   local script='echo SGTEST (concatword setup= $swiftgibs_setup) (concatword clicktab= $guiclicktab) (concatword autospec= $autospecidle) (concatword clip= $cliplength); quit'
-  ( cd "$home" && timeout 120 "$ROOT/tools/headless-client.sh" "$CLIENT" -k"$DATA" -q"$home" -x"$script" > "$home/run.log" 2>&1 ) || true
+  ( cd "$home" && timeout 120 "$ROOT/tools/headless-client.sh" "$CLIENT" -k"$PKG" -q"$home" -x"$script" > "$home/run.log" 2>&1 ) || true
   grep -m1 '^SGTEST ' "$home/run.log" || { echo "FAIL: $name: the client never reached the init script; last lines:"; tail -5 "$home/run.log"; return 1; }
 }
 
-# expect <name> <live line> <field=value>...: every field must match the live SGTEST line.
+# expect_live <name> <live line> <field=value>...: every field must appear as a whole token of the
+# live SGTEST line (so clicktab=1 never matches clicktab=10).
 expect_live() {
   local name="$1" line="$2"; shift 2
-  local ok=0 f
+  local ok=0 f tok found
   for f in "$@"; do
-    if grep -q -F -w -- "$f" <<< "$line"; then echo "  ok   $name: live $f"
+    found=0
+    for tok in $line; do [ "$tok" = "$f" ] && found=1; done
+    if [ "$found" = "1" ]; then echo "  ok   $name: live $f"
     else echo "  FAIL $name: live wanted $f, got: ${line#SGTEST }"; ok=1; fi
   done
   return $ok
