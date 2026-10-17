@@ -61,6 +61,7 @@ Your settings and saved friends live in your user config directory and persist b
 - **F3** opens Quick Play: launch an instant bot match (FFA, Team, or CTF), add bots, or jump into settings.
 - **Esc > options** has four SwiftGibs tabs: **SwiftGibs** (server filter, scoreboard columns, friend highlighting, teammate crosshair, blocky lighting, flag popup, deep zoom, stats and feedback), **Cues** (reload countdown, ready flash, metronome, hit markers, and streak fx - every choice previews itself over the menu, with a cue colours page for hue, mono, and opacity), **Audio** (hit sounds and weapon sounds with volume and pitch), and **Friends** (quick-add, who's in game, and a full manage-friends page).
 - The server browser is filtered to instagib-family servers by default (toggle it in the SwiftGibs tab).
+- Menu tabs switch when you click them, not when the cursor passes over them (the stock hover behaviour). To get hover back, untick "click tab" on the first page of Esc > options (top row, next to "2D menus").
 
 ### Feedback cues
 
