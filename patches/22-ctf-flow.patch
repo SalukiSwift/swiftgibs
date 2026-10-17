@@ -1,0 +1,338 @@
+--- a/fpsgame/client.cpp
++++ b/fpsgame/client.cpp
+@@ -1216,6 +1216,11 @@
+         // resetafklatches() (fpsgame/fps.cpp) for the full reasoning.
+         extern void resetafklatches();
+         resetafklatches();
++        // SwiftGibs match cues (patch 22): same every-disconnect-and-quit reasoning as the resets
++        // above - no per-match cue state (the end-of-match banner and later cues) may outlive its
++        // match. See sgmatchcuesreset() (fpsgame/fps.cpp).
++        extern void sgmatchcuesreset();
++        sgmatchcuesreset();
+     }
+ 
+     VARP(teamcolorchat, 0, 1, 1);
+--- a/fpsgame/fps.cpp
++++ b/fpsgame/fps.cpp
+@@ -354,6 +354,7 @@
+     void updatereloadmetronome();
+     void checkautorespawn();   // SwiftGibs Task 7: defined below, after the cue-demo helpers it checks
+     void checkautospec();      // SwiftGibs AFK-aware auto-respawn Part B: defined below, after checkautorespawn()
++    void updatetimercue();     // SwiftGibs match cues (patch 22): final-ten-seconds beeps, defined in the match cues section below
+     void updateworld()        // main game update loop
+     {
+         // SwiftGibs clip export (Task 3): a genuinely unconditional per-frame hook (updateworld()
+@@ -366,6 +367,7 @@
+         // No-op (one int compare) whenever no export is in progress.
+         checkclipexport();
+         updatereloadmetronome();
++        updatetimercue();   // SwiftGibs match cues (patch 22): every frame like the metronome, so the beeps never depend on the clock being drawn
+         if(!maptime) { maptime = lastmillis; maprealtime = totalmillis; return; }
+         if(!curtime) { gets2c(); if(player1->clientnum>=0) c2sinfo(); return; }
+ 
+@@ -691,6 +693,215 @@
+         else flagpopupmillis = 0;
+     }
+ 
++    // === SwiftGibs match cues (patch 22, CTF match-flow round) ==================================
++    // Design: docs/superpowers/specs/2026-09-13-ctf-match-flow-design.md (untracked locally).
++    // Per-match state for this round's cues lives in this section, above its first users
++    // (timeupdate(), startgame() and the HUD code below; updateworld() above reaches updatetimercue()
++    // through a forward declaration); sgmatchcuesreset() at the end clears all of it.
++    //
++    // End-of-match banner: at intermission one large centred line gives the result from the local
++    // player's point of view (VICTORY / DEFEAT / DRAW, WON / LOST, "3rd of 8", or "<X> WINS" for a
++    // spectator, never "you"), then fades out over sgendbannertime so it is gone before the player
++    // reads the scoreboard. Presentation only: it reads the same winner lists the stock win
++    // animation uses (getbestteams()/getbestplayers(), fpsgame/scoreboard.cpp) and changes no game
++    // state, so it may also show in demo/clip playback, which is correct. Drawn by drawendbanner().
++    VARP(sgendbanner, 0, 1, 1);                 // banner on/off
++    VARP(sgendbannertime, 1000, 4000, 10000);   // ms on screen: full strength for the first half, then fading out
++
++    // sgendbannerresult: begin pure unit - tools/test-ctf-flow.sh compiles this block on its own, so it must stay free of engine state
++    enum { SGEND_NEUTRAL = 0, SGEND_WIN, SGEND_LOSS };   // banner colour class: white, win colour, loss colour
++
++    // Writes the banner line into text and returns its SGEND_* class. Every input is passed in by
++    // sgendbannertrigger() below:
++    //   teammode     m_teammode
++    //   self         the local player (player1)
++    //   players      game::players as the engine keeps it, which INCLUDES the local player
++    //                (initclient() adds player1), so the count loop skips self and self is
++    //                counted exactly once
++    //   bestteams    getbestteams() output, read in team modes
++    //   bestplayers  getbestplayers() output, read by an FFA spectator
++    static int sgendbannerresult(char *text, int len, bool teammode, const fpsent *self, const vector<fpsent *> &players,
++                                 const vector<const char *> &bestteams, const vector<fpsent *> &bestplayers)
++    {
++        bool spectating = self->state == CS_SPECTATOR;
++        if(teammode)
++        {
++            if(spectating)
++            {
++                if(bestteams.length() != 1) { copystring(text, "DRAW", len); return SGEND_NEUTRAL; }   // level, or no team scored (0-0 ctf lists none)
++                nformatstring(text, len, "%s WINS", bestteams[0]);
++                for(char *c = text; *c; c++) *c = cubeupper(*c);   // GOOD WINS, not good WINS
++                return SGEND_NEUTRAL;
++            }
++            if(bestteams.length() != 1)
++            {
++                // A tie at the top (2+ teams listed) is a draw only for a team actually in it: with
++                // 3+ teams a non-tied team has lost outright (final review Minor 2). An empty list
++                // (no team could have scored, e.g. a CTF map with no flag bases) is a draw for
++                // everyone, the same as the spectator wording above.
++                bool ontied = false;
++                loopv(bestteams) if(!strcmp(self->team, bestteams[i])) { ontied = true; break; }
++                bool draw = !bestteams.length() || ontied;
++                copystring(text, draw ? "DRAW" : "DEFEAT", len);
++                return draw ? SGEND_NEUTRAL : SGEND_LOSS;
++            }
++            bool won = !strcmp(self->team, bestteams[0]);
++            copystring(text, won ? "VICTORY" : "DEFEAT", len);
++            return won ? SGEND_WIN : SGEND_LOSS;
++        }
++        if(spectating)
++        {
++            if(bestplayers.length() != 1) { copystring(text, "DRAW", len); return SGEND_NEUTRAL; }
++            nformatstring(text, len, "%s WINS", bestplayers[0]->name);   // player names keep their own case
++            return SGEND_NEUTRAL;
++        }
++        int total = 1, ahead = 0, level = 0;   // total starts at 1 for self: playing, so scoring
++        loopv(players)
++        {
++            const fpsent *o = players[i];
++            if(o == self || o->state == CS_SPECTATOR) continue;
++            total++;
++            if(o->frags > self->frags) ahead++;
++            else if(o->frags == self->frags) level++;
++        }
++        if(total == 2)   // duel: exactly two scoring players, self included
++        {
++            copystring(text, ahead ? "LOST" : level ? "DRAW" : "WON", len);
++            return ahead ? SGEND_LOSS : level ? SGEND_NEUTRAL : SGEND_WIN;
++        }
++        int place = ahead + 1;   // standard competition ranking: players level on frags share a place
++        if(place == 1) { nformatstring(text, len, "VICTORY - 1st of %d", total); return SGEND_WIN; }
++        int tens = place%100, units = place%10;
++        const char *suffix = tens >= 11 && tens <= 13 ? "th" : units == 1 ? "st" : units == 2 ? "nd" : units == 3 ? "rd" : "th";
++        nformatstring(text, len, "%d%s of %d", place, suffix, total);
++        return SGEND_NEUTRAL;
++    }
++    // sgendbannerresult: end pure unit
++
++    static int sgendmillis = 0;              // lastmillis when the banner was triggered, 0 = idle
++    static int sgendclass = SGEND_NEUTRAL;   // colour class of sgendtext
++    static string sgendtext;                 // the line to show
++
++    // Called from timeupdate() where intermission is set: gathers what the pure unit above needs,
++    // the same winner lists render.cpp gathers for the stock win animation.
++    static void sgendbannertrigger()
++    {
++        sgendmillis = 0;
++        sgendtext[0] = '\0';
++        if(!sgendbanner) return;
++        // No banner for a match this client never saw. Joining a server that is already in
++        // intermission delivers N_MAPCHANGE and N_TIMEUP 0 in one welcome packet: startgame() has
++        // just zeroed maptime, and only updateworld() sets it again, on this map's first frame. A
++        // real match end always arrives after that first frame, so maptime is non-zero there.
++        if(!maptime) return;
++        vector<const char *> bestteams;
++        vector<fpsent *> bestplayers;
++        if(m_teammode) getbestteams(bestteams);
++        else getbestplayers(bestplayers);
++        sgendclass = sgendbannerresult(sgendtext, sizeof(sgendtext), m_teammode, player1, players, bestteams, bestplayers);
++        sgendmillis = lastmillis;
++    }
++
++    // Round-end escalation: in the final minute of a timed match the match clock breathes (scale and
++    // colour, drawgameclock()) from the moment the stock clock switches to gameclocklowcolour, faster
++    // and stronger for the last ten seconds, and with sgtimercue 2 each of those ten seconds also beeps
++    // once. The beeps run every frame from updateworld() (updatetimercue()), not from the clock draw,
++    // which only runs while the clock is shown. The clock is hidden by default (gameclock 0), so the
++    // cue shows it for the final minute (gameplayhud()). Presentation only: demos and clips may pulse
++    // and beep too.
++    VARP(sgtimercue, 0, 2, 2);          // 0 = off, 1 = visual only, 2 = visual + sound
++    VARP(sgtimercuevol, 0, 200, 255);   // beep volume (0..255; 0 = silent), the same default as the other cue volumes
++
++    // sgtimercue: begin pure unit - tools/test-ctf-flow.sh compiles this block on its own, so it must stay free of engine state
++    // Whole seconds left for msleft = maplimit-lastmillis, counted exactly as drawgameclock() counts
++    // them before it splits off the minutes: 60 reads 1:00, 59 reads 0:59, 1 is the last second and 0
++    // is at or past the limit. Every threshold below uses this total, never the seconds of the minute.
++    static int sgtimerremaining(int msleft) { return max(msleft + 999, 0)/1000; }
++
++    // The beep latch, fed once a frame. live: every gate except the clock (sgtimercue 2, a timed match
++    // with a known limit, not intermission, connected). lastbeep: the last whole second already beeped,
++    // -1 = armed. True exactly when a beep is due: once for each of 10..1, never twice in a row for the
++    // same second, and re-armed whenever more than ten seconds are left again (overtime and other
++    // server time changes can move maplimit back out).
++    static bool sgtimerbeepdue(bool live, int remaining, int &lastbeep)
++    {
++        if(remaining > 10) { lastbeep = -1; return false; }
++        if(!live || remaining < 1 || remaining == lastbeep) return false;
++        lastbeep = remaining;
++        return true;
++    }
++
++    // The clock pulse at msleft. Returns false outside 0:59..0:01, the stretch in which the stock clock
++    // already shows gameclocklowcolour; otherwise writes scale (never below 1, so the clock never
++    // shrinks) and glow (0..1, how far its colour lightens towards white). Until 0:11 it breathes once
++    // every two seconds, starting from rest at 0:59; for the last ten seconds it kicks on every second
++    // change, the frame the beep fires, and settles before the next one.
++    static bool sgtimerpulse(int msleft, float &scale, float &glow)
++    {
++        scale = 1;
++        glow = 0;
++        int remaining = sgtimerremaining(msleft);
++        if(remaining < 1 || remaining > 59) return false;
++        if(remaining > 10)
++        {
++            float breath = 0.5f - 0.5f*cosf((59000 - msleft)*PI/1000);   // 0 at 0:59, 1 at 0:58, 0 at 0:57...
++            scale += 0.06f*breath;
++            glow = 0.3f*breath;
++        }
++        else
++        {
++            float kick = 1 - (remaining*1000 - msleft)/1000.0f;   // 1 as the second changes, down to 0 by the next
++            kick *= kick*kick;
++            scale += 0.25f*kick;
++            glow = 0.75f*kick;
++        }
++        return true;
++    }
++
++    // color (0xRRGGBB) lightened towards white by glow (0..1), channel by channel.
++    static int sgtimerglow(int color, float glow)
++    {
++        int r = (color>>16)&0xFF, g = (color>>8)&0xFF, b = color&0xFF;
++        r += int((255-r)*glow);
++        g += int((255-g)*glow);
++        b += int((255-b)*glow);
++        return (r<<16) | (g<<8) | b;
++    }
++    // sgtimercue: end pure unit
++
++    static int sgtimerlastbeep = -1;   // last whole second already beeped, -1 = armed (see sgtimerbeepdue())
++
++    // swiftgibs/respawncount is the bundled countdown tone the design picks (swiftgibs/tick_mid is the
++    // fallback if it clashes with the respawn countdown by ear). Volume 0 plays nothing: the engine
++    // reads a raw 0 as "default volume", so it is never passed on.
++    static void sgtimerbeep() { if(sgtimercuevol > 0) playsoundname("swiftgibs/respawncount", NULL, sgtimercuevol); }
++    ICOMMAND(playtimercuepreview, "", (), sgtimerbeep());   // the match cues page auditions the beep at the current volume
++
++    // Called every frame from updateworld(), right after updatereloadmetronome().
++    void updatetimercue()
++    {
++        bool live = connected && sgtimercue >= 2 && m_timed && maplimit > 0 && !intermission;
++        if(sgtimerbeepdue(live, sgtimerremaining(maplimit-lastmillis), sgtimerlastbeep)) sgtimerbeep();
++    }
++
++    // True in the final minute of a timed match while the cue is on: from 0:59 (0:00 included) until
++    // intermission. drawgameclock() pulses inside it; gameplayhud() shows a hidden clock for it.
++    static bool sgtimerfinalminute()
++    {
++        return sgtimercue && m_timed && maplimit > 0 && !intermission && sgtimerremaining(maplimit-lastmillis) < 60;
++    }
++
++    // Clears every per-match cue latch in this section so nothing from one match can bleed into the
++    // next. Called from startgame() (every real match start) and from gamedisconnect()
++    // (fpsgame/client.cpp: every disconnect and quit), the same two-site idiom as resetafklatches().
++    void sgmatchcuesreset()
++    {
++        sgendmillis = 0;
++        sgendtext[0] = '\0';
++        sgtimerlastbeep = -1;
++    }
++    // === end SwiftGibs match cues state =========================================================
++
+     // === SwiftGibs career stats file writer (Task 6) ===
+     ICOMMAND(writestatsfile, "iiiiiis", (int *m,int *f,int *d,int *dmg,int *sh,int *bs,char *ts),
+     {
+@@ -1160,6 +1371,7 @@
+             // the next real match (see the startgame() hook above), not immediately here - there
+             // is nothing to capture during intermission itself.
+             cliprecordfinalizeall("intermission");
++            sgendbannertrigger();   // SwiftGibs match cues (patch 22): end-of-match banner
+             player1->attacking = false;
+             if(cmode) cmode->gameover();
+             conoutf(CON_GAMEINFO, "\f2intermission:");
+@@ -1302,6 +1514,7 @@
+         killstreak = 0;
+         matchbeststreak = 0;
+         flagpopupmillis = 0;
++        sgmatchcuesreset();   // SwiftGibs match cues (patch 22): no cue state survives into a new match
+         loopv(players) { players[i]->cstreak = 0; players[i]->bstreak = 0; }
+ 
+         setclientmode();
+@@ -1670,9 +1883,23 @@
+ 
+         pushhudmatrix();
+         hudmatrix.scale(gameclockscale, gameclockscale, 1);
++        // SwiftGibs match cues (patch 22): the final-minute pulse. The clock grows sideways about
++        // gameclockx (every gameclockalign keeps its edge) and away from the nearer top or bottom edge
++        // of the screen (the default clock sits 3% from the top, where a centred pulse would clip), and
++        // its colour lightens below.
++        float sgscale = 1, sgglow = 0;
++        if(sgtimerfinalminute() && sgtimerpulse(maplimit-lastmillis, sgscale, sgglow))
++        {
++            vec2 anchor = vec2(gameclockx, gameclocky).mul(vec2(w, h).div(gameclockscale));
++            anchor.y += gameclocky < 0.5f ? -th/2.0f : th/2.0f;
++            hudmatrix.translate(anchor.x, anchor.y, 0);
++            hudmatrix.scale(sgscale, sgscale, 1);
++            hudmatrix.translate(-anchor.x, -anchor.y, 0);
++        }
+         flushhudmatrix();
+ 
+         int color = mins < 1 ? gameclocklowcolour : gameclockcolour;
++        if(sgglow > 0) color = sgtimerglow(color, sgglow);   // SwiftGibs match cues (patch 22): final-minute pulse
+         draw_text(buf, int(offset.x), int(offset.y), (color>>16)&0xFF, (color>>8)&0xFF, color&0xFF, gameclockalpha);
+ 
+         pophudmatrix();
+@@ -2174,11 +2401,41 @@
+         pophudmatrix();
+     }
+ 
++    // SwiftGibs match cues (patch 22): end-of-match banner. State and trigger live in the match
++    // cues section further up (sgendbannertrigger()). Drawn from the post-gui overlay just below,
++    // not from gameplayhud(): gl_drawhud() (engine/rendergl.cpp) runs gameplayhud() BEFORE
++    // g3d_render2d() draws the 2D guis, so a gameplayhud() banner sits under the translucent
++    // intermission scoreboard that showscores(true) opens. Here it sits on top while it fades.
++    // Same visibility gate as gameplayhud() itself (!hidehud && !mainmenu), same centred, scaled,
++    // upper-third idiom as drawflagpopup().
++    void drawendbanner(int w, int h)
++    {
++        if(!sgendbanner || !sgendmillis || hidehud || mainmenu) return;
++        int t = lastmillis - sgendmillis;
++        if(t >= sgendbannertime) { sgendmillis = 0; return; }
++        float fade = 1.0f - float(t)/float(sgendbannertime);
++        int a = int(255*min(1.0f, fade*2.0f));   // full strength for the first half, then fade out
++        static const uchar colours[3][3] = { { 255, 255, 255 }, { 255, 200, 64 }, { 255, 72, 72 } };   // SGEND_NEUTRAL white, SGEND_WIN gold, SGEND_LOSS red
++        const uchar *col = colours[sgendclass];
++        int cx = 1800*w/h/2, cy = 1800/3;
++        int tw, th; text_bounds(sgendtext, tw, th);
++        float scale = min(2.5f, 0.9f*1800*w/h/max(tw, 1));   // a long name shrinks to fit instead of running off the screen
++        pushhudmatrix();
++        hudmatrix.scale(h/1800.0f, h/1800.0f, 1);
++        hudmatrix.translate(cx, cy, 0);
++        hudmatrix.scale(scale, scale, 1);
++        flushhudmatrix();
++        hudshader->set();   // draw_text() binds no shader and the gui pass may end on an untextured one, same as drawstreakfx()
++        draw_text(sgendtext, -tw/2, -th/2, col[0], col[1], col[2], a);
++        pophudmatrix();
++    }
++
+     // Post-gui overlay: cue demos must draw AFTER g3d_render2d or menu windows cover them
+     // (that is exactly where a player is when auditioning styles). Real reloads keep the
+     // normal gameplayhud draw above.
+     void reloadhudoverlay(int w, int h)
+     {
++        drawendbanner(w, h);   // SwiftGibs match cues (patch 22): over the intermission scoreboard, see drawendbanner()
+         if(!reloaddemoing() && !hitmarkerdemoing() && !streakfxdemoing()) return;
+         reloadoverlaypass = true;
+         pushhudmatrix();
+@@ -2469,6 +2726,7 @@
+         if(!m_edit && !m_sp)
+         {
+             if(gameclock) drawgameclock(w, h);
++            else if(sgtimerfinalminute()) drawgameclock(w, h);   // SwiftGibs match cues (patch 22): the timer cue shows a hidden clock for the final minute
+             if(hudscore) drawhudscore(w, h);
+         }
+     }
