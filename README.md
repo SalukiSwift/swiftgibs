@@ -23,7 +23,7 @@ SwiftGibs takes the classic open-source arena shooter and strips it to its faste
 - **Blocky lighting (optional).** A crisp pixelated-shadow look for the flat world. Community-discovered via in-game feedback.
 - **Readable chat.** Scroll back through chat with the mouse wheel while you type, or open a dedicated Chat History page.
 - **Non-obscuring teammate crosshair.** Over a teammate, your crosshair tints blue instead of the aim-blocking circle-slash icon (friendly fire is usually on).
-- **Native settings.** All SwiftGibs options live in the regular Esc > options menu as SwiftGibs, Timing Cues, and Friends tabs. F3 is a quick-play launcher for instant bot matches.
+- **Native settings.** All SwiftGibs options live in the regular Esc > options menu as SwiftGibs, Cues, Audio, Clips, and Friends tabs. F3 is a quick-play launcher for instant bot matches.
 - **Live previews.** Selecting any cue demonstrates it on the spot: countdown and ready-flash styles play out right over the menu (main menu included, with a pulsing crosshair where a style needs one), and hit sounds, volumes, and the killstreak ding audition as you click.
 - **In-game feedback.** Found a bug or got an idea? Press **F8** mid-game (or Esc > options > SwiftGibs > send feedback) and your report lands on this repo's public issues, complete with a screenshot of that moment and the telemetry that helps us fix it (map, position, fps, match stats). Reports are anonymous unless you tick "sign with my player name". No account needed. F8 is only claimed if you haven't bound it yourself.
 - **Easy updates.** The main menu tells you when a newer release is out. Windows: run `update-swiftgibs.bat` in the game folder. macOS: double-click `update-swiftgibs.command`, shipped right next to `SwiftGibs.app`. Linux: run `./update-swiftgibs.sh` in the game folder, shipped next to `swiftgibs.sh`. All three fetch the latest version while keeping your settings, friends and stats.
@@ -59,13 +59,13 @@ Your settings and saved friends live in your user config directory and persist b
 
 - Move and shoot like any Sauerbraten client. It's instagib: you spawn with the rifle, one hit kills.
 - **F3** opens Quick Play: launch an instant bot match (FFA, Team, or CTF), add bots, or jump into settings.
-- **Esc > options** has four SwiftGibs tabs: **SwiftGibs** (server filter, scoreboard columns, friend highlighting, teammate crosshair, blocky lighting, flag popup, deep zoom, stats and feedback), **Cues** (reload countdown, ready flash, metronome, hit markers, and streak fx - every choice previews itself over the menu, with a cue colours page for hue, mono, and opacity), **Audio** (hit sounds and weapon sounds with volume and pitch), and **Friends** (quick-add, who's in game, and a full manage-friends page).
+- **Esc > options** has five SwiftGibs tabs: **SwiftGibs** (server filter, scoreboard columns, friend highlighting, teammate crosshair, blocky lighting, flag popup, deep zoom, stats and feedback), **Cues** (reload countdown, ready flash, metronome, hit markers, and streak fx - every choice previews itself over the menu, with a cue colours page for hue, mono, and opacity, and a match cues page for the end-of-match banner and the final-minute timer), **Audio** (hit sounds and weapon sounds with volume and pitch), **Clips** (replay clips: F10 saves the last moments, F9 records, then play them back or export to video), and **Friends** (quick-add, who's in game, and a full manage-friends page).
 - The server browser is filtered to instagib-family servers by default (toggle it in the SwiftGibs tab).
 - Menu tabs switch when you click them, not when the cursor passes over them (the stock hover behaviour). To get hover back, untick "click tab" on the first page of Esc > options (top row, next to "2D menus").
 
 ### Feedback cues
 
-Independent settings under the Timing Cues tab (all off by default except where noted); picking any option plays a live demo:
+Independent settings under the Cues tab (all off by default except where noted); picking any option plays a live demo. The last two live on its match cues page:
 
 | Setting | What it is | Options |
 |---|---|---|
@@ -74,6 +74,8 @@ Independent settings under the Timing Cues tab (all off by default except where 
 | Metronome | audio tick-tick-tick-ding over the reload | **Off** (default), Flat, Rising, plus volume |
 | Hit sound | the marker sound when you land a hit | **Stock** (default) or an alternate, plus an adjustable volume and preview |
 | Killstreak | per-life streak counter, with optional milestone dings | Counter **on** by default; milestone sound off |
+| End-of-match banner | VICTORY / DEFEAT / DRAW, your FFA placing, or WON / LOST in a duel, centre screen for about four seconds when the match ends | **On** (default) |
+| Final-minute timer | the hidden clock revealed for the last minute, with a kick and a beep per second for the last ten | Off, Pulse, **Pulse + beeps** (default), plus volume |
 
 ## Design philosophy: clarity, not cheating
 
@@ -102,7 +104,7 @@ build/make-bundle-mac.sh            # macOS .app (APP_DIR=/tmp/SwiftGibs.app for
 
 - `patches/NN-*.patch` are the engine changes, applied in order. Each is one focused feature (server filter, scoreboard, friends, reload feedback, flat models, and so on).
 - `overlay/` holds menus, autoexec, crosshair, and flat skins: pure data layered over the stock game.
-- `build/integrate-menus.sh` splices the SwiftGibs, Timing Cues, and Friends tabs into the stock options menu at bundle time.
+- `build/integrate-menus.sh` splices the SwiftGibs, Cues, Audio, Clips, and Friends tabs into the stock options menu at bundle time.
 - `tools/strip-assets.sh` produces the flat low-res data tree from a Sauerbraten install (or the official release archive).
 
 Releases are built reproducibly in GitHub Actions from the official 2020 Sauerbraten data, so no local install is required.
